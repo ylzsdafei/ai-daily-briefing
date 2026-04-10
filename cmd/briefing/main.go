@@ -24,6 +24,7 @@ Commands:
     migrate     Initialize or migrate the SQLite schema
     seed        Load sources from config/ai.yaml into the database
     run         Fetch + classify + compose + render + publish (main pipeline)
+    regen       Reuse existing SQLite data, rebuild infocard + HTML + push
     serve       Start static file server for docs/ (web viewer)
     promote     Manually promote an existing issue to Slack prod channel
     status      Show the status of a specific issue
@@ -113,6 +114,8 @@ func main() {
 		err = seedCommand(ctx, cfg)
 	case "run":
 		err = runCommand(ctx, cfg, date, gf)
+	case "regen":
+		err = regenCommand(ctx, cfg, date, gf)
 	case "promote":
 		err = promoteCommand(ctx, cfg, date, gf)
 	case "status":

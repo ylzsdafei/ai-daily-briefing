@@ -1,0 +1,310 @@
+// cmd/briefing/regen.go — `briefing regen` subcommand.
+//
+// Rebuilds the info-card PNGs, HTML page, and Slack push for an EXISTING
+// issue already persisted in SQLite. It skips ingest → rank → classify →
+// compose → insight → summary (the expensive steps) and only re-runs:
+//
+//	load existing data → infocard (LLM JSON + PIL) → render → publish
+//
+// Use when you want to iterate on the visual pipeline (template, layout,
+// LLM card prompt) without paying for another 7-minute rank pass or
+// re-fetching 2000+ raw items.
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"briefing-v3/internal/config"
+	"briefing-v3/internal/gate"
+	"briefing-v3/internal/infocard"
+	"briefing-v3/internal/publish"
+	"briefing-v3/internal/render"
+	"briefing-v3/internal/store"
+)
+
+// cardImgMarker matches the ![alt](../data/images/cards/.../item-N.png) lines
+// our previous run injected into BodyMD. We strip them before re-injecting
+// fresh ones so the body does not accumulate stale image references across
+// multiple regen passes.
+var cardImgMarker = regexp.MustCompile(`!\[[^\]]*\]\(\.\./data/images/cards/[^)]+\)\s*\n?\n?`)
+
+func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *globalFlags) error {
+	stage := func(name string) { fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), name) }
+
+	stage(fmt.Sprintf("regen start: date=%s domain=%s target=%s",
+		date.Format("2006-01-02"), gf.domain, gf.target))
+
+	// --- 0. Open store -----------------------------------------------
+	s, err := store.New("data/briefing.db")
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer s.Close()
+
+	// --- 1. Load existing issue --------------------------------------
+	issue, err := s.GetIssueByDate(ctx, gf.domain, date)
+	if err != nil {
+		return fmt.Errorf("get issue: %w", err)
+	}
+	if issue == nil {
+		return fmt.Errorf("no issue row for date=%s domain=%s — run `briefing run` first",
+			date.Format("2006-01-02"), gf.domain)
+	}
+	stage(fmt.Sprintf("loaded issue id=%d status=%s items=%d", issue.ID, issue.Status, issue.ItemCount))
+
+	issueItems, err := s.ListIssueItems(ctx, issue.ID)
+	if err != nil {
+		return fmt.Errorf("list issue items: %w", err)
+	}
+	if len(issueItems) == 0 {
+		return errors.New("existing issue has zero items — nothing to regen")
+	}
+	stage(fmt.Sprintf("loaded %d issue items", len(issueItems)))
+
+	// Strip any leftover card image markdown from a previous regen so
+	// we can re-inject fresh paths without stacking.
+	for _, it := range issueItems {
+		if it == nil {
+			continue
+		}
+		it.BodyMD = cardImgMarker.ReplaceAllString(it.BodyMD, "")
+	}
+
+	insight, err := s.GetIssueInsight(ctx, issue.ID)
+	if err != nil {
+		return fmt.Errorf("get insight: %w", err)
+	}
+	if insight == nil {
+		return errors.New("existing issue has no insight row — run `briefing run` first")
+	}
+	stage("loaded insight")
+
+	summary := strings.TrimSpace(issue.Summary)
+	if summary == "" {
+		// Summary row in DB is empty (the run pipeline updates a local
+		// Issue struct but the stored column stayed at its zero value
+		// when the initial UpsertIssue raced the Summary assignment).
+		// Re-ask the LLM for a fresh 3-line summary — it is a single
+		// cheap call so regen can still be 10-20x faster than `run`.
+		stage("summary: DB summary empty, regenerating")
+		fresh, err := generateDailySummary(ctx, cfg.LLM, issueItems)
+		if err != nil {
+			return fmt.Errorf("regen summary: %w", err)
+		}
+		summary = strings.TrimSpace(fresh)
+		issue.Summary = summary
+		if _, err := s.UpsertIssue(ctx, issue); err != nil {
+			fmt.Printf("[WARN] persist summary: %v\n", err)
+		}
+	}
+
+	// --- 2. Regenerate info cards (the whole point of this command) ---
+	stage("infocard: calling LLM to re-distill cards")
+	icGen, icErr := infocard.New(infocard.Config{
+		BaseURL:    cfg.LLM.BaseURL,
+		APIKey:     cfg.LLM.APIKey,
+		Model:      cfg.LLM.Model,
+		MaxRetries: 3,
+		Timeout:    cfg.LLM.LLMTimeout(),
+	})
+	if icErr != nil {
+		return fmt.Errorf("infocard new: %w", icErr)
+	}
+
+	// Shadow-remap seqs to globally-unique UIDs to avoid per-section
+	// collisions clobbering each other's PNG files.
+	shadowItems := make([]*store.IssueItem, 0, len(issueItems))
+	uidToItem := make(map[int]*store.IssueItem, len(issueItems))
+	for i, it := range issueItems {
+		if it == nil {
+			continue
+		}
+		shadow := *it
+		shadow.Seq = i + 1
+		shadowItems = append(shadowItems, &shadow)
+		uidToItem[shadow.Seq] = it
+	}
+
+	header, cards, err := icGen.Generate(ctx, shadowItems, summary)
+	if err != nil {
+		return fmt.Errorf("infocard generate: %w", err)
+	}
+	stage(fmt.Sprintf("infocard: got header + %d cards", len(cards)))
+	header.IssueDate = date.Format("2006-01-02")
+
+	cardDir := filepath.Join("data", "images", "cards", date.Format("2006-01-02"))
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir cards: %w", err)
+	}
+	// Clear any stale PNGs so broken/renamed files cannot leak through.
+	if entries, _ := os.ReadDir(cardDir); entries != nil {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".png") {
+				_ = os.Remove(filepath.Join(cardDir, e.Name()))
+			}
+		}
+	}
+
+	// Header card PNG (非阻断).
+	var headerCardPNGRel string
+	headerPath := filepath.Join(cardDir, "header.png")
+	if err := renderInfoCardPNG(ctx, "header", header, headerPath); err != nil {
+		fmt.Printf("[WARN] infocard header render: %v\n", err)
+	} else {
+		headerCardPNGRel = fmt.Sprintf("../data/images/cards/%s/header.png", date.Format("2006-01-02"))
+		stage(fmt.Sprintf("infocard: header PNG → %s", headerPath))
+	}
+
+	// Item cards, each inside recover() so a single failure cannot
+	// take down the regen.
+	renderedCount := 0
+	for _, c := range cards {
+		if c == nil {
+			continue
+		}
+		it := uidToItem[c.ItemSeq]
+		if it == nil {
+			fmt.Printf("[WARN] infocard: card uid=%d has no matching item, skip\n", c.ItemSeq)
+			continue
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("[WARN] infocard uid=%d panic: %v\n", c.ItemSeq, r)
+				}
+			}()
+			outPath := filepath.Join(cardDir, fmt.Sprintf("item-%d.png", c.ItemSeq))
+			if err := renderInfoCardPNG(ctx, "item", c, outPath); err != nil {
+				fmt.Printf("[WARN] infocard item uid=%d render: %v\n", c.ItemSeq, err)
+				return
+			}
+			renderedCount++
+			relPath := fmt.Sprintf("../data/images/cards/%s/item-%d.png", date.Format("2006-01-02"), c.ItemSeq)
+			alt := strings.TrimSpace(c.MainTitle)
+			if alt == "" {
+				alt = strings.TrimSpace(it.Title)
+			}
+			for _, ch := range []string{"[", "]", "(", ")"} {
+				alt = strings.ReplaceAll(alt, ch, " ")
+			}
+			alt = strings.TrimSpace(alt)
+			imgLine := fmt.Sprintf("![%s](%s)\n\n", alt, relPath)
+			it.BodyMD = imgLine + strings.TrimLeft(it.BodyMD, "\n")
+		}()
+	}
+	stage(fmt.Sprintf("infocard: rendered %d/%d item PNGs", renderedCount, len(cards)))
+
+	// Persist mutated BodyMD back to SQLite.
+	if err := s.ReplaceIssueItems(ctx, issue.ID, issueItems); err != nil {
+		fmt.Printf("[WARN] replace issue items: %v\n", err)
+	}
+
+	// --- 3. Render markdown + HTML -----------------------------------
+	renderSecs := make([]render.SectionMeta, 0, len(cfg.Sections))
+	for _, sec := range cfg.Sections {
+		renderSecs = append(renderSecs, render.SectionMeta{
+			ID:    sec.ID,
+			Title: sec.Title,
+		})
+	}
+	fullMarkdown := render.RenderMarkdown(issue, issueItems, insight, renderSecs)
+	sectionsMD := render.RenderSectionsMap(issueItems, renderSecs)
+	stage(fmt.Sprintf("render: markdown built (%d bytes)", len(fullMarkdown)))
+	_ = writeDailyMarkdown(date, fullMarkdown)
+
+	headlineRelForHTML := headerCardPNGRel
+	if headlineRelForHTML == "" && cfg.Image.Enabled {
+		headlineRelForHTML = fmt.Sprintf("../data/images/%s.png", date.Format("2006-01-02"))
+	}
+	htmlRes, htmlErr := render.WriteIssueHTML("docs", &render.IssueHTMLInput{
+		Issue:       issue,
+		Items:       issueItems,
+		Insight:     insight,
+		Sections:    renderSecs,
+		HeadlineImg: headlineRelForHTML,
+	})
+	if htmlErr != nil {
+		fmt.Printf("[WARN] html: %v\n", htmlErr)
+	} else {
+		stage(fmt.Sprintf("html: %s (%d bytes)", htmlRes.Path, htmlRes.Size))
+	}
+	if indexEntries, err := render.CollectIndexEntries("docs"); err == nil {
+		_, _ = render.WriteIndexHTML("docs", indexEntries, "briefing-v3 · 每日早读 · 全网深度聚合")
+	}
+
+	// --- 4. Build & publish ------------------------------------------
+	reportURL := fmt.Sprintf("file:///root/briefing-v3/docs/%s.html", date.Format("2006-01-02"))
+	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
+		reportURL = strings.Replace(base, "{{DATE}}", date.Format("2006-01-02"), 1)
+	}
+	rendered := &publish.RenderedIssue{
+		Issue:            issue,
+		Items:            issueItems,
+		Insight:          insight,
+		HeadlineImageURL: "",
+		SectionsMarkdown: sectionsMD,
+		DateZH:           render.FormatDateZH(issue),
+		ReportURL:        reportURL,
+	}
+
+	stage("gate: checking hard quality rules")
+	g := gate.New(gate.Config{
+		MinItems:               cfg.Gate.MinItems,
+		MinSectionsWithContent: cfg.Gate.MinSectionsWithContent,
+		MinInsightChars:        cfg.Gate.MinInsightChars,
+		MinIndustryBullets:     cfg.Gate.MinIndustryBullets,
+		MaxIndustryBullets:     cfg.Gate.MaxIndustryBullets,
+		MinTakeawayBullets:     cfg.Gate.MinTakeawayBullets,
+		MaxTakeawayBullets:     cfg.Gate.MaxTakeawayBullets,
+		MinSourceDomains:       cfg.Gate.MinSourceDomains,
+	})
+	report := g.Check(issue, issueItems, insight)
+	stage(fmt.Sprintf("gate: pass=%v items=%d sections=%d insightChars=%d domains=%d",
+		report.Pass, report.ItemCount, report.SectionCount, report.InsightChars, report.SourceDomainCount))
+
+	slackPayload, err := render.BuildSlackPayload(rendered)
+	if err != nil {
+		return fmt.Errorf("build slack payload: %w", err)
+	}
+
+	if gf.dryRun {
+		stage("dry-run: skipping publish")
+		fmt.Println(string(bytes.TrimSpace(slackPayload)))
+		return nil
+	}
+
+	stage("publish: posting to Slack test channel")
+	testDelivery := postSlackPayload(ctx, store.ChannelSlackTest, cfg.Slack.TestWebhook, slackPayload, issue.ID)
+	if err := s.InsertDelivery(ctx, testDelivery); err != nil {
+		fmt.Printf("[WARN] insert delivery: %v\n", err)
+	}
+	if testDelivery.Status != store.DeliveryStatusSent {
+		return fmt.Errorf("slack test publish failed: %s", testDelivery.ResponseJSON)
+	}
+	stage("publish: slack test OK")
+
+	if (gf.target == "auto" || gf.target == "prod") && report.Pass {
+		stage("publish: posting to Slack prod channel")
+		prodDelivery := postSlackPayload(ctx, store.ChannelSlackProd, cfg.Slack.ProdWebhook, slackPayload, issue.ID)
+		if err := s.InsertDelivery(ctx, prodDelivery); err != nil {
+			fmt.Printf("[WARN] insert prod delivery: %v\n", err)
+		}
+		if prodDelivery.Status != store.DeliveryStatusSent {
+			return fmt.Errorf("slack prod publish failed: %s", prodDelivery.ResponseJSON)
+		}
+		stage("publish: slack prod OK")
+	} else {
+		stage("publish: target=test or gate failed, skipping prod")
+	}
+
+	stage("regen complete")
+	return nil
+}
