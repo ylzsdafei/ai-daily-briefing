@@ -1,0 +1,23 @@
+# Build artifacts
+/bin/
+*.o
+*.a
+*.exe
+*.test
+*.out
+
+# Data and logs (not tracked)
+/data/*.db
+/data/*.db-wal
+/data/*.db-shm
+/data/*.bak*
+/logs/
+/config/secrets.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Go
+vendor/
