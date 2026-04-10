@@ -1,0 +1,281 @@
+# briefing-v3 AI domain config
+# Sources verified on 2026-04-10. 21 sources covering:
+#   - English AI news (smol.ai / the-decoder / techcrunch / openai)
+#   - AI researcher blogs (Mollick / Willison / J.Clark / Raschka / L.Weng)
+#   - Chinese tech blogs (baoyu / ruanyifeng)
+#   - Papers (arxiv cs.AI / cs.LG / HuggingFace)
+#   - Code (ossinsight GitHub trending)
+#   - Community (HN top / Reddit r/ML + r/LocalLLaMA)
+#   - Chinese news fallback (Google News RSS)
+#   - Anthropic (HTML scraping, no public RSS)
+
+domain:
+  id: ai
+  name: "AI 行业早报"
+  title_template: "AI资讯日报 {{.DateZH}}"
+  subtitle: "briefing-v3 · 每日早读 · 全网深度聚合"
+  timezone: "Asia/Shanghai"
+
+# Time window for item filtering. Items older than this are dropped during
+# dedup+filter stage even if the source returns them.
+window:
+  # Day-1 hard requirement: briefing is a DAILY report. Primary window
+  # is 24h. extended_hours is only a safety valve if the 24h fetch
+  # produced too few items after history dedup.
+  lookback_hours: 24
+  extended_hours: 48
+
+# LLM client config. All values can be overridden via environment variables
+# listed in the *_env fields.
+llm:
+  base_url_env: OPENAI_BASE_URL
+  api_key_env: OPENAI_API_KEY
+  model_env: OPENAI_MODEL
+  default_base_url: "http://64.186.239.99:8080"
+  default_model: "gpt-5.4"
+  temperature: 0.3
+  max_tokens: 2000
+  timeout_seconds: 120
+  max_retries: 5
+
+# Hard quality gate. Pipeline fails loudly if any of these are not met.
+# Nothing is ever silently degraded.
+gate:
+  min_items: 20                # total issue items after compose
+  min_sections_with_content: 4 # at least 4 of 5 sections must be non-empty
+  min_insight_chars: 150       # sum of industry + takeaway markdown
+  min_industry_bullets: 3
+  max_industry_bullets: 4
+  min_takeaway_bullets: 2
+  max_takeaway_bullets: 3
+  min_source_domains: 5
+
+# Slack distribution. test channel is the default/safe target.
+# prod channel is only written when gate passes AND target=auto.
+slack:
+  test_webhook_env: SLACK_TEST_WEBHOOK
+  prod_webhook_env: SLACK_PROD_WEBHOOK
+  default_target: test          # test | auto
+  enable_alert_on_failure: true # failure posts to test channel
+
+# Headline cover image. Generated once per issue by scripts/gen_headline.py.
+image:
+  enabled: true
+  width: 1200
+  height: 630
+  output_dir: data/images
+  python_bin: python3
+  generator_script: scripts/gen_headline.py
+  font_bold: /usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc
+  font_regular: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+
+# Compose / render section ordering (matches upstream ai.hubtoday.app).
+sections:
+  - id: product_update
+    title: "产品与功能更新"
+    min_items: 3
+    max_items: 8
+  - id: research
+    title: "前沿研究"
+    min_items: 3
+    max_items: 8
+  - id: industry
+    title: "行业展望与社会影响"
+    min_items: 3
+    max_items: 8
+  - id: opensource
+    title: "开源TOP项目"
+    min_items: 2
+    max_items: 6
+  - id: social
+    title: "社媒分享"
+    min_items: 2
+    max_items: 6
+
+# Sources. Each entry maps to an ingest adapter via `type` field.
+# Adapters defined in internal/ingest/*.go via init() registration.
+#
+# type values:
+#   rss             - generic RSS/Atom feed (rss.go)
+#   hn_top          - HackerNews firebase API (hn.go)
+#   reddit_json     - Reddit listing JSON API (reddit.go)
+#   huggingface_papers - HF daily papers HTML (hf_papers.go)
+#   anthropic_news  - anthropic.com/news HTML (anthropic.go)
+#   google_news     - Google News RSS search (gnews.go)
+#   ossinsight      - ossinsight.io GitHub trending API (ossinsight.go)
+sources:
+  # === AI news (English) ===
+  - id: smol-ai
+    type: rss
+    category: news
+    name: "smol.ai news"
+    url: "https://news.smol.ai/rss.xml"
+    enabled: true
+    priority: 10
+  - id: the-decoder
+    type: rss
+    category: news
+    name: "The Decoder"
+    url: "https://the-decoder.com/feed/"
+    enabled: true
+    priority: 9
+  - id: techcrunch-ai
+    type: rss
+    category: news
+    name: "TechCrunch AI"
+    url: "https://techcrunch.com/category/artificial-intelligence/feed/"
+    enabled: true
+    priority: 8
+  - id: openai-news
+    type: rss
+    category: news
+    name: "OpenAI News"
+    url: "https://openai.com/news/rss.xml"
+    enabled: true
+    priority: 10
+
+  # === Anthropic (HTML scrape — no public RSS) ===
+  - id: anthropic-news
+    type: anthropic_news
+    category: news
+    name: "Anthropic News"
+    url: "https://www.anthropic.com/news"
+    enabled: true
+    priority: 10
+
+  # === Chinese content (境外托管) ===
+  - id: baoyu
+    type: rss
+    category: news
+    name: "宝玉的分享"
+    url: "https://baoyu.io/feed.xml"
+    enabled: true
+    priority: 9
+  - id: ruanyifeng
+    type: rss
+    category: news
+    name: "阮一峰的网络日志"
+    url: "https://www.ruanyifeng.com/blog/atom.xml"
+    enabled: true
+    priority: 8
+
+  # === Chinese news via Google News RSS (bypasses GFW) ===
+  - id: gnews-ai-cn
+    type: google_news
+    category: news
+    name: "Google News: 人工智能"
+    query: "人工智能"
+    hl: "zh-CN"
+    gl: "US"
+    ceid: "US:zh-Hans"
+    when: "1d"
+    enabled: true
+    priority: 7
+  - id: gnews-llm-cn
+    type: google_news
+    category: news
+    name: "Google News: 大语言模型"
+    query: "大语言模型"
+    hl: "zh-CN"
+    gl: "US"
+    ceid: "US:zh-Hans"
+    when: "1d"
+    enabled: true
+    priority: 7
+
+  # === AI researcher blogs ===
+  - id: blog-emollick
+    type: rss
+    category: blog
+    name: "Ethan Mollick (oneusefulthing)"
+    url: "https://www.oneusefulthing.org/feed"
+    enabled: true
+    priority: 8
+  - id: blog-simonw
+    type: rss
+    category: blog
+    name: "Simon Willison"
+    url: "https://simonwillison.net/atom/everything/"
+    enabled: true
+    priority: 9
+  - id: blog-jackclark
+    type: rss
+    category: blog
+    name: "Jack Clark (Import AI)"
+    url: "https://jack-clark.net/feed/"
+    enabled: true
+    priority: 9
+  - id: blog-raschka
+    type: rss
+    category: blog
+    name: "Sebastian Raschka"
+    url: "https://magazine.sebastianraschka.com/feed"
+    enabled: true
+    priority: 8
+  - id: blog-lilianweng
+    type: rss
+    category: blog
+    name: "Lilian Weng (OpenAI)"
+    url: "https://lilianweng.github.io/index.xml"
+    enabled: true
+    priority: 8
+
+  # === Papers ===
+  - id: arxiv-cs-ai
+    type: rss
+    category: paper
+    name: "arXiv cs.AI"
+    url: "https://rss.arxiv.org/rss/cs.AI"
+    enabled: true
+    priority: 7
+  - id: arxiv-cs-lg
+    type: rss
+    category: paper
+    name: "arXiv cs.LG"
+    url: "https://rss.arxiv.org/rss/cs.LG"
+    enabled: true
+    priority: 7
+  - id: hf-papers
+    type: huggingface_papers
+    category: paper
+    name: "HuggingFace Daily Papers"
+    url: "https://huggingface.co/papers"
+    enabled: true
+    priority: 9
+
+  # === Open source (GitHub trending) ===
+  - id: gh-trending
+    type: ossinsight
+    category: project
+    name: "GitHub Trending (via ossinsight)"
+    url: "https://api.ossinsight.io/v1/trends/repos"
+    enabled: true
+    priority: 10
+
+  # === HackerNews ===
+  - id: hn-top
+    type: hn_top
+    category: community
+    name: "HackerNews Top Stories"
+    url: "https://hacker-news.firebaseio.com/v0/topstories.json"
+    top_n: 30
+    enabled: true
+    priority: 8
+
+  # === Reddit ===
+  - id: reddit-ml
+    type: reddit_json
+    category: community
+    name: "r/MachineLearning"
+    url: "https://www.reddit.com/r/MachineLearning/hot.json"
+    limit: 25
+    enabled: true
+    priority: 7
+  - id: reddit-localllama
+    type: reddit_json
+    category: community
+    name: "r/LocalLLaMA"
+    url: "https://www.reddit.com/r/LocalLLaMA/hot.json"
+    limit: 25
+    enabled: true
+    priority: 7

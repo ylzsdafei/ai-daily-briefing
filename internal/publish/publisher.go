@@ -21,6 +21,27 @@ type RenderedIssue struct {
 	Issue   *store.Issue
 	Items   []*store.IssueItem // sorted by section, then seq
 	Insight *store.IssueInsight
+
+	// HeadlineImageURL is the publicly reachable URL of the generated
+	// newspaper-style cover image for today's issue. Empty string means
+	// the renderer failed or image generation was disabled; publishers
+	// should gracefully omit the image block in that case.
+	HeadlineImageURL string
+
+	// SectionsMarkdown maps section ID (e.g. "product_update", "research")
+	// to the pre-rendered markdown for that section's body. Populated by
+	// internal/render.RenderMarkdown during the render stage so that Slack
+	// and other channel publishers don't need to re-parse the full report.
+	SectionsMarkdown map[string]string
+
+	// DateZH is today's date in Chinese form, e.g. "2026年4月11日".
+	// Published header blocks prefer this over raw YYYY-MM-DD for readability.
+	DateZH string
+
+	// ReportURL is a public link to the full daily briefing. Used by the
+	// Slack "view full report" button. May be empty when there is no
+	// published web view yet; publishers should fall back to a placeholder.
+	ReportURL string
 }
 
 // Publisher sends a RenderedIssue to one distribution channel.
