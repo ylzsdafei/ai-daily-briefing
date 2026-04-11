@@ -287,6 +287,50 @@ func saveResponse(body io.Reader, dest string, minBytes int) bool {
 	return true
 }
 
+// BuildHotlinkURL returns a Pollinations image URL that can be embedded
+// directly into an <img src=...> or markdown ![](url) without any
+// local download. The browser of the reader then triggers Pollinations
+// to render the image on demand (Pollinations caches on the URL).
+//
+// Use this in environments where you do NOT want briefing-v3 to own
+// any local image bytes (the user's hard preference: "no local hosting,
+// everything should be on-line fetched or generated").
+//
+// The prompt should be in ENGLISH for best generation quality, but
+// Pollinations also accepts Chinese/mixed-language prompts. The seed
+// parameter makes the output deterministic for a given (prompt, seed)
+// pair so a regen with the same data returns the same image.
+//
+// Style: the function appends an infographic / diagram / flowchart
+// style suffix so the output tends towards "explanatory illustration"
+// rather than generic stock art, matching the user request for
+// "图解/功能拆解/流程拆解" (diagrammatic feature/flow breakdowns).
+//
+// width/height default to 1200x675 (16:9 landscape, matches the
+// existing HTML card layout). Seed must be unique per item to avoid
+// all items getting the same picture.
+func BuildHotlinkURL(prompt string, seed int, width, height int) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+	if width <= 0 {
+		width = 1200
+	}
+	if height <= 0 {
+		height = 675
+	}
+	// Append style tokens that push Pollinations towards infographic
+	// output rather than generic stock illustration.
+	styled := prompt + ", technical infographic diagram, architecture flowchart, clean vector illustration, educational style, no text overlay, modern minimal, wide aspect"
+
+	encoded := url.PathEscape(styled)
+	return fmt.Sprintf(
+		"https://image.pollinations.ai/prompt/%s?width=%d&height=%d&nologo=true&seed=%d",
+		encoded, width, height, seed,
+	)
+}
+
 // BuildPrompts is a helper that produces one English illustration
 // prompt per IssueItem from its title + a short body excerpt. This is
 // a purely mechanical fallback that does not require an LLM call; it

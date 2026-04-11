@@ -346,19 +346,31 @@ def render_item_card(data, output_path, width, height,
 
 def render_header_card(data, output_path, width, height,
                        font_bold_path, font_regular_path):
-    """One big banner for the whole issue — the 大字报 top of page."""
+    """One big banner for the whole issue — the 大字报 top of page.
+
+    v1.0.0 急救版：从原来 7 个稀疏元素扩展到 11 个区域，把 1600x1600
+    画布从 ~40% 留白填到 ~90% 密度。新区域：edition 期号、加大的
+    main_headline、lead_paragraph 导语段、6 条 stories 双行布局、
+    key_numbers 横排数字。LLM prompt 同步加长字数限制，让每个区域
+    都有内容可填。
+    """
     img = Image.new("RGB", (width, height), BG_MAIN)
     draw = ImageDraw.Draw(img)
 
     scale = width / 1600
 
     f_mono = load_font(font_bold_path, int(26 * scale))
-    f_date = load_font(font_bold_path, int(44 * scale))
-    f_headline = load_font(font_bold_path, int(120 * scale))
-    f_sub = load_font(font_bold_path, int(52 * scale))
-    f_story_tag = load_font(font_bold_path, int(28 * scale))
-    f_story_title = load_font(font_bold_path, int(40 * scale))
-    f_slogan = load_font(font_regular_path, int(32 * scale))
+    f_edition = load_font(font_bold_path, int(34 * scale))
+    f_date = load_font(font_bold_path, int(40 * scale))
+    f_headline = load_font(font_bold_path, int(108 * scale))
+    f_sub = load_font(font_bold_path, int(46 * scale))
+    f_lead = load_font(font_regular_path, int(34 * scale))
+    f_section_label = load_font(font_bold_path, int(24 * scale))
+    f_story_tag = load_font(font_bold_path, int(24 * scale))
+    f_story_title = load_font(font_bold_path, int(34 * scale))
+    f_keynum_value = load_font(font_bold_path, int(96 * scale))
+    f_keynum_label = load_font(font_regular_path, int(24 * scale))
+    f_slogan = load_font(font_regular_path, int(28 * scale))
 
     # Masthead
     draw_masthead(
@@ -371,55 +383,127 @@ def render_header_card(data, output_path, width, height,
     pad_x = int(56 * scale)
     content_w = width - pad_x * 2
 
-    # Date line with accent red left bar
-    y = int(160 * scale)
-    draw.rectangle([pad_x, y + int(6 * scale), pad_x + int(12 * scale), y + int(48 * scale)],
-                   fill=ACCENT_RED)
+    # ---- Edition + Date line: red bar | issue_date | edition ----------
+    y = int(120 * scale)
+    draw.rectangle(
+        [pad_x, y + int(6 * scale), pad_x + int(12 * scale), y + int(44 * scale)],
+        fill=ACCENT_RED,
+    )
     issue_date = data.get("issue_date", "")
     draw.text((pad_x + int(28 * scale), y), issue_date.upper(),
               font=f_date, fill=ACCENT_RED)
+    edition = data.get("edition", "").strip()
+    if edition:
+        edition_bbox = draw.textbbox((0, 0), edition, font=f_edition)
+        edition_w = edition_bbox[2] - edition_bbox[0]
+        draw.text(
+            (width - pad_x - edition_w, y + int(2 * scale)),
+            edition,
+            font=f_edition,
+            fill=INK_SOFT,
+        )
 
-    # Main headline (huge)
-    y += int(90 * scale)
+    # ---- Main headline (huge, up to 4 lines) --------------------------
+    y += int(80 * scale)
     headline = data.get("main_headline") or "AI 资讯日报"
     y = draw_wrapped(draw, (pad_x, y), headline, f_headline,
-                     INK_MAIN, content_w, line_spacing=1.12, max_lines=3)
-    y += int(24 * scale)
+                     INK_MAIN, content_w, line_spacing=1.12, max_lines=4)
+    y += int(20 * scale)
 
-    # Sub-headline
+    # ---- Sub-headline (blue accent) -----------------------------------
     sub = data.get("sub_headline", "")
     if sub:
         y = draw_wrapped(draw, (pad_x, y), sub, f_sub,
-                         ACCENT_BLUE, content_w, line_spacing=1.3, max_lines=2)
+                         ACCENT_BLUE, content_w, line_spacing=1.28, max_lines=2)
+        y += int(28 * scale)
+
+    # ---- Horizontal rule before lead paragraph ------------------------
+    draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=3)
+    y += int(28 * scale)
+
+    # ---- Lead paragraph (导语段) --------------------------------------
+    # New v1.0.0 region: 100-160 字 narrative summarising today's top
+    # stories in a single connected paragraph, like a real newspaper lead.
+    lead = data.get("lead_paragraph", "").strip()
+    if lead:
+        y = draw_wrapped(
+            draw, (pad_x, y), lead, f_lead,
+            INK_MAIN, content_w, line_spacing=1.45, max_lines=6,
+        )
+        y += int(36 * scale)
+        # Section divider rule
+        draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=2)
+        y += int(28 * scale)
+
+    # ---- Top stories block (6 entries, 3 columns × 2 rows) ------------
+    stories = (data.get("top_stories") or [])[:6]
+    if stories:
+        # "TOP STORIES" section label on the left
+        draw.text((pad_x, y), "TOP STORIES",
+                  font=f_section_label, fill=ACCENT_RED)
         y += int(40 * scale)
 
-    # Horizontal rule
-    draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=3)
-    y += int(40 * scale)
+        col_gap = int(40 * scale)
+        row_gap = int(30 * scale)
+        col_w = (content_w - col_gap * 2) // 3
+        # Each story cell is roughly 140px high in 1600 frame.
+        row_h = int(170 * scale)
 
-    # Top stories row (3 columns)
-    stories = (data.get("top_stories") or [])[:3]
-    if stories:
-        col_w = (content_w - int(80 * scale)) // 3
         for i, st in enumerate(stories):
-            cx = pad_x + i * (col_w + int(40 * scale))
-            cy = y
+            row = i // 3
+            col = i % 3
+            cx = pad_x + col * (col_w + col_gap)
+            cy = y + row * (row_h + row_gap)
             tag = st.get("tag", "").upper()
             if tag:
                 draw.text((cx, cy), tag, font=f_story_tag, fill=ACCENT_RED)
-                cy += int(40 * scale)
-            draw_wrapped(draw, (cx, cy), st.get("title", ""),
-                         f_story_title, INK_MAIN, col_w,
-                         line_spacing=1.3, max_lines=4)
+                cy += int(34 * scale)
+            draw_wrapped(
+                draw, (cx, cy), st.get("title", ""),
+                f_story_title, INK_MAIN, col_w,
+                line_spacing=1.3, max_lines=3,
+            )
 
-    # Footer slogan
+        n_rows = (len(stories) + 2) // 3
+        y += n_rows * (row_h + row_gap) + int(20 * scale)
+
+        # Section divider rule
+        draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=2)
+        y += int(40 * scale)
+
+    # ---- Key numbers strip (3 cells with huge value + label) ---------
+    # New v1.0.0 region: editorial-style "by the numbers" panel.
+    key_numbers = (data.get("key_numbers") or [])[:3]
+    if key_numbers:
+        draw.text((pad_x, y), "BY THE NUMBERS",
+                  font=f_section_label, fill=ACCENT_RED)
+        y += int(36 * scale)
+
+        cell_w = content_w // len(key_numbers)
+        for i, kn in enumerate(key_numbers):
+            cx = pad_x + i * cell_w
+            value = (kn.get("value") or "").strip()
+            label = (kn.get("label") or "").strip()
+            if value:
+                draw.text((cx, y), value, font=f_keynum_value, fill=ACCENT_BLUE)
+            if label:
+                draw.text(
+                    (cx, y + int(108 * scale)),
+                    label,
+                    font=f_keynum_label,
+                    fill=INK_SOFT,
+                )
+
+        y += int(160 * scale)
+
+    # ---- Footer slogan (centered) -------------------------------------
     slogan = data.get("footer_slogan", "briefing-v3 · 每日早读")
-    sy = int(height * 0.88)
+    sy = int(height * 0.93)
     bbox = draw.textbbox((0, 0), slogan, font=f_slogan)
     sx = (width - (bbox[2] - bbox[0])) // 2
     draw.text((sx, sy), slogan, font=f_slogan, fill=INK_SOFT)
 
-    # Footer bar
+    # ---- Footer bar ---------------------------------------------------
     draw_footer_bar(
         draw, width, height,
         left_text="briefing-v3 · hero",

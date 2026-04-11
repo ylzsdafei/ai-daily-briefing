@@ -55,12 +55,19 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 		})
 	}
 
-	// 2. Header block.
+	// 2. Header block. When the upstream gate reported a soft-warn state
+	// (v1.0.0 D7b), prefix the header with "🟡 质量待审 | " so downstream
+	// readers immediately see the briefing passed through a degraded
+	// state and should be double-checked before any prod promotion.
+	headerText := fmt.Sprintf("🤖 AI 资讯日报 - %s", chineseDate)
+	if rendered.QualityWarn {
+		headerText = "🟡 质量待审 | " + headerText
+	}
 	blocks = append(blocks, map[string]any{
 		"type": "header",
 		"text": map[string]any{
 			"type":  "plain_text",
-			"text":  fmt.Sprintf("🤖 AI 资讯日报 - %s", chineseDate),
+			"text":  headerText,
 			"emoji": true,
 		},
 	})
@@ -156,14 +163,18 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 	})
 
 	// 10. Footer context.
-	blocks = append(blocks, map[string]any{
-		"type": "context",
-		"elements": []map[string]any{
-			{
-				"type": "mrkdwn",
-				"text": fmt.Sprintf("briefing-v3 自动推送 | %s", dateStr),
-			},
+	// v1.0.0: 只保留一行简洁的 "briefing-v3 自动推送 | 日期"，
+	// 不向 Slack 用户暴露 FailedSections / QualityWarnings 这种内部
+	// 质量信号 (用户反馈: 这些字段不用暴露出来).
+	footerElems := []map[string]any{
+		{
+			"type": "mrkdwn",
+			"text": fmt.Sprintf("briefing-v3 自动推送 | %s", dateStr),
 		},
+	}
+	blocks = append(blocks, map[string]any{
+		"type":     "context",
+		"elements": footerElems,
 	})
 
 	return map[string]any{"blocks": blocks}

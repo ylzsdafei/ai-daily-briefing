@@ -21,6 +21,14 @@ type Source struct {
 	Type       string // 'github_trending' | 'rss' | 'folo_list' | ...
 	Name       string
 	ConfigJSON string // type-specific config (feed URL, list ID, auth, ...)
+	// Category is parsed from ConfigJSON (SourceConfig.Category) when the
+	// row is loaded. It is one of: news, blog, paper, project, community.
+	// Used by classify to pre-bucket items via a deterministic rule before
+	// asking the LLM for second-pass disambiguation of news → product_update
+	// vs industry. Not persisted as its own column — the authoritative copy
+	// lives in config/ai.yaml and is re-parsed on every ListEnabledSources
+	// call.
+	Category   string
 	Enabled    bool
 	CreatedAt  time.Time
 }

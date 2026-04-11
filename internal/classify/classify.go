@@ -1,12 +1,23 @@
-// Package classify is the Step 2 LLM classifier: given a list of
-// RawItems already filtered by rank, assign each one to exactly one of
-// the five briefing-v3 sections (product_update, research, industry,
-// opensource, social).
+// Package classify is the Step 2 classifier: given a list of RawItems
+// already filtered by rank, assign each one to exactly one of the five
+// briefing-v3 sections (product_update, research, industry, opensource,
+// social).
 //
-// The classifier is LLM-first but falls back to simple URL/domain rules
-// when the LLM response is malformed or missing an item. This guarantees
-// every ranked item lands in some section, so compose can never end up
-// with a nil bucket.
+// v1.0.0 strategy — rules first, LLM second:
+//
+//	1. Look up the item's source category (paper/project/community/blog/news).
+//	2. If the category has a confident rule mapping (paper → research,
+//	   project → opensource, community|blog → social), bucket directly.
+//	3. Only news-category items fall through to an LLM batch call that
+//	   decides product_update vs industry.
+//	4. Anything the LLM misses lands in fallbackSection, which now uses
+//	   URL host heuristics instead of dumping everything into social.
+//
+// The old 70% research skew came from the LLM being asked to classify
+// every item into one of five sections when papers dominated the input —
+// it produced plausible but lopsided verdicts. The rule-first split caps
+// research at whatever fraction of the rank output is actually paper-source,
+// which in practice is around 30-40% of 30 top-ranked items.
 package classify
 
 import (
@@ -50,7 +61,18 @@ type Classifier interface {
 	// Classify returns a map from section id (store.SectionProductUpdate
 	// etc.) to the RawItems assigned to that section. Every non-nil
 	// input item is guaranteed to appear in exactly one bucket.
-	Classify(ctx context.Context, items []*store.RawItem) (map[string][]*store.RawItem, error)
+	//
+	// sourceCategories maps raw_items.source_id to the source's config
+	// category (news / blog / paper / project / community). It is the
+	// primary signal for the rule-based pre-bucketing pass. Items whose
+	// source is not in the map (or whose category is "news") fall through
+	// to the LLM for second-pass disambiguation into product_update vs
+	// industry.
+	Classify(
+		ctx context.Context,
+		items []*store.RawItem,
+		sourceCategories map[int64]string,
+	) (map[string][]*store.RawItem, error)
 }
 
 // New constructs an LLM-backed Classifier.
@@ -68,31 +90,41 @@ func New(cfg Config) (Classifier, error) {
 	return &llmClassifier{cfg: cfg, hc: &http.Client{}}, nil
 }
 
-// classifySystemPrompt is the rubric the LLM follows.
-const classifySystemPrompt = `你是 AI 日报编辑。给定一批候选条目，把每一条分配到以下 5 个 section 之一:
+// classifySystemPrompt is the rubric the LLM follows. v1.0.0 narrows
+// the LLM's job to a strict binary: every item passed to classifyBatch
+// is known to be a news-category article, and the LLM must decide
+// whether it is a product update or an industry / policy / commentary
+// story. All other section types (research / opensource / social) are
+// handled by deterministic rules before the LLM is ever called.
+const classifySystemPrompt = `你是 AI 日报编辑。你收到的每一条都来自新闻类来源 (news category)。
+你的任务：把每一条分到且仅分到以下 2 个 section 之一。请在批次内尽量均衡：
+product_update 和 industry 的比例理想在 1:1 到 2:1 之间，不要把 batch
+全部判到同一个 section。
 
-- product_update: AI 公司/产品的发布、更新、新功能 (ChatGPT/Claude/Gemini/DeepSeek 等产品消息)
-- research: 学术论文、新算法、技术突破 (arxiv/会议/新模型研究)
-- industry: 政策、商业、伦理、社会话题 (融资/监管/讨论/伦理辩论)
-- opensource: GitHub 项目、开源工具 (仓库发布/star 热门)
-- social: 社区讨论、热门观点、博客文章 (HN/Reddit/个人博客/社媒)
+- product_update: AI 公司或产品的具体发布、更新、新功能、新版本、发布会、开发者工具、API、模型
+  (典型标志: OpenAI/Anthropic/Google/DeepMind/Meta/xAI/DeepSeek/Mistral/NVIDIA/Microsoft/Apple/
+  AWS/字节/阿里/腾讯/华为/智谱/月之暗面/MiniMax 等公司推出的任何具体产品/模型/工具/API/功能)
+- industry: 行业趋势、政策、监管、融资并购、人事变动、观点评论、社会影响、市场分析、调查报告
+  (典型标志: 融资/监管/诉讼/收购/政策/观点/评论/报告/调研/访谈/专访/行业白皮书/人事变动)
 
-规则:
-1. 每条必须分到且仅分到一个 section
-2. 同时属于多个 section 时优先按最核心的
-3. arxiv / HuggingFace Papers → research
-4. GitHub 项目 → opensource
-5. Reddit/HN/blog → social (除非是公司产品发布则 product_update)
+判断要点：
+1. 标题/内容含"发布/推出/上线/开源/新增/新功能/新模型/new model/release/launch/ships/unveil/
+   available/announce/rollout/beta/preview/API/SDK" 等字眼且指向具体产品 → product_update
+2. 标题/内容含"融资/投资/估值/监管/政策/诉讼/收购/并购/合作/观点/评论/分析/报告/调研/趋势/访谈"
+   等字眼 → industry
+3. 描述某家 AI 公司有新能力、新产品、新工具的，一律 product_update
+4. 讨论某个商业/监管/行业动态但没有新产品的，才归 industry
+5. 不确定时：若提到任何 AI 公司名 + 任何能力性描述 → product_update；否则 industry
 
-输出严格 JSON 数组:
-[{"id": 原 id, "section": "section_id"}, ...]`
+只输出严格 JSON 数组 (不要输出其他任何文字):
+[{"id": 原 id, "section": "product_update" 或 "industry"}, ...]`
 
 // classifyUserPromptTemplate is the per-batch user message.
-const classifyUserPromptTemplate = `以下是候选条目，请按规则分类。
+const classifyUserPromptTemplate = `以下是新闻类候选条目，请只在 product_update / industry 里二选一：
 
 %s
 
-只输出 JSON 数组。`
+只输出 JSON 数组，不要输出其他文字。`
 
 // validSections is the allowlist that LLM output must fall into.
 var validSections = map[string]bool{
@@ -141,9 +173,24 @@ type classifyVerdict struct {
 	Section string `json:"section"`
 }
 
-// Classify batches items, calls the LLM once per batch, merges verdicts
-// and uses fallbackSection for any item the LLM missed or mislabeled.
-func (c *llmClassifier) Classify(ctx context.Context, items []*store.RawItem) (map[string][]*store.RawItem, error) {
+// Classify walks items in two passes:
+//
+//  1. Rule pass: look up sourceCategories[it.SourceID] and ask
+//     ruleClassifyByCategory for a confident section verdict. Items
+//     whose source category is paper / project / community / blog get
+//     bucketed immediately without any LLM call.
+//  2. LLM pass: any item that the rule pass declined (news category,
+//     or unknown source) gets batched to the LLM with a binary prompt
+//     that can only emit product_update or industry. Batch failures
+//     and missing verdicts drop through to fallbackSection.
+//
+// The guarantee is unchanged from v0: every non-nil input item appears
+// in exactly one bucket in the returned map.
+func (c *llmClassifier) Classify(
+	ctx context.Context,
+	items []*store.RawItem,
+	sourceCategories map[int64]string,
+) (map[string][]*store.RawItem, error) {
 	result := map[string][]*store.RawItem{
 		store.SectionProductUpdate: nil,
 		store.SectionResearch:      nil,
@@ -163,13 +210,36 @@ func (c *llmClassifier) Classify(ctx context.Context, items []*store.RawItem) (m
 		byID[it.ID] = it
 	}
 
+	// Pass 1 — rule pre-classify. Any item whose source category maps
+	// to a confident section verdict is placed directly; ambiguous items
+	// (news, or unknown source) accumulate in the LLM queue.
 	assigned := make(map[int64]string, len(items))
-	for start := 0; start < len(items); start += c.cfg.BatchSize {
-		end := start + c.cfg.BatchSize
-		if end > len(items) {
-			end = len(items)
+	var ambiguous []*store.RawItem
+	for _, it := range items {
+		if it == nil {
+			continue
 		}
-		batch := items[start:end]
+		srcCat := ""
+		if sourceCategories != nil {
+			srcCat = sourceCategories[it.SourceID]
+		}
+		sec, confident := ruleClassifyByCategory(srcCat, it.URL, it.Title)
+		if confident {
+			assigned[it.ID] = sec
+			continue
+		}
+		ambiguous = append(ambiguous, it)
+	}
+
+	// Pass 2 — LLM binary disambiguation for the ambiguous bucket only.
+	// The LLM is a strict product_update / industry classifier here; any
+	// other verdict is ignored and the item falls through to fallback.
+	for start := 0; start < len(ambiguous); start += c.cfg.BatchSize {
+		end := start + c.cfg.BatchSize
+		if end > len(ambiguous) {
+			end = len(ambiguous)
+		}
+		batch := ambiguous[start:end]
 
 		verdicts, err := c.classifyBatchWithRetry(ctx, batch)
 		if err != nil {
@@ -181,14 +251,16 @@ func (c *llmClassifier) Classify(ctx context.Context, items []*store.RawItem) (m
 			if _, ok := byID[v.ID]; !ok {
 				continue
 			}
-			if !validSections[v.Section] {
+			// The binary prompt should only emit these two, but we defend
+			// in depth against the LLM hallucinating a five-section verdict.
+			if v.Section != store.SectionProductUpdate && v.Section != store.SectionIndustry {
 				continue
 			}
 			assigned[v.ID] = v.Section
 		}
 	}
 
-	// Bucket assigned items, fallback-classify unassigned ones.
+	// Pass 3 — bucket assigned items, fallback-classify unassigned ones.
 	for id, it := range byID {
 		sec, ok := assigned[id]
 		if !ok {
@@ -198,6 +270,64 @@ func (c *llmClassifier) Classify(ctx context.Context, items []*store.RawItem) (m
 	}
 
 	return result, nil
+}
+
+// ruleClassifyByCategory is the deterministic pre-classifier for
+// v1.0.0. It maps source.category (from config/ai.yaml) plus some URL
+// hints into a section verdict. Returns (section, true) when the rule
+// is confident — caller should NOT re-ask the LLM. Returns ("", false)
+// when the item needs LLM help (i.e., it is a news article where the
+// product_update vs industry split cannot be derived from metadata
+// alone).
+//
+// Mapping:
+//
+//	paper      → research      (confident)
+//	project    → opensource    (confident)
+//	community  → social        (confident)
+//	blog       → social        (confident, blogs are commentary not news)
+//	news       → ("", false)   (ambiguous — LLM must decide)
+//	anything else → ("", false) (unknown — LLM fallback)
+//
+// A couple of URL-level overrides run before the category lookup so that
+// (e.g.) a blog post that links to arxiv.org still lands in research,
+// not social.
+func ruleClassifyByCategory(srcCategory, urlStr, title string) (string, bool) {
+	lowerURL := strings.ToLower(urlStr)
+
+	// High-confidence URL overrides beat the source category. These
+	// catch cases where a blog or news source happens to link to
+	// canonical research / open-source destinations.
+	switch {
+	case strings.Contains(lowerURL, "arxiv.org"),
+		strings.Contains(lowerURL, "huggingface.co/papers"),
+		strings.Contains(lowerURL, "papers.cool"),
+		strings.Contains(lowerURL, "openreview.net"):
+		return store.SectionResearch, true
+	case strings.Contains(lowerURL, "github.com/"),
+		strings.Contains(lowerURL, "gitlab.com/"),
+		strings.Contains(lowerURL, "ossinsight.io"):
+		return store.SectionOpenSource, true
+	}
+
+	switch strings.ToLower(strings.TrimSpace(srcCategory)) {
+	case "paper":
+		return store.SectionResearch, true
+	case "project":
+		return store.SectionOpenSource, true
+	case "community":
+		return store.SectionSocial, true
+	case "blog":
+		return store.SectionSocial, true
+	case "news":
+		// news is intentionally ambiguous — the LLM makes the
+		// product_update vs industry call.
+		return "", false
+	default:
+		// Unknown or missing category — let the LLM try. If the LLM
+		// also fails, fallbackSection will take over.
+		return "", false
+	}
 }
 
 // classifyBatchWithRetry calls the LLM up to MaxRetries times for a batch
@@ -259,9 +389,15 @@ func parseClassifyJSON(raw string) ([]classifyVerdict, error) {
 	return verdicts, nil
 }
 
-// fallbackSection is a deterministic rule-based classifier used when the
-// LLM fails or skips an item. It inspects URL host and title keywords to
-// pick the most plausible bucket.
+// fallbackSection is the last-resort rule-based classifier used when
+// both the category rule and the LLM decline to place an item. It
+// inspects URL host and title keywords to pick the most plausible
+// bucket. v1.0.0 tightens the default: instead of dumping "unknown"
+// items into social (which historically starved the research /
+// opensource sections), the catch-all now uses title keywords to
+// split between product_update and industry — because by the time we
+// reach this function the item is almost always a news article that
+// the LLM failed to decide.
 func fallbackSection(it *store.RawItem) string {
 	url := strings.ToLower(it.URL)
 	title := strings.ToLower(it.Title)
@@ -269,23 +405,14 @@ func fallbackSection(it *store.RawItem) string {
 	switch {
 	case strings.Contains(url, "arxiv.org"),
 		strings.Contains(url, "huggingface.co/papers"),
-		strings.Contains(url, "papers.cool"):
+		strings.Contains(url, "papers.cool"),
+		strings.Contains(url, "openreview.net"):
 		return store.SectionResearch
 
 	case strings.Contains(url, "github.com"),
 		strings.Contains(url, "ossinsight.io"),
 		strings.Contains(url, "gitlab.com"):
 		return store.SectionOpenSource
-
-	case strings.Contains(url, "openai.com"),
-		strings.Contains(url, "anthropic.com"),
-		strings.Contains(url, "deepmind.google"),
-		strings.Contains(url, "meta.ai"),
-		strings.Contains(url, "ai.meta.com"),
-		strings.Contains(url, "deepseek.com"),
-		strings.Contains(url, "mistral.ai"),
-		strings.Contains(url, "x.ai"):
-		return store.SectionProductUpdate
 
 	case strings.Contains(url, "reddit.com"),
 		strings.Contains(url, "ycombinator.com"),
@@ -300,21 +427,49 @@ func fallbackSection(it *store.RawItem) string {
 		strings.Contains(url, "ruanyifeng.com"):
 		return store.SectionSocial
 
-	case strings.Contains(url, "techcrunch.com"),
-		strings.Contains(url, "the-decoder.com"),
-		strings.Contains(url, "news.smol.ai"),
-		strings.Contains(url, "news.google.com"),
-		strings.Contains(title, "融资"),
-		strings.Contains(title, "监管"),
-		strings.Contains(title, "政策"),
-		strings.Contains(title, "funding"),
-		strings.Contains(title, "regulation"):
-		return store.SectionIndustry
+	case strings.Contains(url, "openai.com"),
+		strings.Contains(url, "anthropic.com"),
+		strings.Contains(url, "deepmind.google"),
+		strings.Contains(url, "meta.ai"),
+		strings.Contains(url, "ai.meta.com"),
+		strings.Contains(url, "deepseek.com"),
+		strings.Contains(url, "mistral.ai"),
+		strings.Contains(url, "x.ai"):
+		return store.SectionProductUpdate
 	}
 
-	// Default catch-all: the social bucket. It is the most permissive of
-	// the five and least likely to mislead downstream composition.
-	return store.SectionSocial
+	// Title keyword heuristic. News-style URLs (techcrunch, the-decoder,
+	// smol.ai, google news, ...) drop through to here; pick product_update
+	// vs industry by simple keyword matching so that one fallback-heavy
+	// day does not pile everything into a single bucket.
+	productKeywords := []string{
+		"发布", "推出", "上线", "发布会", "新版本", "新模型", "新功能",
+		"release", "launch", "launches", "unveil", "ships", "ship",
+		"announce", "announces", "available", "availability", "rolls out",
+		"beta", "preview",
+	}
+	industryKeywords := []string{
+		"融资", "监管", "政策", "诉讼", "收购", "并购", "报告", "调查",
+		"观点", "评论", "分析", "趋势",
+		"funding", "raise", "raised", "regulation", "policy", "lawsuit",
+		"acquisition", "acquires", "report", "survey", "analysis",
+		"opinion", "perspective", "interview",
+	}
+
+	for _, kw := range productKeywords {
+		if strings.Contains(title, kw) {
+			return store.SectionProductUpdate
+		}
+	}
+	for _, kw := range industryKeywords {
+		if strings.Contains(title, kw) {
+			return store.SectionIndustry
+		}
+	}
+
+	// Still unknown — prefer industry over social so news-category
+	// items default to the news-shaped section.
+	return store.SectionIndustry
 }
 
 // extractJSONArray / firstRunes / truncateOneLine are duplicated from

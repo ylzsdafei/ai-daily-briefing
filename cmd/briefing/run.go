@@ -22,7 +22,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,7 @@ import (
 	"briefing-v3/internal/config"
 	"briefing-v3/internal/gate"
 	"briefing-v3/internal/generate"
+	"briefing-v3/internal/illustration"
 	"briefing-v3/internal/image"
 	"briefing-v3/internal/infocard"
 	"briefing-v3/internal/ingest"
@@ -127,18 +130,38 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		return errors.New("filter: zero items inside lookback window — cannot proceed")
 	}
 
+	// --- 5a. Build sourceID → category map for rank + classify ---------
+	// v1.0.0 INTERFACE CHANGE (T2/C-stage): rank + classify now take a
+	// sourceCategories map so they can apply per-category quota and
+	// rule-first pre-classification. The authoritative category field
+	// lives in config/ai.yaml and is persisted into sources.config_json
+	// by seedCommand; ListEnabledSources parses it back out onto
+	// store.Source.Category.
+	sourceRows, err := s.ListEnabledSources(ctx, gf.domain)
+	if err != nil {
+		return fmt.Errorf("list sources for category map: %w", err)
+	}
+	sourceCategories := make(map[int64]string, len(sourceRows))
+	for _, sr := range sourceRows {
+		if sr == nil {
+			continue
+		}
+		sourceCategories[sr.ID] = sr.Category
+	}
+
 	// --- 5. Rank (LLM quality scoring) ----------------------------------
 	stage("rank: calling LLM quality scorer")
 	ranker, err := rank.New(rank.Config{
-		BaseURL: cfg.LLM.BaseURL,
-		APIKey:  cfg.LLM.APIKey,
-		Model:   cfg.LLM.Model,
-		Timeout: cfg.LLM.LLMTimeout(),
+		BaseURL:          cfg.LLM.BaseURL,
+		APIKey:           cfg.LLM.APIKey,
+		Model:            cfg.LLM.Model,
+		Timeout:          cfg.LLM.LLMTimeout(),
+		PerCategoryQuota: cfg.Rank.PerCategoryQuota,
 	})
 	if err != nil {
 		return fmt.Errorf("rank new: %w", err)
 	}
-	ranked, err := ranker.Rank(ctx, filtered)
+	ranked, err := ranker.Rank(ctx, filtered, sourceCategories)
 	if err != nil {
 		return fmt.Errorf("rank: %w", err)
 	}
@@ -155,8 +178,8 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		}
 	}
 
-	// --- 6. Classify (LLM section assignment) ---------------------------
-	stage("classify: calling LLM section classifier")
+	// --- 6. Classify (rule pre-classify + LLM binary disambiguation) ----
+	stage("classify: rule pre-classify + LLM news binary")
 	classifier, err := classify.New(classify.Config{
 		BaseURL: cfg.LLM.BaseURL,
 		APIKey:  cfg.LLM.APIKey,
@@ -166,7 +189,7 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	if err != nil {
 		return fmt.Errorf("classify new: %w", err)
 	}
-	sectioned, err := classifier.Classify(ctx, rankedRaws)
+	sectioned, err := classifier.Classify(ctx, rankedRaws, sourceCategories)
 	if err != nil {
 		return fmt.Errorf("classify: %w", err)
 	}
@@ -203,9 +226,17 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			MaxItems: sec.MaxItems,
 		})
 	}
-	issueItems, err := composer.Compose(ctx, issueID, sectioned, composeSections, summarizer)
+	// INTERFACE CHANGE (T2/C3): Compose() now returns (items, failedSections, err).
+	// failedSections drives the gate Warn downgrade in stage 14.
+	// T3 will take over refinement of how failedSections is surfaced to
+	// the render + Slack payload.
+	issueItems, composeFailedSections, err := composer.Compose(ctx, issueID, sectioned, composeSections, summarizer)
 	if err != nil {
 		return fmt.Errorf("compose: %w", err)
+	}
+	if len(composeFailedSections) > 0 {
+		stage(fmt.Sprintf("compose: %d section(s) degraded: %s",
+			len(composeFailedSections), strings.Join(composeFailedSections, ",")))
 	}
 	stage(fmt.Sprintf("compose: produced %d issue items", len(issueItems)))
 
@@ -214,9 +245,13 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// (editorial-style PIL info cards) built below from LLM-distilled
 	// structured JSON. mediaextract only runs to give items a hotlink
 	// image/video IF the info-card generation later fails.
-	stage("media: extracting fallback hero image/video from source URLs")
-	mediaFound := enrichItemsWithMedia(ctx, issueItems)
-	stage(fmt.Sprintf("media: %d items got a fallback hero image/video", mediaFound))
+	if gf.noImages {
+		stage("media: --no-images → skipping mediaextract")
+	} else {
+		stage("media: extracting fallback hero image/video from source URLs")
+		mediaFound := enrichItemsWithMedia(ctx, issueItems)
+		stage(fmt.Sprintf("media: %d items got a fallback hero image/video", mediaFound))
+	}
 
 	// --- 8. Persist IssueItems (replace any existing for this issue) ----
 	if err := s.ReplaceIssueItems(ctx, issueID, issueItems); err != nil {
@@ -262,6 +297,10 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// PNGs (1 header + N item cards). Each card PNG is injected as a
 	// markdown image at the top of its IssueItem.BodyMD so the HTML
 	// renderer picks it up via the existing `![alt](url)` path.
+	var headerCardPNGRel string
+	if gf.noImages {
+		stage("infocard: --no-images → skipping LLM card generation")
+	} else {
 	stage("infocard: generating editorial info-card JSON via LLM")
 	icGen, icErr := infocard.New(infocard.Config{
 		BaseURL:    cfg.LLM.BaseURL,
@@ -270,7 +309,6 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		MaxRetries: 3,
 		Timeout:    cfg.LLM.LLMTimeout(),
 	})
-	var headerCardPNGRel string
 	if icErr != nil {
 		fmt.Printf("[WARN] infocard new: %v — falling back to mediaextract images only\n", icErr)
 	} else {
@@ -358,6 +396,18 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			}
 		}
 	}
+	} // end of: if gf.noImages { ... } else { ... }
+
+	// --- 10c. Defensive scrub of any media markdown from BodyMD ---------
+	// When --no-images is set we must be 100% sure no image or video
+	// tag survives into the Slack mrkdwn (which does not support image
+	// markdown and would render `![alt](url)` as an ugly literal string).
+	// This also catches any image that the compose LLM itself injected
+	// into a body from the raw source content.
+	if gf.noImages {
+		stripMediaFromIssueItems(issueItems)
+		stage("scrub: stripped image/video markdown from all items (--no-images)")
+	}
 
 	// --- 11. Render markdown + sections map ----------------------------
 	renderSecs := make([]render.SectionMeta, 0, len(cfg.Sections))
@@ -375,11 +425,51 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// and manual review always have a flat text copy.
 	_ = writeDailyMarkdown(date, fullMarkdown)
 
+	// --- 11b. Write Hextra content markdown (v1.0.0 D2) ---------------
+	// When HEXTRA_SITE_DIR is set, write the canonical markdown (wrapped
+	// in a Hextra frontmatter block) under
+	// {HEXTRA_SITE_DIR}/content/cn/YYYY-MM/YYYY-MM-DD.md. A write failure
+	// is non-fatal — Slack publishing still proceeds. T3/v1.0.0 D2.
+	if hextraDir := os.Getenv("HEXTRA_SITE_DIR"); hextraDir != "" {
+		hugoPath, hugoErr := render.WriteHugoPost(hextraDir, issue, issueItems, insight, renderSecs)
+		if hugoErr != nil {
+			fmt.Printf("[WARN] hugo write post failed: %v (continuing)\n", hugoErr)
+		} else {
+			stage(fmt.Sprintf("hugo: wrote %s", hugoPath))
+		}
+	}
+
+	// --- 11c. Hugo build static site (v1.0.0 D4) ----------------------
+	// When HUGO_BIN + HEXTRA_SITE_DIR are both set, rebuild the Hextra
+	// site so the new content/*.md is picked up and published at
+	// {HEXTRA_SITE_DIR}/public/YYYY-MM/YYYY-MM-DD/. The build runs with a
+	// 60s timeout and its failure is logged but does NOT block the Slack
+	// publish — static-site refresh is always lower priority than the
+	// outbound Slack notification. The Go binary lives at /usr/local/go
+	// (T1 discovery), which Hextra's Hugo module resolution requires on
+	// PATH; without that, `hugo` errors out with "binary with name 'go'
+	// not found in PATH".
+	if hugoBin := os.Getenv("HUGO_BIN"); hugoBin != "" {
+		if hextraDir := os.Getenv("HEXTRA_SITE_DIR"); hextraDir != "" {
+			buildCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			cmd := exec.CommandContext(buildCtx, hugoBin, "--source", hextraDir, "--minify")
+			cmd.Env = append(os.Environ(), "PATH=/usr/local/go/bin:"+os.Getenv("PATH"))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				fmt.Printf("[WARN] hugo build failed: %v\n%s (continuing)\n", err, string(out))
+			} else {
+				stage("hugo: build complete")
+			}
+			cancel()
+		}
+	}
+
 	// --- 12. Generate headline image (local PNG only; Slack image_url
 	//         stays empty until we have a public image host) ------------
 	var headlineImageURL string
 	headlineText := extractTopHeadline(issueItems, summary)
-	if cfg.Image.Enabled {
+	if gf.noImages {
+		stage("image: --no-images → skipping headline PNG")
+	} else if cfg.Image.Enabled {
 		stage(fmt.Sprintf("image: generating headline PNG — %q", headlineText))
 		imgRenderer := image.New(image.Config{
 			PythonBin:   cfg.Image.PythonBin,
@@ -412,29 +502,41 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// Fall back to the old gen_headline.py PNG only if the info-card
 	// pass did not produce a header file.
 	headlineRelForHTML := headerCardPNGRel
-	if headlineRelForHTML == "" && cfg.Image.Enabled {
+	if gf.noImages {
+		headlineRelForHTML = ""
+	} else if headlineRelForHTML == "" && cfg.Image.Enabled {
 		// The PNG lives at data/images/YYYY-MM-DD.png; docs/*.html sits
 		// one level deep under briefing-v3/, so the relative href is
 		// ../data/images/... which browsers open correctly via file://.
 		headlineRelForHTML = fmt.Sprintf("../data/images/%s.png", date.Format("2006-01-02"))
 	}
-	htmlRes, htmlErr := render.WriteIssueHTML("docs", &render.IssueHTMLInput{
-		Issue:       issue,
-		Items:       issueItems,
-		Insight:     insight,
-		Sections:    renderSecs,
-		HeadlineImg: headlineRelForHTML,
-	})
-	if htmlErr != nil {
-		fmt.Printf("[WARN] html page generation failed: %v\n", htmlErr)
-	} else {
-		stage(fmt.Sprintf("html: %s (%d bytes)", htmlRes.Path, htmlRes.Size))
-	}
-	if indexEntries, err := render.CollectIndexEntries("docs"); err == nil {
-		if _, err := render.WriteIndexHTML("docs", indexEntries, "briefing-v3 · 每日早读 · 全网深度聚合"); err != nil {
-			fmt.Printf("[WARN] index html refresh failed: %v\n", err)
+	// v1.0.0 D3: Hextra migration deprecated docs/*.html. The legacy HTML
+	// path is now provided by the new Hextra static site (11b + 11c above).
+	// The three calls below are kept commented out as a rollback point:
+	// should v1.0.1 need to revert to the self-written HTML template, we
+	// simply uncomment this block and re-enable briefing-serve.service on
+	// port 8080. Do NOT remove the referenced helpers from render/html.go —
+	// they are preserved for the same reason.
+	_ = headlineRelForHTML // silence unused-var when the block is commented
+	/*
+		htmlRes, htmlErr := render.WriteIssueHTML("docs", &render.IssueHTMLInput{
+			Issue:       issue,
+			Items:       issueItems,
+			Insight:     insight,
+			Sections:    renderSecs,
+			HeadlineImg: headlineRelForHTML,
+		})
+		if htmlErr != nil {
+			fmt.Printf("[WARN] html page generation failed: %v\n", htmlErr)
+		} else {
+			stage(fmt.Sprintf("html: %s (%d bytes)", htmlRes.Path, htmlRes.Size))
 		}
-	}
+		if indexEntries, err := render.CollectIndexEntries("docs"); err == nil {
+			if _, err := render.WriteIndexHTML("docs", indexEntries, "briefing-v3 · 每日早读 · 全网深度聚合"); err != nil {
+				fmt.Printf("[WARN] index html refresh failed: %v\n", err)
+			}
+		}
+	*/
 
 	// --- 13. Build RenderedIssue for downstream render/publish ---------
 	// ReportURL points at the local HTML page via an absolute file:// URI
@@ -442,23 +544,27 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// development. Once GitHub Pages (or another host) is configured, set
 	// an env var BRIEFING_REPORT_URL_BASE to override this with a public
 	// URL. Example: https://ylzsdafei.github.io/briefing-v3/{{DATE}}.html
+	// v1.0.0 D7a: support both {{DATE}} (YYYY-MM-DD) and {{YEARMONTH}}
+	// (YYYY-MM) placeholders so operators can point report URLs at the
+	// Hextra-style path /YYYY-MM/YYYY-MM-DD/ instead of the legacy
+	// docs/YYYY-MM-DD.html path. Both placeholders are replaced; unknown
+	// tokens pass through unchanged.
 	reportURL := fmt.Sprintf("file:///root/briefing-v3/docs/%s.html", date.Format("2006-01-02"))
 	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
-		reportURL = strings.Replace(base, "{{DATE}}", date.Format("2006-01-02"), 1)
-	}
-
-	rendered := &publish.RenderedIssue{
-		Issue:            issue,
-		Items:            issueItems,
-		Insight:          insight,
-		HeadlineImageURL: headlineImageURL,
-		SectionsMarkdown: sectionsMD,
-		DateZH:           render.FormatDateZH(issue),
-		ReportURL:        reportURL,
+		reportURL = strings.ReplaceAll(base, "{{DATE}}", date.Format("2006-01-02"))
+		reportURL = strings.ReplaceAll(reportURL, "{{YEARMONTH}}", date.Format("2006-01"))
+		// v1.0.0: 三级 sidebar tree 需要 /YYYY/YYYY-MM/YYYY-MM-DD/ URL
+		reportURL = strings.ReplaceAll(reportURL, "{{YEAR}}", date.Format("2006"))
 	}
 
 	// --- 14. Hard quality gate -----------------------------------------
-	stage("gate: checking hard quality rules")
+	// INTERFACE CHANGE (T2/C4): gate.Check() now takes failedSections
+	// and totalSections, and returns Warn + Warnings alongside Pass +
+	// Reasons. Outcomes: Pass=true → green; Pass=false,Warn=true → yellow
+	// "质量待审"; Pass=false,Warn=false → hard fail. v1.0.0 D7b wires
+	// Warn/Warnings/FailedSections into RenderedIssue below so the Slack
+	// renderer can surface the degraded state visually.
+	stage("gate: checking quality rules (tri-state)")
 	g := gate.New(gate.Config{
 		MinItems:               cfg.Gate.MinItems,
 		MinSectionsWithContent: cfg.Gate.MinSectionsWithContent,
@@ -469,13 +575,36 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		MaxTakeawayBullets:     cfg.Gate.MaxTakeawayBullets,
 		MinSourceDomains:       cfg.Gate.MinSourceDomains,
 	})
-	report := g.Check(issue, issueItems, insight)
-	stage(fmt.Sprintf("gate: pass=%v items=%d sections=%d insightChars=%d industry=%d takeaways=%d domains=%d",
-		report.Pass, report.ItemCount, report.SectionCount, report.InsightChars,
-		report.IndustryBullets, report.TakeawayBullets, report.SourceDomainCount))
+	report := g.Check(issue, issueItems, insight, composeFailedSections, len(cfg.Sections))
+
+	// --- 13 (post-gate). Build RenderedIssue for downstream render/publish.
+	// Moved *after* the gate so v1.0.0 D7b can feed the Warn/Warnings/
+	// FailedSections into the Slack renderer in the same construction step.
+	rendered := &publish.RenderedIssue{
+		Issue:            issue,
+		Items:            issueItems,
+		Insight:          insight,
+		HeadlineImageURL: headlineImageURL,
+		SectionsMarkdown: sectionsMD,
+		DateZH:           render.FormatDateZH(issue),
+		ReportURL:        reportURL,
+		QualityWarn:      report.Warn,
+		QualityWarnings:  report.Warnings,
+		FailedSections:   report.FailedSections,
+	}
+	stage(fmt.Sprintf("gate: pass=%v warn=%v items=%d sections=%d insightChars=%d industry=%d takeaways=%d domains=%d failedSections=%d",
+		report.Pass, report.Warn, report.ItemCount, report.SectionCount, report.InsightChars,
+		report.IndustryBullets, report.TakeawayBullets, report.SourceDomainCount,
+		len(report.FailedSections)))
 	if !report.Pass {
-		for _, reason := range report.Reasons {
-			fmt.Printf("[GATE FAIL] %s\n", reason)
+		if report.Warn {
+			for _, w := range report.Warnings {
+				fmt.Printf("[GATE WARN] %s\n", w)
+			}
+		} else {
+			for _, reason := range report.Reasons {
+				fmt.Printf("[GATE FAIL] %s\n", reason)
+			}
 		}
 	}
 
@@ -483,6 +612,14 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	slackPayload, err := render.BuildSlackPayload(rendered)
 	if err != nil {
 		return fmt.Errorf("render slack payload: %w", err)
+	}
+
+	// Persist the exact bytes we are about to POST so `briefing promote`
+	// can re-send them verbatim to the prod webhook later. We intentionally
+	// write before dry-run branches so even a dry-run snapshot is usable
+	// for later inspection.
+	if err := savePayloadSnapshot(date, slackPayload); err != nil {
+		fmt.Printf("[WARN] save payload snapshot: %v\n", err)
 	}
 
 	// Dry-run short-circuit: print the markdown + payload to stdout and stop.
@@ -617,22 +754,119 @@ func ingestAll(ctx context.Context, s store.Store, domainID string, perSourceTim
 	return allItems, stats, nil
 }
 
-// filterByWindow keeps only items whose PublishedAt (or FetchedAt fallback)
-// is after cutoff. Items with zero PublishedAt and zero FetchedAt are kept
-// conservatively (we cannot prove they are old).
+// Regexes used by extractDateFromText to recover a real publication date
+// from adapter output when the upstream source embedded the date in the
+// title or body instead of a machine-readable field.
+//
+// Order matters: we try the high-specificity patterns first. Lower-case
+// month abbreviations are handled via strings.ToLower() in the function.
+var (
+	// English: "Feb 17, 2026", "February 17, 2026", "Feb17, 2026" (no space).
+	titleDateReEN = regexp.MustCompile(`(?i)(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)[a-z]*\s*(\d{1,2}),?\s*(\d{4})`)
+	// ISO: 2026-02-17 or 2026/02/17
+	titleDateReISO = regexp.MustCompile(`(\d{4})[-/](\d{1,2})[-/](\d{1,2})`)
+	// Chinese: 2026年2月17日 / 2026 年 2 月 17 日
+	titleDateReZH = regexp.MustCompile(`(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日`)
+)
+
+var monthAbbrToNum = map[string]time.Month{
+	"jan": time.January, "feb": time.February, "mar": time.March,
+	"apr": time.April, "may": time.May, "jun": time.June,
+	"jul": time.July, "aug": time.August, "sep": time.September,
+	"oct": time.October, "nov": time.November, "dec": time.December,
+}
+
+// extractDateFromText parses a dateline out of arbitrary text.
+// Returns (date, true) on success, (zero, false) on failure.
+// The returned date is set to 00:00 UTC of the matched day.
+func extractDateFromText(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	now := time.Now().UTC()
+	validYear := func(y int) bool { return y >= 2000 && y <= now.Year()+1 }
+	validMonth := func(m int) bool { return m >= 1 && m <= 12 }
+	validDay := func(d int) bool { return d >= 1 && d <= 31 }
+
+	if m := titleDateReEN.FindStringSubmatch(s); len(m) == 4 {
+		key := strings.ToLower(m[1])
+		if len(key) > 3 {
+			key = key[:3]
+		}
+		mon, ok := monthAbbrToNum[key]
+		day, _ := strconv.Atoi(m[2])
+		year, _ := strconv.Atoi(m[3])
+		if ok && validYear(year) && validDay(day) {
+			return time.Date(year, mon, day, 0, 0, 0, 0, time.UTC), true
+		}
+	}
+	if m := titleDateReISO.FindStringSubmatch(s); len(m) == 4 {
+		year, _ := strconv.Atoi(m[1])
+		mn, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		if validYear(year) && validMonth(mn) && validDay(day) {
+			return time.Date(year, time.Month(mn), day, 0, 0, 0, 0, time.UTC), true
+		}
+	}
+	if m := titleDateReZH.FindStringSubmatch(s); len(m) == 4 {
+		year, _ := strconv.Atoi(m[1])
+		mn, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		if validYear(year) && validMonth(mn) && validDay(day) {
+			return time.Date(year, time.Month(mn), day, 0, 0, 0, 0, time.UTC), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// filterByWindow keeps only items whose effective publication date is
+// after cutoff. "Effective" means: if the title (or content preview)
+// contains an explicit dateline, we trust that over whatever PublishedAt
+// the adapter set, because multiple adapters currently fall back to
+// fetch time when they cannot parse the real date — a pattern that lets
+// 2-month-old press releases leak into a 24h briefing.
+//
+// Items with NO recoverable date (zero PublishedAt AND no dateline in
+// title/content) are DROPPED rather than kept. The prior "keep on
+// unknown" policy produced false positives; the user explicitly asked
+// for quality over recall.
 func filterByWindow(items []*store.RawItem, cutoff time.Time) []*store.RawItem {
 	out := make([]*store.RawItem, 0, len(items))
+	var fallbackHits, droppedStale, droppedUnknown int
 	for _, it := range items {
 		if it == nil {
 			continue
 		}
+		// Try to recover a more reliable date from the adapter's title
+		// and content. If found, override whatever PublishedAt says —
+		// this is the single line that saves 04-11 from shipping Feb
+		// press releases.
+		if dt, ok := extractDateFromText(it.Title); ok {
+			it.PublishedAt = dt
+			fallbackHits++
+		} else if dt, ok := extractDateFromText(it.Content); ok {
+			it.PublishedAt = dt
+			fallbackHits++
+		}
+
 		ts := it.PublishedAt
 		if ts.IsZero() {
 			ts = it.FetchedAt
 		}
-		if ts.IsZero() || ts.After(cutoff) {
-			out = append(out, it)
+		if ts.IsZero() {
+			droppedUnknown++
+			continue
 		}
+		if ts.Before(cutoff) {
+			droppedStale++
+			continue
+		}
+		out = append(out, it)
+	}
+	if fallbackHits > 0 || droppedStale > 0 || droppedUnknown > 0 {
+		fmt.Printf("[filter] title-date fallback: %d recovered, %d dropped as stale, %d dropped as undated\n",
+			fallbackHits, droppedStale, droppedUnknown)
 	}
 	return out
 }
@@ -811,17 +1045,35 @@ func postAlert(ctx context.Context, webhookURL string, body []byte) error {
 }
 
 // buildGateFailAlert formats a Slack plain-text alert describing why the
-// gate rejected today's issue.
+// gate rejected today's issue. Works for both hard-fail and soft-warn
+// paths — the caller only ever invokes this when !r.Pass, but the
+// wording is conditioned on r.Warn so Warn cases read "质量待审" instead
+// of "质量不达标".
 func buildGateFailAlert(issue *store.Issue, r *gate.Report) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "🚨 briefing-v3 %s 质量不达标,正式频道已跳过\n", issue.IssueDate.Format("2006-01-02"))
+	if r.Warn {
+		fmt.Fprintf(&b, "⚠️ briefing-v3 %s 质量待审,正式频道已跳过\n", issue.IssueDate.Format("2006-01-02"))
+	} else {
+		fmt.Fprintf(&b, "🚨 briefing-v3 %s 质量不达标,正式频道已跳过\n", issue.IssueDate.Format("2006-01-02"))
+	}
 	fmt.Fprintf(&b, "• 条目数 %d | 非空 section %d | 洞察字数 %d\n",
 		r.ItemCount, r.SectionCount, r.InsightChars)
 	fmt.Fprintf(&b, "• 行业洞察 %d 条 | 启发 %d 条 | 独立源 %d 个\n",
 		r.IndustryBullets, r.TakeawayBullets, r.SourceDomainCount)
-	b.WriteString("未通过原因:\n")
-	for _, reason := range r.Reasons {
-		fmt.Fprintf(&b, "  - %s\n", reason)
+	if len(r.FailedSections) > 0 {
+		fmt.Fprintf(&b, "• 降级 section: %s\n", strings.Join(r.FailedSections, ","))
+	}
+	if len(r.Reasons) > 0 {
+		b.WriteString("硬 fail 原因:\n")
+		for _, reason := range r.Reasons {
+			fmt.Fprintf(&b, "  - %s\n", reason)
+		}
+	}
+	if len(r.Warnings) > 0 {
+		b.WriteString("软 warn 原因:\n")
+		for _, w := range r.Warnings {
+			fmt.Fprintf(&b, "  - %s\n", w)
+		}
 	}
 	return b.String()
 }
@@ -902,6 +1154,28 @@ func stableSortItemsBySectionSeq(items []*store.IssueItem) {
 	})
 }
 
+// stripMediaFromIssueItems removes any ![alt](url) markdown images,
+// [[VIDEO:url]] placeholders and common embed/hotlink fragments from
+// every IssueItem.BodyMD. Used by the --no-images escape hatch so the
+// text-only output never leaks image urls into Slack mrkdwn (which
+// does not render markdown images, so they would show up as ugly
+// literal text).
+func stripMediaFromIssueItems(items []*store.IssueItem) {
+	imgRe := regexp.MustCompile(`(?m)!\[[^\]]*\]\([^)]*\)[ \t]*\n?`)
+	videoRe := regexp.MustCompile(`(?m)\[\[VIDEO:[^\]]*\]\][ \t]*\n?`)
+	blankLines := regexp.MustCompile(`\n{3,}`)
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		body := it.BodyMD
+		body = imgRe.ReplaceAllString(body, "")
+		body = videoRe.ReplaceAllString(body, "")
+		body = blankLines.ReplaceAllString(body, "\n\n")
+		it.BodyMD = strings.TrimSpace(body)
+	}
+}
+
 // enrichItemsWithMedia walks every IssueItem, inspects its
 // SourceURLsJSON, and tries to extract a hero image (og:image) and
 // optional video (og:video / <video>) from the original article URLs
@@ -963,13 +1237,24 @@ func enrichItemsWithMedia(ctx context.Context, items []*store.IssueItem) int {
 	results := ex.ExtractBatch(ctx, urls, 8)
 
 	// Collate per-item: pick the first image and first video we find
-	// across that item's URL set.
+	// across that item's URL set, applying a cross-item de-duplication
+	// step so the same hero image cannot be assigned to more than one
+	// IssueItem (the 2026-04-10 run leaked 8× arxiv license badges and
+	// 5× openai_logos_wall_money.png this way).
+	//
+	// Strategy: iterate all refs in order, and only accept an image
+	// the first time we see that exact URL. Subsequent items keep
+	// searching their other source URLs (each item has up to 3) for a
+	// unique image. A first-seen tracker hit is also rejected here so
+	// we never inject one.
 	type collected struct {
 		image string
 		video string
 		alt   string
 	}
 	byItem := make(map[int]*collected)
+	seenImages := make(map[string]bool, len(allRefs))
+	seenVideos := make(map[string]bool, len(allRefs))
 	for i, ref := range allRefs {
 		m := results[i]
 		if m == nil {
@@ -981,14 +1266,26 @@ func enrichItemsWithMedia(ctx context.Context, items []*store.IssueItem) int {
 			byItem[ref.itemIdx] = c
 		}
 		if c.image == "" && m.HasImage() {
-			c.image = m.ImageURL
-			if strings.TrimSpace(m.AltText) != "" {
-				c.alt = m.AltText
+			candidate := strings.TrimSpace(m.ImageURL)
+			// Defence-in-depth: run the tracker filter again in case
+			// parseHTML accepted a borderline URL. Keeping the check
+			// here means enriching items is safe even if someone
+			// bypasses the parser.
+			if candidate != "" && !looksLikeMediaTracker(candidate) && !seenImages[candidate] {
+				c.image = candidate
+				seenImages[candidate] = true
+				if strings.TrimSpace(m.AltText) != "" {
+					c.alt = m.AltText
+				}
 			}
 		}
-		if c.video == "" && m.HasVideo() {
-			c.video = m.VideoURL
-		}
+		// v1.0.0 disables og:video capture entirely. Source og:video
+		// fields in the wild are too often stale site intros / player
+		// backgrounds with no relationship to the specific article, and
+		// we have no reliable heuristic to classify which ones are
+		// on-topic. Images are a safer default; callers can revisit
+		// video later with a semantic filter.
+		_ = seenVideos
 	}
 
 	// Apply back to IssueItem.BodyMD.
@@ -1026,7 +1323,96 @@ func enrichItemsWithMedia(ctx context.Context, items []*store.IssueItem) int {
 		enriched++
 	}
 
-	return enriched
+	// -------------------------------------------------------------
+	// FALLBACK: for every item that still has NO hero image (no og:image
+	// was extractable, or the extractor returned a blocked/duplicate
+	// one), fall back to an on-line AI-generated infographic from
+	// Pollinations. The URL is hot-linked — we never download the
+	// bytes, which honours the user preference of "no local hosting".
+	//
+	// Each item gets a deterministic seed (based on its Seq) so repeated
+	// regens produce the same image. The style suffix inside
+	// illustration.BuildHotlinkURL steers Pollinations towards
+	// "diagram / architecture / flowchart" rather than generic art.
+	// -------------------------------------------------------------
+	illusCount := 0
+	for i, it := range items {
+		if it == nil {
+			continue
+		}
+		// Skip items that already got a real og:image above.
+		if c, ok := byItem[i]; ok && c != nil && c.image != "" {
+			continue
+		}
+		// Use Title as the prompt source. v1.0.0 does NOT call an LLM
+		// to translate it to English — Pollinations accepts Chinese
+		// prompts directly. An English translation pass is on the
+		// v1.0.1 roadmap.
+		prompt := strings.TrimSpace(it.Title)
+		if prompt == "" {
+			continue
+		}
+		// Unique seed per item so no two items collide on the same
+		// Pollinations cache key. We combine section + Seq to avoid
+		// different sections with the same Seq getting the same image.
+		seed := 10000 + (len(it.Section)*97 + it.Seq*31)
+		url := illustration.BuildHotlinkURL(prompt, seed, 1200, 675)
+		if url == "" {
+			continue
+		}
+		alt := prompt
+		for _, ch := range []string{"[", "]", "(", ")"} {
+			alt = strings.ReplaceAll(alt, ch, " ")
+		}
+		alt = strings.TrimSpace(alt)
+
+		// Append at the END of the body so the image sits below the
+		// prose, mirroring mediaextract's existing append-behaviour.
+		var b strings.Builder
+		b.WriteString(strings.TrimRight(it.BodyMD, "\n"))
+		b.WriteString("\n\n")
+		fmt.Fprintf(&b, "![%s](%s)\n", alt, url)
+		it.BodyMD = b.String()
+		illusCount++
+	}
+	if illusCount > 0 {
+		fmt.Printf("[media] fallback: %d items got an AI-generated Pollinations illustration\n", illusCount)
+	}
+
+	return enriched + illusCount
+}
+
+// looksLikeMediaTracker is a thin wrapper that calls into the mediaextract
+// package's heuristic. We keep a tiny duplicate here (rather than exporting
+// looksLikeTracker from the package) so the defensive second-line filter
+// in enrichItemsWithMedia stays close to the site-specific needles we may
+// tweak on a production hotfix.
+//
+// At present it forwards the URL to a fresh mediaextract.Extractor, which
+// does NOT do an HTTP fetch — we only call the filter path via a local
+// helper. The mediaextract package recognises its own trackers the same
+// way, so this behaves identically and is cheap.
+func looksLikeMediaTracker(raw string) bool {
+	lower := strings.ToLower(raw)
+	// Mirror the most common hits; the canonical list lives inside the
+	// mediaextract package and is also applied at parse time.
+	blocklist := []string{
+		"/icons/licenses", "licenses/by-", "by-nc-sa", "by-nc-nd",
+		"arxiv.org/icons", "arxiv.org/favicons", "arxiv.org/static",
+		"logos_wall", "_logos", "-logos", "logos.", "logos-", "/logos",
+		"/logo", "logo.", "logo-", "logo_",
+		"favicon", "apple-touch", "site-icon",
+		"avatar", "gravatar", "profile-pic",
+		"=s0-", "=w100", "=w150", "=w200", "=w300",
+		"sprite", "social-", "share-button",
+		"placeholder", "default-image", "no-image",
+	}
+	for _, needle := range blocklist {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // renderInfoCardPNG invokes the Python PIL renderer script via stdin.

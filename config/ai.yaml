@@ -38,8 +38,24 @@ llm:
   timeout_seconds: 120
   max_retries: 5
 
+# Rank-stage knobs. v1.0.0 introduces per-category quotas so a
+# single explosive source (e.g. arxiv with 300 papers/day) cannot
+# starve other sections downstream. Rank first sorts by LLM score
+# then caps each source category at the quota below before passing
+# the top N to classify.
+rank:
+  per_category_quota:
+    news: 8
+    blog: 6
+    paper: 8
+    project: 6
+    community: 6
+
 # Hard quality gate. Pipeline fails loudly if any of these are not met.
-# Nothing is ever silently degraded.
+# v1.0.0: the gate is tri-state — pass / warn / fail. Only hard-fail
+# conditions (items=0, no sections, insight missing, every compose
+# section failed) block the test-channel publish. Soft-warn conditions
+# (counters below min) still publish with a "质量待审" marker.
 gate:
   min_items: 20                # total issue items after compose
   min_sections_with_content: 4 # at least 4 of 5 sections must be non-empty

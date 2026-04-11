@@ -15,11 +15,22 @@ type Config struct {
 	Domain   DomainConfig    `yaml:"domain"`
 	Window   WindowConfig    `yaml:"window"`
 	LLM      LLMConfig       `yaml:"llm"`
+	Rank     RankConfig      `yaml:"rank"`
 	Gate     GateConfig      `yaml:"gate"`
 	Slack    SlackConfig     `yaml:"slack"`
 	Image    ImageConfig     `yaml:"image"`
 	Sections []SectionConfig `yaml:"sections"`
 	Sources  []SourceConfig  `yaml:"sources"`
+}
+
+// RankConfig mirrors the `rank:` block in config/ai.yaml. Currently only
+// PerCategoryQuota is consumed; add more fields here as rank gains
+// knobs. All fields are optional — an empty block keeps v0 behaviour.
+type RankConfig struct {
+	// PerCategoryQuota maps source category (news/blog/paper/project/
+	// community) to the maximum number of top-scoring items rank will
+	// keep from that group. Empty means no quota (pure global top-N).
+	PerCategoryQuota map[string]int `yaml:"per_category_quota"`
 }
 
 // DomainConfig captures identity and presentation for a briefing domain.

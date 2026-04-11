@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -140,12 +141,41 @@ func (s *sqliteStore) ListEnabledSources(ctx context.Context, domainID string) (
 			return nil, fmt.Errorf("scan source: %w", err)
 		}
 		src.Enabled = enabled != 0
+		// Cheap one-off parse of config_json to surface the Category field.
+		// We intentionally ignore errors here — a missing or malformed JSON
+		// leaves Category empty, which downstream rule-based classify will
+		// treat as "unknown → fall through to LLM".
+		src.Category = extractSourceCategory(src.ConfigJSON)
 		out = append(out, &src)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sources: %w", err)
 	}
 	return out, nil
+}
+
+// extractSourceCategory pulls the "category" string out of a source's
+// config_json blob. Returns an empty string on any parse error or if the
+// field is missing. Kept here (not in types.go) because it is a SQLite
+// implementation detail of how sources.config_json is serialized by
+// cmd/briefing/main.go:marshalSourceConfig.
+func extractSourceCategory(configJSON string) string {
+	if strings.TrimSpace(configJSON) == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(configJSON), &m); err != nil {
+		return ""
+	}
+	v, ok := m["category"]
+	if !ok {
+		return ""
+	}
+	cat, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(cat)
 }
 
 // -------- RawItem --------

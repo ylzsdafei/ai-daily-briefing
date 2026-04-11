@@ -42,6 +42,28 @@ type RenderedIssue struct {
 	// Slack "view full report" button. May be empty when there is no
 	// published web view yet; publishers should fall back to a placeholder.
 	ReportURL string
+
+	// QualityWarn is true when the upstream gate produced a soft-warn
+	// verdict (Pass=false, Warn=true). Slack publishers should surface a
+	// "质量待审" marker in the message header so users can tell the
+	// briefing was shipped despite some missing signals. Default false.
+	//
+	// v1.0.0 D7b: introduced to ship tri-state gate results through to
+	// the Slack renderer without adding a new cross-package dependency
+	// on internal/gate from internal/render.
+	QualityWarn bool
+
+	// QualityWarnings is the free-form list of soft-warn reasons the
+	// gate emitted, in render order (already deduplicated). When
+	// non-empty the Slack footer surfaces them in a context block so
+	// operators can glance at why the warn state triggered.
+	QualityWarnings []string
+
+	// FailedSections lists the section IDs whose compose stage
+	// degraded (LLM call failed and was skipped with continue). Slack
+	// renderers display this in the footer context block when
+	// non-empty so readers know which sections are missing content.
+	FailedSections []string
 }
 
 // Publisher sends a RenderedIssue to one distribution channel.

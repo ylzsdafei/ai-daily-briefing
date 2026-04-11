@@ -35,6 +35,19 @@ type Config struct {
 	TopN       int           // return at most TopN items, default 30
 	MaxRetries int           // per-batch retries, default 3
 	Timeout    time.Duration // per-request timeout, default 120s
+	// PerCategoryQuota caps how many top-scoring items the ranker will
+	// return from each source category (news / blog / paper / project /
+	// community). When set, rank does two passes:
+	//
+	//   1. group items by source category (using SourceCategories) and
+	//      keep at most PerCategoryQuota[category] items per group,
+	//   2. merge the groups, sort by score descending, apply TopN.
+	//
+	// This prevents a single-category source explosion (e.g. arxiv
+	// dumping 20+ papers into the top 30) from starving other sections
+	// downstream. If PerCategoryQuota is nil or empty, rank falls back
+	// to pure global top-N behaviour (v0 default).
+	PerCategoryQuota map[string]int
 }
 
 func (c *Config) fillDefaults() {
@@ -64,8 +77,18 @@ type RankedItem struct {
 
 // Ranker is the public interface: score a batch of RawItems and return a
 // ranked-and-filtered subset.
+//
+// v1.0.0: Rank now accepts a sourceCategories lookup so it can enforce
+// the per-category quota configured via Config.PerCategoryQuota. The
+// map is sourceID → category ("news"/"blog"/"paper"/"project"/"community").
+// Items whose source is absent from the map are treated as an "unknown"
+// category that is not subject to any quota.
 type Ranker interface {
-	Rank(ctx context.Context, items []*store.RawItem) ([]*RankedItem, error)
+	Rank(
+		ctx context.Context,
+		items []*store.RawItem,
+		sourceCategories map[int64]string,
+	) ([]*RankedItem, error)
 }
 
 // New constructs a Ranker backed by an OpenAI-compatible chat/completions
@@ -155,10 +178,15 @@ type rankVerdict struct {
 }
 
 // Rank splits items into batches, scores each batch via LLM, merges the
-// verdicts, sorts by score desc and returns the top N items above
-// MinScore. Items for which no verdict is returned are silently dropped
-// (they are treated as "not interesting enough to be scored").
-func (r *llmRanker) Rank(ctx context.Context, items []*store.RawItem) ([]*RankedItem, error) {
+// verdicts, optionally applies a per-category quota, then sorts by score
+// desc and returns the top N items above MinScore. Items for which no
+// verdict is returned are silently dropped (they are treated as "not
+// interesting enough to be scored").
+func (r *llmRanker) Rank(
+	ctx context.Context,
+	items []*store.RawItem,
+	sourceCategories map[int64]string,
+) ([]*RankedItem, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -227,10 +255,71 @@ func (r *llmRanker) Rank(ctx context.Context, items []*store.RawItem) ([]*Ranked
 		return ranked[i].Item.ID < ranked[j].Item.ID
 	})
 
+	// Per-category quota: group by source category, keep at most N per
+	// group, then merge. This caps pathological single-category
+	// explosions (e.g. arxiv dumping 20+ papers into top 30 and starving
+	// news / opensource / social sections).
+	if len(r.cfg.PerCategoryQuota) > 0 {
+		ranked = applyPerCategoryQuota(ranked, sourceCategories, r.cfg.PerCategoryQuota)
+	}
+
 	if len(ranked) > r.cfg.TopN {
 		ranked = ranked[:r.cfg.TopN]
 	}
 	return ranked, nil
+}
+
+// applyPerCategoryQuota walks a score-sorted ranked slice, groups items
+// by their source category, truncates each group to the configured
+// quota and returns the merged slice in score-desc order.
+//
+// Unknown categories (source not in the map, or category not in the
+// quota map) are collected into a pseudo "_unknown" bucket that is NOT
+// capped — this lets edge-case sources (e.g. a new source added to the
+// DB but missing from config) still contribute items instead of being
+// silently dropped.
+func applyPerCategoryQuota(
+	ranked []*RankedItem,
+	sourceCategories map[int64]string,
+	quota map[string]int,
+) []*RankedItem {
+	if len(ranked) == 0 {
+		return ranked
+	}
+
+	// Input is already sorted by score desc, tie-break by ID asc. Walk
+	// it once, track per-category running count, drop items that exceed
+	// their category's quota.
+	counts := make(map[string]int, len(quota)+1)
+	out := make([]*RankedItem, 0, len(ranked))
+	for _, ri := range ranked {
+		if ri == nil || ri.Item == nil {
+			continue
+		}
+		cat := ""
+		if sourceCategories != nil {
+			cat = strings.ToLower(strings.TrimSpace(sourceCategories[ri.Item.SourceID]))
+		}
+		if cat == "" {
+			// Unknown category: let it through untouched.
+			out = append(out, ri)
+			continue
+		}
+		cap, known := quota[cat]
+		if !known || cap <= 0 {
+			// Category not in quota map: also let it through.
+			out = append(out, ri)
+			continue
+		}
+		if counts[cat] >= cap {
+			continue
+		}
+		counts[cat]++
+		out = append(out, ri)
+	}
+	// Output order is already score-desc because we iterated the sorted
+	// input in order.
+	return out
 }
 
 // rankBatchWithRetry attempts up to MaxRetries LLM calls for a single

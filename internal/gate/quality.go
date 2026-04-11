@@ -37,12 +37,35 @@ type Config struct {
 	BannedPatterns         []*regexp.Regexp
 }
 
-// Report is the outcome of a single gate check. Pass is true only when
-// Reasons is empty. All counters are filled in regardless of Pass, so
-// callers can display them side-by-side with the minimum thresholds.
+// Report is the outcome of a single gate check.
+//
+// v1.0.0 introduces a tri-state outcome:
+//
+//   - Pass == true                       → green, safe for prod promotion
+//   - Pass == false && Warn == true      → yellow, emit to test channel
+//     with a "质量待审" header
+//   - Pass == false && Warn == false     → red, hard fail, skip prod and
+//     post an alert to the test channel
+//
+// Hard-fail conditions (Pass=false, Warn=false):
+//   - issue is nil, or
+//   - items == 0, or
+//   - 0 sections with content, or
+//   - insight is nil, or
+//   - every configured section failed compose (FailedSections covers all)
+//
+// Soft-warn conditions (Pass=false, Warn=true) trigger when none of the
+// hard-fail conditions apply but any of the numeric thresholds below
+// the configured min (items, sections, insight chars, bullet counts,
+// source domains), or when FailedSections is non-empty.
+//
+// All counters are filled in regardless of outcome so callers can
+// display them side-by-side with the minimum thresholds.
 type Report struct {
 	Pass              bool
-	Reasons           []string
+	Warn              bool     // true when Pass=false but only soft warnings triggered
+	Reasons           []string // hard-fail reasons
+	Warnings          []string // soft-warn reasons
 	ItemCount         int
 	SectionCount      int
 	InsightChars      int
@@ -50,6 +73,7 @@ type Report struct {
 	TakeawayBullets   int
 	SourceDomainCount int
 	BannedHits        []string
+	FailedSections    []string // sections compose degraded on (from run.go)
 }
 
 // Gate holds a resolved Config and exposes Check to callers.
@@ -91,15 +115,33 @@ func DefaultBannedPatterns() []*regexp.Regexp {
 }
 
 // Check evaluates all gate rules against the supplied issue bundle and
-// returns a Report. The issue parameter is accepted for forward
-// compatibility (e.g. rules that key on IssueDate or Status) but is
-// currently only used to early-return on nil input.
-func (g *Gate) Check(issue *store.Issue, items []*store.IssueItem, insight *store.IssueInsight) *Report {
+// returns a Report.
+//
+// failedSections is the list of section ids that compose gracefully
+// degraded on (e.g. upstream 502). totalSections is the total number of
+// sections configured in config/ai.yaml — needed to detect the "every
+// section failed" hard-fail case. Pass both as empty/zero if the
+// caller does not care about compose degradation.
+//
+// The issue parameter is accepted for forward compatibility (e.g. rules
+// that key on IssueDate or Status) but is currently only used to
+// early-return on nil input.
+func (g *Gate) Check(
+	issue *store.Issue,
+	items []*store.IssueItem,
+	insight *store.IssueInsight,
+	failedSections []string,
+	totalSections int,
+) *Report {
 	r := &Report{
-		Pass:       true,
-		Reasons:    []string{},
-		BannedHits: []string{},
+		Pass:           true,
+		Reasons:        []string{},
+		Warnings:       []string{},
+		BannedHits:     []string{},
+		FailedSections: append([]string(nil), failedSections...),
 	}
+
+	// ----- Hard fail conditions (pipeline is structurally broken) -----
 
 	if issue == nil {
 		r.Pass = false
@@ -109,9 +151,6 @@ func (g *Gate) Check(issue *store.Issue, items []*store.IssueItem, insight *stor
 
 	// Items count.
 	r.ItemCount = len(items)
-	if r.ItemCount < g.cfg.MinItems {
-		r.Reasons = append(r.Reasons, "条目不足")
-	}
 
 	// Section coverage: how many distinct non-empty sections are present.
 	seen := make(map[string]struct{}, 8)
@@ -128,31 +167,35 @@ func (g *Gate) Check(issue *store.Issue, items []*store.IssueItem, insight *stor
 		seen[it.Section] = struct{}{}
 	}
 	r.SectionCount = len(seen)
-	if r.SectionCount < g.cfg.MinSectionsWithContent {
-		r.Reasons = append(r.Reasons, "section 覆盖不足")
-	}
 
-	// Insight length + bullet counts + banned patterns.
+	// Insight presence (hard fail if completely missing).
 	if insight == nil {
 		r.Reasons = append(r.Reasons, "缺少洞察")
-	} else {
+	}
+
+	// Structural hard-fail checks: zero items, zero sections, or every
+	// configured section failed to compose.
+	if r.ItemCount == 0 {
+		r.Reasons = append(r.Reasons, "条目为零")
+	}
+	if r.SectionCount == 0 {
+		r.Reasons = append(r.Reasons, "无有效 section 内容")
+	}
+	if totalSections > 0 && len(failedSections) >= totalSections {
+		r.Reasons = append(r.Reasons, "所有 section 撰稿均失败")
+	}
+
+	// Insight numeric checks: these are fatal if insight is present
+	// but the content itself is malformed (bullet counts wildly out of
+	// range or banned patterns). Length / bullet-count soft-warns are
+	// handled in the soft-warn section below.
+	if insight != nil {
 		industryMD := strings.TrimSpace(insight.IndustryMD)
 		ourMD := strings.TrimSpace(insight.OurMD)
 		combined := industryMD + ourMD
 		r.InsightChars = countRunes(combined)
-		if r.InsightChars < g.cfg.MinInsightChars {
-			r.Reasons = append(r.Reasons, "洞察字数不足")
-		}
-
 		r.IndustryBullets = countNumberedBullets(industryMD)
-		if r.IndustryBullets < g.cfg.MinIndustryBullets || r.IndustryBullets > g.cfg.MaxIndustryBullets {
-			r.Reasons = append(r.Reasons, "行业洞察条数超出范围")
-		}
-
 		r.TakeawayBullets = countNumberedBullets(ourMD)
-		if r.TakeawayBullets < g.cfg.MinTakeawayBullets || r.TakeawayBullets > g.cfg.MaxTakeawayBullets {
-			r.Reasons = append(r.Reasons, "启发条数超出范围")
-		}
 
 		for _, re := range g.cfg.BannedPatterns {
 			if re == nil {
@@ -167,14 +210,52 @@ func (g *Gate) Check(issue *store.Issue, items []*store.IssueItem, insight *stor
 		}
 	}
 
-	// Source diversity.
+	// Source diversity — count regardless of hard/soft classification.
 	domains := extractDomains(items)
 	r.SourceDomainCount = len(domains)
-	if r.SourceDomainCount < g.cfg.MinSourceDomains {
-		r.Reasons = append(r.Reasons, "源多样性不足")
+
+	// ----- Soft warn conditions (pipeline is producing but degraded) -----
+
+	// Only consider soft warnings when no hard-fail was recorded, so we
+	// don't muddle a fatal outcome with non-load-bearing warnings.
+	if len(r.Reasons) == 0 {
+		if r.ItemCount < g.cfg.MinItems {
+			r.Warnings = append(r.Warnings, "条目不足")
+		}
+		if r.SectionCount < g.cfg.MinSectionsWithContent {
+			r.Warnings = append(r.Warnings, "section 覆盖不足")
+		}
+		if insight != nil {
+			if r.InsightChars < g.cfg.MinInsightChars {
+				r.Warnings = append(r.Warnings, "洞察字数不足")
+			}
+			if r.IndustryBullets < g.cfg.MinIndustryBullets || r.IndustryBullets > g.cfg.MaxIndustryBullets {
+				r.Warnings = append(r.Warnings, "行业洞察条数超出范围")
+			}
+			if r.TakeawayBullets < g.cfg.MinTakeawayBullets || r.TakeawayBullets > g.cfg.MaxTakeawayBullets {
+				r.Warnings = append(r.Warnings, "启发条数超出范围")
+			}
+		}
+		if r.SourceDomainCount < g.cfg.MinSourceDomains {
+			r.Warnings = append(r.Warnings, "源多样性不足")
+		}
+		if len(failedSections) > 0 {
+			r.Warnings = append(r.Warnings, "部分 section 撰稿失败: "+strings.Join(failedSections, ","))
+		}
 	}
 
-	r.Pass = len(r.Reasons) == 0
+	// ----- Finalize -----
+
+	if len(r.Reasons) > 0 {
+		r.Pass = false
+		r.Warn = false
+	} else if len(r.Warnings) > 0 {
+		r.Pass = false
+		r.Warn = true
+	} else {
+		r.Pass = true
+		r.Warn = false
+	}
 	return r
 }
 

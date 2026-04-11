@@ -9,13 +9,19 @@
 // compose is the first stage that crosses back into the store.IssueItem
 // shape. It does NOT persist anything — callers (cmd/briefing) must
 // pass the returned IssueItems to store.Store.InsertIssueItems.
+//
+// v1.0.0: Compose() now degrades a failed section (e.g. summarizer
+// returns a 502 from the upstream gateway) into a logged warning and
+// continues with the remaining sections. The failed section ids are
+// returned alongside the IssueItems so the caller can surface them in
+// the Slack message / gate decision.
 package compose
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"log"
 	"regexp"
 	"strings"
 
@@ -43,13 +49,19 @@ type Composer interface {
 	// summarizer is the LLM text generator from the generate package;
 	// a nil summarizer returns an error (compose refuses to make up
 	// body text without an LLM).
+	//
+	// Returns (items, failedSections, error). failedSections is the
+	// list of section ids whose summarizer call raised an error (e.g.
+	// 502 upstream) and which were skipped gracefully. A non-nil error
+	// means compose itself failed setup (nil summarizer, no sections);
+	// per-section failures never propagate as a hard error.
 	Compose(
 		ctx context.Context,
 		issueID int64,
 		sectioned map[string][]*store.RawItem,
 		sections []SectionConfig,
 		summarizer generate.Summarizer,
-	) ([]*store.IssueItem, error)
+	) ([]*store.IssueItem, []string, error)
 }
 
 // New returns a default Composer. It is stateless so a single instance
@@ -63,21 +75,28 @@ type composer struct{}
 // Compose walks sections in order, caps each bucket at MaxItems, asks
 // the Summarizer to produce the section's markdown body, then splits
 // that markdown into one IssueItem per numbered entry.
+//
+// v1.0.0 behaviour: a single section's summarizer failure is logged
+// and its id is collected into failedSections; compose keeps going
+// with the remaining sections. The returned items slice is whatever
+// sections DID succeed; it can be empty if every section failed, in
+// which case the caller's gate will flag it as a hard fail.
 func (c *composer) Compose(
 	ctx context.Context,
 	issueID int64,
 	sectioned map[string][]*store.RawItem,
 	sections []SectionConfig,
 	summarizer generate.Summarizer,
-) ([]*store.IssueItem, error) {
+) ([]*store.IssueItem, []string, error) {
 	if summarizer == nil {
-		return nil, errors.New("compose: Summarizer is required")
+		return nil, nil, errors.New("compose: Summarizer is required")
 	}
 	if len(sections) == 0 {
-		return nil, errors.New("compose: no sections configured")
+		return nil, nil, errors.New("compose: no sections configured")
 	}
 
 	var out []*store.IssueItem
+	var failedSections []string
 
 	for _, sec := range sections {
 		items := sectioned[sec.ID]
@@ -94,10 +113,18 @@ func (c *composer) Compose(
 
 		md, err := summarizer.Summarize(ctx, sec.Title, items)
 		if err != nil {
-			return nil, fmt.Errorf("compose: summarize section %q: %w", sec.ID, err)
+			// v1.0.0 degradation: a single section's summarizer failure
+			// (e.g. upstream 502) is logged and skipped. The pipeline
+			// continues and the caller's gate downgrades to warn.
+			log.Printf("[WARN] compose: summarize section %q failed: %v (continuing)", sec.ID, err)
+			failedSections = append(failedSections, sec.ID)
+			continue
 		}
 		md = strings.TrimSpace(md)
 		if md == "" {
+			// Empty response is treated as a soft failure: the section
+			// contributes nothing but is flagged so the gate can warn.
+			failedSections = append(failedSections, sec.ID)
 			continue
 		}
 
@@ -105,7 +132,7 @@ func (c *composer) Compose(
 		out = append(out, issueItems...)
 	}
 
-	return out, nil
+	return out, failedSections, nil
 }
 
 // numberedEntryStart matches "1. " at the beginning of a line, which is

@@ -773,6 +773,78 @@ body {
 }
 
 /* ---------- main content ---------- */
+/* Masthead — a pure-text "大字报" hero that needs no image file and
+   works even when no headline illustration was generated. Dark poster
+   look with a kicker label, oversized headline, and a list of today's
+   top storylines. Matches the "important summary billboard" ask. */
+.masthead {
+  background: linear-gradient(135deg, #111 0%, #1e1e2b 100%);
+  color: #fff;
+  padding: 44px 40px;
+  margin-bottom: 32px;
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.12);
+  position: relative;
+  overflow: hidden;
+}
+.masthead::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 4px;
+  background: linear-gradient(90deg, #f59e0b 0%, #ef4444 50%, #8b5cf6 100%);
+}
+.masthead-label {
+  font-size: 11px;
+  letter-spacing: 3px;
+  color: #f59e0b;
+  text-transform: uppercase;
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+.masthead-title {
+  font-size: 40px;
+  font-weight: 900;
+  line-height: 1.15;
+  margin: 0 0 22px 0;
+  color: #fff;
+  letter-spacing: -0.5px;
+}
+.masthead-sub {
+  font-size: 15px;
+  line-height: 1.6;
+  color: #cbd5e1;
+  margin: 0 0 22px 0;
+  max-width: 820px;
+}
+.masthead-tops {
+  list-style: none;
+  padding: 0;
+  margin: 20px 0 0 0;
+  border-top: 1px solid #2d3040;
+  padding-top: 22px;
+}
+.masthead-tops li {
+  font-size: 15px;
+  line-height: 1.55;
+  color: #e2e8f0;
+  padding: 10px 0 10px 26px;
+  border-bottom: 1px dashed #2d3040;
+  position: relative;
+  font-weight: 500;
+}
+.masthead-tops li:last-child { border-bottom: none; }
+.masthead-tops li::before {
+  content: "▸";
+  position: absolute;
+  left: 0;
+  color: #f59e0b;
+  font-weight: 700;
+}
+@media (max-width: 760px) {
+  .masthead { padding: 28px 22px; }
+  .masthead-title { font-size: 26px; }
+}
 .headline-img {
   width: 100%;
   border-radius: 10px;
@@ -1128,7 +1200,17 @@ footer a { color: var(--fg-muted); }
 
   <main class="main">
     {{if .HasHeadlineImg}}
-    <img class="headline-img" src="{{.HeadlineImg}}" alt="briefing-v3 {{.DateStr}} 头版">
+    <img class="headline-img" src="{{.HeadlineImg}}" alt="briefing-v3 {{.DateStr}} 头版大字报">
+    {{else}}
+    <section class="masthead">
+      <div class="masthead-label">HEADLINE · {{.DateStr}}</div>
+      <h1 class="masthead-title">{{.Title}}</h1>
+      {{if .SummaryLines}}
+      <ol class="masthead-tops">
+      {{range .SummaryLines}}<li>{{.}}</li>
+      {{end}}</ol>
+      {{end}}
+    </section>
     {{end}}
     <header class="page-header">
       <h1>{{.Title}}</h1>

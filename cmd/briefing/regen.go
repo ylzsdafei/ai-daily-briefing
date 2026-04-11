@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -35,6 +36,12 @@ import (
 // fresh ones so the body does not accumulate stale image references across
 // multiple regen passes.
 var cardImgMarker = regexp.MustCompile(`!\[[^\]]*\]\(\.\./data/images/cards/[^)]+\)\s*\n?\n?`)
+
+// anyImgMarker matches ANY ![alt](url) and [[VIDEO:url]] fragment so
+// --media-only regen can start from a clean slate, whether the previous
+// run was an infocard-style card PNG or an earlier mediaextract pass.
+var anyImgMarker = regexp.MustCompile(`(?m)!\[[^\]]*\]\([^)]*\)[ \t]*\n?`)
+var anyVideoMarker = regexp.MustCompile(`(?m)\[\[VIDEO:[^\]]*\]\][ \t]*\n?`)
 
 func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *globalFlags) error {
 	stage := func(name string) { fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), name) }
@@ -69,13 +76,20 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	}
 	stage(fmt.Sprintf("loaded %d issue items", len(issueItems)))
 
-	// Strip any leftover card image markdown from a previous regen so
-	// we can re-inject fresh paths without stacking.
+	// Strip any leftover image markdown from previous passes so
+	// we can re-inject fresh paths without stacking. In --media-only
+	// mode we clear ALL images (not just card PNGs) so the pass
+	// starts from a clean BodyMD.
 	for _, it := range issueItems {
 		if it == nil {
 			continue
 		}
 		it.BodyMD = cardImgMarker.ReplaceAllString(it.BodyMD, "")
+		if gf.mediaOnly {
+			it.BodyMD = anyImgMarker.ReplaceAllString(it.BodyMD, "")
+			it.BodyMD = anyVideoMarker.ReplaceAllString(it.BodyMD, "")
+			it.BodyMD = strings.TrimSpace(it.BodyMD)
+		}
 	}
 
 	insight, err := s.GetIssueInsight(ctx, issue.ID)
@@ -106,7 +120,38 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 		}
 	}
 
-	// --- 2. Regenerate info cards (the whole point of this command) ---
+	// --- 2. Visual pass -----------------------------------------------
+	// Two modes:
+	//   (a) default: full infocard — local PIL L1 header PNG + L2 item
+	//       card PNGs, all file-served under data/images/cards/
+	//   (b) --media-only: NO local PIL rendering at all. Every image
+	//       comes from an on-line source (og:image hotlinks via
+	//       mediaextract). Items without a meaningful extractable
+	//       image simply stay image-free. This matches the user
+	//       preference of "all images online, no local hosting".
+	var headerCardPNGRel string
+
+	if gf.mediaOnly {
+		stage("media-only: no local PIL render, pulling og:image for each item")
+		// Wipe any stale card PNGs from a previous infocard pass so the
+		// HTML does not leak orphaned file references.
+		cardDir := filepath.Join("data", "images", "cards", date.Format("2006-01-02"))
+		if entries, _ := os.ReadDir(cardDir); entries != nil {
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), ".png") {
+					_ = os.Remove(filepath.Join(cardDir, e.Name()))
+				}
+			}
+		}
+
+		found := enrichItemsWithMedia(ctx, issueItems)
+		stage(fmt.Sprintf("media-only: %d items got a hero image/video from og:image", found))
+
+		// Persist mutated BodyMD back to SQLite.
+		if err := s.ReplaceIssueItems(ctx, issue.ID, issueItems); err != nil {
+			fmt.Printf("[WARN] replace issue items after media-only: %v\n", err)
+		}
+	} else {
 	stage("infocard: calling LLM to re-distill cards")
 	icGen, icErr := infocard.New(infocard.Config{
 		BaseURL:    cfg.LLM.BaseURL,
@@ -154,7 +199,6 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	}
 
 	// Header card PNG (非阻断).
-	var headerCardPNGRel string
 	headerPath := filepath.Join(cardDir, "header.png")
 	if err := renderInfoCardPNG(ctx, "header", header, headerPath); err != nil {
 		fmt.Printf("[WARN] infocard header render: %v\n", err)
@@ -206,6 +250,7 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	if err := s.ReplaceIssueItems(ctx, issue.ID, issueItems); err != nil {
 		fmt.Printf("[WARN] replace issue items: %v\n", err)
 	}
+	} // end of: if gf.mediaOnly { ... } else { ... }
 
 	// --- 3. Render markdown + HTML -----------------------------------
 	renderSecs := make([]render.SectionMeta, 0, len(cfg.Sections))
@@ -220,9 +265,24 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	stage(fmt.Sprintf("render: markdown built (%d bytes)", len(fullMarkdown)))
 	_ = writeDailyMarkdown(date, fullMarkdown)
 
+	// Only use a local hero PNG when we actually produced one (infocard
+	// legacy mode). In --media-only mode headerCardPNGRel is empty and
+	// we leave HeadlineImg blank — the HTML template just skips the
+	// hero image block, matching the "all images online" user pref.
 	headlineRelForHTML := headerCardPNGRel
-	if headlineRelForHTML == "" && cfg.Image.Enabled {
+	if !gf.mediaOnly && headlineRelForHTML == "" && cfg.Image.Enabled {
 		headlineRelForHTML = fmt.Sprintf("../data/images/%s.png", date.Format("2006-01-02"))
+	}
+	// BRIEFING_HERO_URL env var allows the operator to inject a
+	// pre-generated hero image URL (e.g. a hubtoday-style info poster
+	// that they rendered out of band). When set, it overrides both the
+	// HTML hero slot AND the Slack header image block so test+prod see
+	// the same poster. The URL is NOT downloaded — it is hot-linked
+	// verbatim, keeping the "no local hosting" guarantee.
+	heroOverrideURL := strings.TrimSpace(os.Getenv("BRIEFING_HERO_URL"))
+	if heroOverrideURL != "" {
+		headlineRelForHTML = heroOverrideURL
+		stage(fmt.Sprintf("hero: using BRIEFING_HERO_URL override = %s", heroOverrideURL))
 	}
 	htmlRes, htmlErr := render.WriteIssueHTML("docs", &render.IssueHTMLInput{
 		Issue:       issue,
@@ -240,16 +300,61 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 		_, _ = render.WriteIndexHTML("docs", indexEntries, "briefing-v3 · 每日早读 · 全网深度聚合")
 	}
 
+	// --- 3b. Hextra hugo path (v1.0.0 G 阶段补 regen 对接) ---------------
+	// regen 在 T3 D 阶段没有同步对接 hugo path. 缺这一段就会让 hugo.go 的
+	// scrub / hero prepend / 三级路径 / drop item-*.png 改动通过 regen
+	// 完全失效. 这里复制 run.go 11b/11c 段的逻辑追加进来. 旧的
+	// docs/*.html 路径仍然保留 (上面 line ~286), 作为 v1.0.1 之前的
+	// rollback safety net.
+	if hextraDir := os.Getenv("HEXTRA_SITE_DIR"); hextraDir != "" {
+		hugoPath, hugoErr := render.WriteHugoPost(hextraDir, issue, issueItems, insight, renderSecs)
+		if hugoErr != nil {
+			fmt.Printf("[WARN] hugo write post failed: %v (continuing)\n", hugoErr)
+		} else {
+			stage(fmt.Sprintf("hugo: wrote %s", hugoPath))
+		}
+		if hugoBin := os.Getenv("HUGO_BIN"); hugoBin != "" {
+			buildCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			cmd := exec.CommandContext(buildCtx, hugoBin, "--source", hextraDir, "--minify")
+			// Hextra needs Go on PATH for hugo modules (T1 discovery).
+			cmd.Env = append(os.Environ(), "PATH=/usr/local/go/bin:"+os.Getenv("PATH"))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				fmt.Printf("[WARN] hugo build failed: %v\n%s (continuing)\n", err, string(out))
+			} else {
+				stage("hugo: build complete")
+			}
+			cancel()
+		}
+	}
+
 	// --- 4. Build & publish ------------------------------------------
 	reportURL := fmt.Sprintf("file:///root/briefing-v3/docs/%s.html", date.Format("2006-01-02"))
 	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
-		reportURL = strings.Replace(base, "{{DATE}}", date.Format("2006-01-02"), 1)
+		// v1.0.0: support {{DATE}} / {{YEARMONTH}} / {{YEAR}} placeholders
+		// to align with run.go and the three-level Hextra URL structure
+		// /YYYY/YYYY-MM/YYYY-MM-DD/.
+		reportURL = strings.ReplaceAll(base, "{{DATE}}", date.Format("2006-01-02"))
+		reportURL = strings.ReplaceAll(reportURL, "{{YEARMONTH}}", date.Format("2006-01"))
+		reportURL = strings.ReplaceAll(reportURL, "{{YEAR}}", date.Format("2006"))
+	}
+	// Slack image_url only accepts JPG/PNG/GIF. If the hero override is
+	// AVIF/WEBP (modern formats many sites use now) Slack returns
+	// invalid_blocks. Detect the extension and, for Slack, fall back
+	// to empty so the Slack block is skipped — the HTML page still
+	// shows the image natively via the <img> tag.
+	slackHero := ""
+	if heroOverrideURL != "" {
+		low := strings.ToLower(heroOverrideURL)
+		if strings.Contains(low, ".jpg") || strings.Contains(low, ".jpeg") ||
+			strings.Contains(low, ".png") || strings.Contains(low, ".gif") {
+			slackHero = heroOverrideURL
+		}
 	}
 	rendered := &publish.RenderedIssue{
 		Issue:            issue,
 		Items:            issueItems,
 		Insight:          insight,
-		HeadlineImageURL: "",
+		HeadlineImageURL: slackHero,
 		SectionsMarkdown: sectionsMD,
 		DateZH:           render.FormatDateZH(issue),
 		ReportURL:        reportURL,
@@ -266,13 +371,25 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 		MaxTakeawayBullets:     cfg.Gate.MaxTakeawayBullets,
 		MinSourceDomains:       cfg.Gate.MinSourceDomains,
 	})
-	report := g.Check(issue, issueItems, insight)
+	// INTERFACE CHANGE (T2/C4): gate.Check() now takes failedSections and
+	// totalSections for tri-state (pass/warn/fail) outcome. regen replays an
+	// already-published issue so there are no fresh compose failures to
+	// report — pass nil and the configured total.
+	report := g.Check(issue, issueItems, insight, nil, len(cfg.Sections))
 	stage(fmt.Sprintf("gate: pass=%v items=%d sections=%d insightChars=%d domains=%d",
 		report.Pass, report.ItemCount, report.SectionCount, report.InsightChars, report.SourceDomainCount))
 
 	slackPayload, err := render.BuildSlackPayload(rendered)
 	if err != nil {
 		return fmt.Errorf("build slack payload: %w", err)
+	}
+
+	// Persist the exact payload bytes we are about to POST. `briefing
+	// promote` reads this file to re-post the SAME bytes to the prod
+	// webhook later, so that a manual "test OK, promote now" flow does
+	// not risk any drift (LLM non-determinism, new og:image etc.).
+	if err := savePayloadSnapshot(date, slackPayload); err != nil {
+		fmt.Printf("[WARN] save payload snapshot: %v\n", err)
 	}
 
 	if gf.dryRun {

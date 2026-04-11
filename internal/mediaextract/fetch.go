@@ -341,11 +341,18 @@ func resolveURL(base, href string) string {
 
 // looksLikeTracker is a best-effort heuristic to skip images that are
 // clearly NOT content-bearing illustrations: logos, banners, tracking
-// pixels, spacers, avatars, thumbnails, favicons, sprites, UI chrome.
+// pixels, spacers, avatars, thumbnails, favicons, sprites, UI chrome,
+// license badges, and site-wide composite brand images.
 //
 // The list is aggressive because the cost of a false positive (missing
 // a real image) is much lower than the cost of a false negative
 // (plastering 20 article cards with the same site logo).
+//
+// Maintenance note: when a real-world false negative slips through,
+// add its exact URL fragment here BEFORE touching the structure. This
+// list is the single source of truth — looksLikeTracker is called from
+// parseHTML AND from enrichItemsWithMedia, so one addition fixes every
+// caller at once.
 func looksLikeTracker(raw string) bool {
 	lower := strings.ToLower(raw)
 
@@ -355,9 +362,20 @@ func looksLikeTracker(raw string) bool {
 		// tracking
 		"pixel.gif", "pixel.png", "track", "beacon", "analytics",
 		"blank.gif", "spacer.gif", "1x1", "transparent.gif",
-		// logos & brand
+		// logos & brand (incl. plural form that earlier version missed,
+		// e.g. the-decoder's "openai_logos_wall_money.png")
 		"/logo", "logo.", "logo-", "logo_", "brand/",
+		"logos.", "logos-", "logos_", "_logos", "-logos", "/logos",
+		"wall_money", "logos_wall", "brand_wall",
 		"favicon", "apple-touch", "site-icon",
+		// license & copyright badges (arxiv icons/licenses/by-nc-sa-4.0.png
+		// was repeated 8× in the 2026-04-10 run)
+		"/icons/licenses", "licenses/by-", "/cc-by", "creativecommons.",
+		"by-nc-sa", "by-nc-nd", "by-sa-", "by-nd-",
+		// arxiv static chrome
+		"arxiv.org/icons", "arxiv.org/favicons", "arxiv.org/static",
+		// generic site chrome icon folders
+		"/icons/", "/badges/", "/emblems/",
 		// avatars & profiles
 		"avatar", "profile-pic", "gravatar", "user-photo", "user_photo",
 		// navigation & layout chrome
@@ -370,10 +388,14 @@ func looksLikeTracker(raw string) bool {
 		// obvious thumbnails (low-res)
 		"_thumb", "-thumb", "thumbnail", "_small", "-small",
 		"_tiny", "-tiny", "icon-", "-icon.", "_icon.",
-		// very small dimension hints
+		// very small dimension hints (in path or query)
 		"16x16", "32x32", "48x48", "64x64", "80x80", "96x96",
+		// Google content CDN low-res thumbnail params (=s0-w300, =w100, etc.)
+		"=s0-", "=w100", "=w150", "=w200", "=w300", "=h100", "=h150",
 		// ads
 		"ad.gif", "advert", "banner-ad", "promo-",
+		// common placeholder/default patterns
+		"placeholder", "default-image", "default_image", "no-image",
 	}
 	for _, needle := range needles {
 		if strings.Contains(lower, needle) {

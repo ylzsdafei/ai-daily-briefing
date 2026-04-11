@@ -347,8 +347,8 @@ crontab /root/crontab.backup.2026-04-10-pre-briefing-v3
 - Python: `/usr/bin/python3` + PIL 10.4.0
 - 字体: `/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc`
 - OpenAI: `http://64.186.239.99:8080` (gpt-5.4)
-- Slack 测试: `hooks.slack.com/services/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`
-- Slack 正式: `hooks.slack.com/services/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`
+- Slack 测试: `hooks.slack.com/services/REPLACE/WITH/YOUR_TEST_WEBHOOK` (实际值在 `config/secrets.env`)
+- Slack 正式: `hooks.slack.com/services/REPLACE/WITH/YOUR_PROD_WEBHOOK` (实际值在 `config/secrets.env`)
 
 ---
 

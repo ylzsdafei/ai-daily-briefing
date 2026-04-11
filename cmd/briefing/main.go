@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -36,6 +37,9 @@ Flags (available on most commands):
         --domain string   Domain id (default "ai")
         --target string   test|auto|prod (default "test")
         --dry-run         Skip actual Slack push
+        --no-images       Skip mediaextract / infocard / headline PNG stages
+                          (text-only mode, used as an escape hatch when image
+                          pipeline is unstable)
 
 Serve flags:
         --port int        listen port (default 8080)
@@ -51,6 +55,8 @@ type globalFlags struct {
 	domain     string
 	target     string
 	dryRun     bool
+	noImages   bool
+	mediaOnly  bool
 }
 
 // parseGlobalFlags parses the flag set used by every command. Unknown
@@ -65,6 +71,8 @@ func parseGlobalFlags(args []string) (*globalFlags, []string) {
 	fs.StringVar(&gf.domain, "domain", "ai", "domain id")
 	fs.StringVar(&gf.target, "target", "test", "test|auto|prod")
 	fs.BoolVar(&gf.dryRun, "dry-run", false, "skip actual slack push")
+	fs.BoolVar(&gf.noImages, "no-images", false, "skip all image generation stages (mediaextract/infocard/headline)")
+	fs.BoolVar(&gf.mediaOnly, "media-only", false, "regen only: skip infocard template PNGs, use mediaextract og:image instead (hubtoday style)")
 	_ = fs.Parse(args)
 	return gf, fs.Args()
 }
@@ -239,10 +247,93 @@ func runCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *glo
 	return runPipeline(ctx, cfg, date, gf)
 }
 
-// promoteCommand manually promotes an existing issue to the Slack prod
-// channel. Filled in by the main thread once publish wiring exists.
+// payloadSnapshotPath returns the canonical file path that run/regen
+// use to persist the last Slack payload they POSTed to the test
+// channel. promoteCommand reads this file and re-POSTs the EXACT same
+// bytes to the prod webhook so "manual sign-off then promote" cannot
+// ever drift from what the reviewer saw in test.
+func payloadSnapshotPath(date time.Time) string {
+	return fmt.Sprintf("data/slack-payload-%s.json", date.Format("2006-01-02"))
+}
+
+// savePayloadSnapshot writes payload verbatim to payloadSnapshotPath(date).
+// Used by run and regen right before they POST to test, so the prod
+// promote path can re-send bytes that are guaranteed to match exactly.
+func savePayloadSnapshot(date time.Time, payload []byte) error {
+	path := payloadSnapshotPath(date)
+	if err := os.MkdirAll("data", 0o755); err != nil {
+		return fmt.Errorf("mkdir data: %w", err)
+	}
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// promoteCommand re-posts the SAME Slack payload that was saved during
+// the last run/regen to the prod webhook. The user workflow is:
+//
+//  1. `briefing run --target test` (or `regen --media-only --target test`)
+//     — generates + POSTs to test webhook + persists payload snapshot
+//  2. Reviewer inspects the test channel, confirms the content is good
+//  3. `briefing promote --date YYYY-MM-DD` — reads the snapshot and
+//     POSTs the EXACT same bytes to the prod webhook
+//
+// This guarantees test and prod see identical blocks, even though the
+// underlying pipeline (LLM, mediaextract, etc.) is non-deterministic
+// between invocations.
 func promoteCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *globalFlags) error {
-	fmt.Printf("promote: date=%s (not yet implemented)\n", date.Format("2006-01-02"))
+	path := payloadSnapshotPath(date)
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read snapshot %s: %w (did you run `briefing run` / `briefing regen` first?)", path, err)
+	}
+	if len(payload) == 0 {
+		return fmt.Errorf("snapshot %s is empty", path)
+	}
+	prodURL := cfg.Slack.ProdWebhook
+	if prodURL == "" {
+		return errors.New("cfg.Slack.ProdWebhook is empty — set SLACK_PROD_WEBHOOK in secrets.env")
+	}
+
+	fmt.Printf("[%s] promote: re-posting snapshot %s (%d bytes) to Slack prod webhook\n",
+		time.Now().Format("15:04:05"), path, len(payload))
+
+	if gf.dryRun {
+		fmt.Println("dry-run: not posting to prod")
+		fmt.Println(string(payload))
+		return nil
+	}
+
+	s, err := store.New("data/briefing.db")
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer s.Close()
+
+	issue, err := s.GetIssueByDate(ctx, gf.domain, date)
+	if err != nil || issue == nil {
+		// The issue row is only used to record a Delivery log entry.
+		// If it is missing we still want to be able to promote, so we
+		// fall back to issueID 0 — the Slack POST itself does not need
+		// it.
+		fmt.Printf("[WARN] get issue for delivery log: %v (proceeding with issueID=0)\n", err)
+	}
+	var issueID int64
+	if issue != nil {
+		issueID = issue.ID
+	}
+
+	delivery := postSlackPayload(ctx, store.ChannelSlackProd, prodURL, payload, issueID)
+	if s != nil && issue != nil {
+		if err := s.InsertDelivery(ctx, delivery); err != nil {
+			fmt.Printf("[WARN] insert prod delivery: %v\n", err)
+		}
+	}
+	if delivery.Status != store.DeliveryStatusSent {
+		return fmt.Errorf("slack prod publish failed: %s", delivery.ResponseJSON)
+	}
+	fmt.Printf("[%s] promote: slack prod OK\n", time.Now().Format("15:04:05"))
 	return nil
 }
 
