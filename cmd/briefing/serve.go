@@ -138,7 +138,15 @@ func wrapFileServer(h http.Handler) http.Handler {
 		// still feel instant but a new day always wins.
 		if strings.HasSuffix(r.URL.Path, ".html") {
 			w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
+		} else if strings.Contains(r.URL.Path, "/cards/") && (strings.HasSuffix(r.URL.Path, ".png") || strings.HasSuffix(r.URL.Path, ".jpg")) {
+			// v1.0.0: hero 大字报和 item card PNG 路径固定但内容每天变,
+			// 不能 cache. 之前用 immutable + 24h 导致浏览器永远显示旧图
+			// (用户原话"大字报和之前一模一样"). 改成 no-store 强制每次
+			// 重新拉, 让大字报跟早报内容同步.
+			w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
 		} else if strings.HasSuffix(r.URL.Path, ".png") || strings.HasSuffix(r.URL.Path, ".jpg") || strings.HasSuffix(r.URL.Path, ".avif") {
+			// 其他静态图 (hugo theme assets/logo/favicon) 路径包含 hash
+			// 或永不变, 24h 缓存依然安全.
 			w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
 		}
 		h.ServeHTTP(w, r)

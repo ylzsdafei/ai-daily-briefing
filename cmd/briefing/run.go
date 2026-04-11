@@ -130,6 +130,22 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		return errors.New("filter: zero items inside lookback window — cannot proceed")
 	}
 
+	// --- 4b. Cross-run dedup --------------------------------------------
+	// v1.0.0: 用户反馈 "我希望每一次都是新的信息,而不是重复的内容收到3次".
+	// 维护 data/sent_urls.txt 文件作为 URL set, filter 阶段排除已经在历史
+	// briefing 中推送过的 URL. 这样即使同一天多次 run, 每次也都是全新内容.
+	// 实现 fail-soft: dedup 是优化项, 任何错误都不阻塞 pipeline.
+	sentURLs := loadSentURLs()
+	if len(sentURLs) > 0 {
+		beforeDedup := len(filtered)
+		filtered = dedupRawItemsBySent(filtered, sentURLs)
+		stage(fmt.Sprintf("dedup: %d → %d items (skipped %d already pushed in past runs)",
+			beforeDedup, len(filtered), beforeDedup-len(filtered)))
+	}
+	if len(filtered) == 0 {
+		return errors.New("dedup: every item in window already published — nothing new to push (consider clearing data/sent_urls.txt)")
+	}
+
 	// --- 5a. Build sourceID → category map for rank + classify ---------
 	// v1.0.0 INTERFACE CHANGE (T2/C-stage): rank + classify now take a
 	// sourceCategories map so they can apply per-category quota and
@@ -275,11 +291,14 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	stage("insight: generated and persisted")
 
 	// --- 10. Daily summary (Step 2 — 3-line summary) --------------------
+	// v1.0.0: 之前是 hard stop, 上游 LLM 一次 502 就让整条 pipeline 退出.
+	// 改为 fail-soft: LLM 临时挂掉就用本地兜底 summary (取前 3 个 high-quality
+	// item 的标题), pipeline 继续走完, 早报照样推送, 只是 summary 行内容降级.
 	stage("summary: generating 3-line daily summary")
 	summary, err := generateDailySummary(ctx, cfg.LLM, issueItems)
 	if err != nil {
-		// Summary failure is a hard stop — upstream always has a summary.
-		return fmt.Errorf("generate summary: %w", err)
+		fmt.Printf("[WARN] summary: %v — falling back to title-based local summary\n", err)
+		summary = buildFallbackSummary(issueItems)
 	}
 	issue.Summary = summary
 	issue.ItemCount = len(issueItems)
@@ -331,8 +350,32 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		}
 
 		header, cards, err := icGen.Generate(ctx, shadowItems, summary)
+		if err == nil && header != nil {
+			// LLM 成功. 但 LLM prompt 还是旧 schema (6 stories / 3 numbers /
+			// 单行 sub_headline), 跟新 PIL newspaper layout (11 stories / 6
+			// numbers / multi-line L2+L3) 不匹配, MORE STORIES / KEY NUMBERS
+			// 后排会空着. 用 buildFallbackHeaderCard 的字段补齐缺失部分,
+			// LLM 的字段优先, fallback 只补 LLM 没生成的.
+			enrichLLMHeader(header, issueItems, summary, issue.IssueNumber, date.Format("2006-01-02"))
+		}
 		if err != nil {
-			fmt.Printf("[WARN] infocard generate: %v — falling back to mediaextract images only\n", err)
+			fmt.Printf("[WARN] infocard generate: %v — using local fallback header\n", err)
+			// v1.0.0 fail-soft: LLM 上游一直 6 分钟超时, 不能因此让大字报
+			// 永远是旧图. 用本地构造器从 issueItems + summary 直接拼出
+			// HeaderCard, 喂给同一个 PIL 渲染脚本, 保证大字报永远是当天的.
+			fallbackHeader := buildFallbackHeaderCard(issueItems, summary, issue.IssueNumber, date.Format("2006-01-02"))
+			cardDir := filepath.Join("data", "images", "cards", date.Format("2006-01-02"))
+			if mkErr := os.MkdirAll(cardDir, 0o755); mkErr != nil {
+				fmt.Printf("[WARN] infocard fallback mkdir: %v\n", mkErr)
+			} else {
+				headerPath := filepath.Join(cardDir, "header.png")
+				if rdErr := renderInfoCardPNG(ctx, "header", fallbackHeader, headerPath); rdErr != nil {
+					fmt.Printf("[WARN] infocard fallback render: %v\n", rdErr)
+				} else {
+					headerCardPNGRel = fmt.Sprintf("../data/images/cards/%s/header.png", date.Format("2006-01-02"))
+					stage(fmt.Sprintf("infocard: fallback header PNG written to %s", headerPath))
+				}
+			}
 		} else {
 			stage(fmt.Sprintf("infocard: got header + %d cards, rendering PNGs", len(cards)))
 			header.IssueDate = date.Format("2006-01-02")
@@ -673,6 +716,16 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	if err := s.MarkIssuePublished(ctx, issueID); err != nil {
 		return fmt.Errorf("mark published: %w", err)
 	}
+
+	// --- 18b. Persist sent URLs for cross-run dedup --------------------
+	// 把这次推送的所有 source URL 加入 sent set, 下次 run 不再选这些条目.
+	// 用户原话: "我希望每一次都是新的信息". fail-soft: 写入失败 log 警告
+	// 但不返回 error (推送已经成功, dedup 优化失败不影响本次结果).
+	if newSent := collectIssueItemSourceURLs(issueItems); len(newSent) > 0 {
+		appendSentURLs(newSent)
+		stage(fmt.Sprintf("dedup: persisted %d new URLs to sent set", len(newSent)))
+	}
+
 	stage("pipeline complete: issue published")
 	return nil
 }
@@ -869,6 +922,408 @@ func filterByWindow(items []*store.RawItem, cutoff time.Time) []*store.RawItem {
 			fallbackHits, droppedStale, droppedUnknown)
 	}
 	return out
+}
+
+// enrichLLMHeader merges fallback content into an LLM-generated HeaderCard
+// to fill the gaps where the (legacy) LLM prompt produces fewer items than
+// the new newspaper PIL layout expects. LLM fields stay authoritative; we
+// only append/extend, never overwrite.
+//
+// Fields covered:
+//   - SubHeadline: 如果 LLM 输出单行, 加 fallback 的第 2 条 (\n 拼接) 让 PIL
+//     渲染出 L2 + L3 双层
+//   - LeadParagraph: 如果 LLM 没输出或太短, 用 fallback 的
+//   - KeyNumbers: 如果 LLM 输出 < 6, 用 fallback 的统计补到 6
+//   - TopStories: 如果 LLM 输出 < 11, 用 fallback 的额外 stories 补到 11
+//     (按 title 去重, LLM 的优先)
+func enrichLLMHeader(h *infocard.HeaderCard, items []*store.IssueItem, summary string, issueNumber int, date string) {
+	if h == nil {
+		return
+	}
+	fb := buildFallbackHeaderCard(items, summary, issueNumber, date)
+
+	// SubHeadline: LLM 单行 → 拼接 fb 的多行版本里的剩余行
+	if !strings.Contains(h.SubHeadline, "\n") && fb.SubHeadline != "" {
+		fbLines := strings.Split(fb.SubHeadline, "\n")
+		// 跳过 fb 的第 1 行 (跟 LLM 的 L2 可能重复), 取 fb 的第 2 条作为 L3
+		if len(fbLines) >= 2 {
+			h.SubHeadline = h.SubHeadline + "\n" + fbLines[1]
+		}
+	}
+
+	// LeadParagraph: LLM 没输出 → 用 fallback
+	if strings.TrimSpace(h.LeadParagraph) == "" {
+		h.LeadParagraph = fb.LeadParagraph
+	}
+
+	// KeyNumbers: 不够 6 个 → 用 fallback 的补
+	if len(h.KeyNumbers) < 6 {
+		seen := map[string]bool{}
+		for _, kn := range h.KeyNumbers {
+			seen[kn.Value] = true
+		}
+		for _, kn := range fb.KeyNumbers {
+			if len(h.KeyNumbers) >= 6 {
+				break
+			}
+			if seen[kn.Value] {
+				continue
+			}
+			seen[kn.Value] = true
+			h.KeyNumbers = append(h.KeyNumbers, kn)
+		}
+	}
+
+	// TopStories: 不够 11 个 → 用 fallback 的补 (按 title 去重)
+	if len(h.TopStories) < 11 {
+		seen := map[string]bool{}
+		for _, s := range h.TopStories {
+			seen[strings.TrimSpace(s.Title)] = true
+		}
+		for _, s := range fb.TopStories {
+			if len(h.TopStories) >= 11 {
+				break
+			}
+			t := strings.TrimSpace(s.Title)
+			if seen[t] {
+				continue
+			}
+			seen[t] = true
+			h.TopStories = append(h.TopStories, s)
+		}
+	}
+
+	// Edition: 如果 LLM 没输出 → 用 fallback
+	if strings.TrimSpace(h.Edition) == "" {
+		h.Edition = fb.Edition
+	}
+	// IssueDate: 如果 LLM 没输出 → 用 fallback
+	if strings.TrimSpace(h.IssueDate) == "" {
+		h.IssueDate = fb.IssueDate
+	}
+	// FooterSlogan: 同上
+	if strings.TrimSpace(h.FooterSlogan) == "" {
+		h.FooterSlogan = fb.FooterSlogan
+	}
+}
+
+// === infocard 本地兜底 (LLM 失败时用) ===
+//
+// 原理: infocard LLM 调用 (gpt-5.4 large JSON) 在 codex 上游一直 6 分钟
+// 超时, 导致 PIL 拿不到 JSON, header.png 永远不更新, 大字报永远是旧的.
+// 这个函数完全不调 LLM, 直接从已有的 issueItems + summary 用规则构造
+// 一个合理的 HeaderCard, 喂给同一个 PIL 脚本生成新 PNG. 保证大字报永远
+// 跟当天早报内容同步.
+//
+// 不追求跟 LLM 输出一样精炼 — 只追求"内容一定是今天的, 不会是历史残留".
+
+var fallbackKeyNumRe = regexp.MustCompile(`(\d+%|\d+)`)
+
+func buildFallbackHeaderCard(items []*store.IssueItem, summary string, issueNumber int, date string) *infocard.HeaderCard {
+	// summary 拆行 + 去前缀 bullet
+	stripBullet := func(s string) string {
+		s = strings.TrimSpace(s)
+		for _, p := range []string{"• ", "* ", "- ", "・", "· "} {
+			s = strings.TrimPrefix(s, p)
+		}
+		return strings.TrimSpace(s)
+	}
+	truncRunes := func(s string, n int) string {
+		s = strings.TrimSpace(s)
+		rs := []rune(s)
+		if len(rs) <= n {
+			return s
+		}
+		return string(rs[:n-1]) + "…"
+	}
+
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(summary), "\n") {
+		if l = stripBullet(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+
+	mainHeadline := "AI 日报今日要闻"
+	if len(lines) > 0 {
+		mainHeadline = lines[0]
+	}
+	// 按第一个逗号/句号截断, main_headline 是完整短句; 50 字硬限保险.
+	for _, sep := range []string{"，", "。", "；", ",", ".", ";"} {
+		if idx := strings.Index(mainHeadline, sep); idx > 0 {
+			mainHeadline = mainHeadline[:idx]
+			break
+		}
+	}
+	mainHeadline = truncRunes(strings.TrimSpace(mainHeadline), 50)
+
+	// L2/L3 次头条: 每行按第一个逗号/句号切是完整短句; 60 字硬限保险.
+	var subLines []string
+	for i := 1; i < len(lines) && len(subLines) < 3; i++ {
+		line := lines[i]
+		for _, sep := range []string{"，", "。", "；", ",", ".", ";"} {
+			if idx := strings.Index(line, sep); idx > 0 {
+				line = line[:idx]
+				break
+			}
+		}
+		subLines = append(subLines, truncRunes(strings.TrimSpace(line), 60))
+	}
+	subHeadline := strings.Join(subLines, "\n")
+	if subHeadline == "" {
+		subHeadline = "全网深度聚合 · 每日早读"
+	}
+
+	// Lead paragraph 加长: summary 全文 + items 的若干个 title 拼接, 总长
+	// 280 字符让左大栏导语段填满 5-6 行.
+	var leadParts []string
+	leadParts = append(leadParts, lines...)
+	for i, it := range items {
+		if it == nil || i >= 4 {
+			break
+		}
+		t := strings.TrimSpace(it.Title)
+		t = strings.TrimLeft(t, "*")
+		t = strings.TrimSpace(t)
+		if t != "" {
+			leadParts = append(leadParts, t)
+		}
+	}
+	leadParagraph := truncRunes(strings.Join(leadParts, " · "), 280)
+
+	// key_numbers: 从 summary 提取数字, 不够用统计补 (最多 5 个)
+	var keyNums []infocard.KeyNum
+	for _, m := range fallbackKeyNumRe.FindAllString(summary, -1) {
+		if len(keyNums) >= 5 {
+			break
+		}
+		keyNums = append(keyNums, infocard.KeyNum{Value: m, Label: "关键数字"})
+	}
+	sections := map[string]struct{}{}
+	for _, it := range items {
+		if it != nil {
+			sections[it.Section] = struct{}{}
+		}
+	}
+	stats := []infocard.KeyNum{
+		{Value: fmt.Sprintf("%d", len(items)), Label: "今日条目"},
+		{Value: fmt.Sprintf("%d", len(sections)), Label: "覆盖板块"},
+		{Value: "21", Label: "信息源"},
+		{Value: "24h", Label: "时间窗口"},
+		{Value: "AI", Label: "领域"},
+	}
+	for _, st := range stats {
+		if len(keyNums) >= 5 {
+			break
+		}
+		keyNums = append(keyNums, st)
+	}
+
+	// top_stories: 最多 9 条 (PIL 模板 3x3), 每个 section 配额 (产品 3, 研究 2, 其他各 1)
+	sectionLabels := map[string]string{
+		"product_update": "产品",
+		"research":       "研究",
+		"industry":       "行业",
+		"opensource":     "开源",
+		"social":         "社会",
+	}
+	// quota 总和 = 11, 让 buildFallbackHeaderCard 输出 11 条 stories,
+	// PIL bot zone (stories[6:11]) MORE STORIES 区能填满 5 条.
+	sectionQuota := map[string]int{
+		"product_update": 3,
+		"research":       3,
+		"industry":       2,
+		"opensource":     2,
+		"social":         1,
+	}
+	tagFor := func(section string) string {
+		if t := sectionLabels[section]; t != "" {
+			return t
+		}
+		if len(section) >= 2 {
+			return strings.ToUpper(section[:2])
+		}
+		return strings.ToUpper(section)
+	}
+	cleanTitle := func(title string) string {
+		t := strings.TrimSpace(title)
+		t = strings.TrimLeft(t, "*")
+		t = strings.TrimSpace(t)
+		// 26 → 60 字: 让每条 story 至少能用一句话把信息交代清楚, 不会出现
+		// "Anthropic 限制Mythos发布,引发..." 这种看不懂的截断 (用户原话).
+		return truncRunes(t, 60)
+	}
+	var stories []infocard.TopStory
+	sectionCount := map[string]int{}
+	for _, it := range items {
+		if len(stories) >= 9 {
+			break
+		}
+		if it == nil {
+			continue
+		}
+		cap := sectionQuota[it.Section]
+		if cap == 0 {
+			cap = 1
+		}
+		if sectionCount[it.Section] >= cap {
+			continue
+		}
+		sectionCount[it.Section]++
+		stories = append(stories, infocard.TopStory{Title: cleanTitle(it.Title), Tag: tagFor(it.Section)})
+	}
+	// 不够 9 条放宽 quota 再选一轮
+	if len(stories) < 9 {
+		seen := map[string]struct{}{}
+		for _, s := range stories {
+			seen[s.Title] = struct{}{}
+		}
+		for _, it := range items {
+			if len(stories) >= 9 {
+				break
+			}
+			if it == nil {
+				continue
+			}
+			t := cleanTitle(it.Title)
+			if _, ok := seen[t]; ok {
+				continue
+			}
+			seen[t] = struct{}{}
+			stories = append(stories, infocard.TopStory{Title: t, Tag: tagFor(it.Section)})
+		}
+	}
+
+	return &infocard.HeaderCard{
+		IssueDate:     date,
+		Edition:       fmt.Sprintf("v1.0.0 · 第 %d 期", issueNumber),
+		MainHeadline:  mainHeadline,
+		SubHeadline:   subHeadline,
+		LeadParagraph: leadParagraph,
+		KeyNumbers:    keyNums,
+		TopStories:    stories,
+		FooterSlogan:  "briefing-v3 · 全自动 AI 早报",
+	}
+}
+
+// === 跨 run 去重 (sent_urls.txt 持久化) ===
+//
+// 设计原则: 用最小代码实现"同一天多次 run 不重复推送同一篇文章".
+// 不动 sqlite schema, 不加 store interface 方法, 用一个简单的文件存
+// URL set. fail-soft: 任何 IO 错误都只 log 不阻塞 pipeline.
+
+const sentURLsPath = "data/sent_urls.txt"
+
+// loadSentURLs 从持久化文件读取已推送 URL set. 文件不存在或 IO 错误
+// 时返回空 set (首次运行 / 文件被清空 / 无权限读 都按"无历史"处理).
+func loadSentURLs() map[string]bool {
+	set := map[string]bool{}
+	data, err := os.ReadFile(sentURLsPath)
+	if err != nil {
+		return set
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			set[line] = true
+		}
+	}
+	return set
+}
+
+// appendSentURLs 把新一批 URL 追加到持久化文件. fail-soft: 任何错误
+// 都只 print warning, 不返回 error (推送已经成功, dedup 是优化项).
+func appendSentURLs(urls []string) {
+	if len(urls) == 0 {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(sentURLsPath), 0o755); err != nil {
+		fmt.Printf("[WARN] dedup: mkdir %s: %v\n", filepath.Dir(sentURLsPath), err)
+		return
+	}
+	f, err := os.OpenFile(sentURLsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Printf("[WARN] dedup: open %s: %v\n", sentURLsPath, err)
+		return
+	}
+	defer f.Close()
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if _, err := f.WriteString(u + "\n"); err != nil {
+			fmt.Printf("[WARN] dedup: write: %v\n", err)
+			return
+		}
+	}
+}
+
+// dedupRawItemsBySent 返回 raw items 的子集, 排除 URL 已经在 sent set
+// 中的条目. 如果 sent 为空 (首次运行) 直接返回原 slice.
+func dedupRawItemsBySent(items []*store.RawItem, sent map[string]bool) []*store.RawItem {
+	if len(sent) == 0 {
+		return items
+	}
+	out := make([]*store.RawItem, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if sent[it.URL] {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// collectIssueItemSourceURLs 解出每个 IssueItem 的 SourceURLsJSON 字段
+// 并扁平为单一 URL 列表, 用于 publish 后追加到 sent set. 解析失败的
+// item 跳过 (不影响其他 item 的去重持久化).
+func collectIssueItemSourceURLs(items []*store.IssueItem) []string {
+	var urls []string
+	for _, it := range items {
+		if it == nil || strings.TrimSpace(it.SourceURLsJSON) == "" {
+			continue
+		}
+		var us []string
+		if err := json.Unmarshal([]byte(it.SourceURLsJSON), &us); err != nil {
+			continue
+		}
+		for _, u := range us {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				urls = append(urls, u)
+			}
+		}
+	}
+	return urls
+}
+
+// buildFallbackSummary 在 LLM 上游临时不可用 (502/超时/etc) 时, 用本地
+// item 标题拼一个 3 行的兜底 summary, 让 pipeline 不会因为 transient
+// upstream error 整条退出. 取前 3 个 high-quality item 的标题作为 3 行.
+// 如果 item 数 < 3 就只取实际数. 如果完全没 item, 返回一行通用兜底.
+func buildFallbackSummary(items []*store.IssueItem) string {
+	var lines []string
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		title := strings.TrimSpace(it.Title)
+		if title == "" {
+			continue
+		}
+		lines = append(lines, "• "+title)
+		if len(lines) == 3 {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		return "今日 AI 早报已就绪 (LLM summary 临时不可用, 详见以下条目)."
+	}
+	return strings.Join(lines, "\n")
 }
 
 // generateDailySummary asks the LLM for a 3-line summary. We call the
@@ -1324,16 +1779,13 @@ func enrichItemsWithMedia(ctx context.Context, items []*store.IssueItem) int {
 	}
 
 	// -------------------------------------------------------------
-	// FALLBACK: for every item that still has NO hero image (no og:image
-	// was extractable, or the extractor returned a blocked/duplicate
-	// one), fall back to an on-line AI-generated infographic from
-	// Pollinations. The URL is hot-linked — we never download the
-	// bytes, which honours the user preference of "no local hosting".
-	//
-	// Each item gets a deterministic seed (based on its Seq) so repeated
-	// regens produce the same image. The style suffix inside
-	// illustration.BuildHotlinkURL steers Pollinations towards
-	// "diagram / architecture / flowchart" rather than generic art.
+	// FALLBACK: 对没抓到 og:image 的 item, 用 Pollinations 生成兜底图.
+	// 用户原则: "优先从信息源链接下拿图,但如果没有允许生成,要确保是有解释
+	// 意义的图". 关键是 prompt 必须精炼 - 不能像 v1.0.0 之前那样直接传
+	// item.Title (那样 19/23 item 都被 Pollinations 兜底成不相关的"diagram
+	// art", 用户判定为"空意义图"). 现在改成: title + body 首句摘要 (前 80
+	// 字符), 让 diffusion 模型有更多语境去生成话题相关的图. 同时 fail-soft:
+	// 单个 item 兜底失败也不能阻塞整条 pipeline.
 	// -------------------------------------------------------------
 	illusCount := 0
 	for i, it := range items {
@@ -1344,23 +1796,24 @@ func enrichItemsWithMedia(ctx context.Context, items []*store.IssueItem) int {
 		if c, ok := byItem[i]; ok && c != nil && c.image != "" {
 			continue
 		}
-		// Use Title as the prompt source. v1.0.0 does NOT call an LLM
-		// to translate it to English — Pollinations accepts Chinese
-		// prompts directly. An English translation pass is on the
-		// v1.0.1 roadmap.
-		prompt := strings.TrimSpace(it.Title)
-		if prompt == "" {
+		title := strings.TrimSpace(it.Title)
+		if title == "" {
 			continue
 		}
+		// Build a richer prompt: title + first ~80 chars of body excerpt.
+		bodyExcerpt := buildPromptExcerpt(it.BodyMD, 80)
+		prompt := title
+		if bodyExcerpt != "" {
+			prompt = title + ". " + bodyExcerpt
+		}
 		// Unique seed per item so no two items collide on the same
-		// Pollinations cache key. We combine section + Seq to avoid
-		// different sections with the same Seq getting the same image.
+		// Pollinations cache key.
 		seed := 10000 + (len(it.Section)*97 + it.Seq*31)
 		url := illustration.BuildHotlinkURL(prompt, seed, 1200, 675)
 		if url == "" {
 			continue
 		}
-		alt := prompt
+		alt := title
 		for _, ch := range []string{"[", "]", "(", ")"} {
 			alt = strings.ReplaceAll(alt, ch, " ")
 		}
@@ -1376,10 +1829,32 @@ func enrichItemsWithMedia(ctx context.Context, items []*store.IssueItem) int {
 		illusCount++
 	}
 	if illusCount > 0 {
-		fmt.Printf("[media] fallback: %d items got an AI-generated Pollinations illustration\n", illusCount)
+		fmt.Printf("[media] fallback: %d items got a Pollinations infographic (rich prompt)\n", illusCount)
 	}
 
 	return enriched + illusCount
+}
+
+// buildPromptExcerpt 把 markdown body 剥成纯文本, 取前 n 字符 (按 rune 切,
+// 避免切到 utf-8 字符中间). 用于给 Pollinations 提供 item 内容摘要作为 prompt
+// 上下文, 让生成的图更贴近实际内容. n 通常 60-100 字符即可, 太长 diffusion
+// 反而抓不住重点.
+func buildPromptExcerpt(body string, n int) string {
+	body = strings.ReplaceAll(body, "**", "")
+	body = strings.ReplaceAll(body, "*", "")
+	body = strings.ReplaceAll(body, "_", "")
+	body = strings.ReplaceAll(body, "`", "")
+	body = strings.ReplaceAll(body, "#", "")
+	body = strings.ReplaceAll(body, "\n", " ")
+	for strings.Contains(body, "  ") {
+		body = strings.ReplaceAll(body, "  ", " ")
+	}
+	body = strings.TrimSpace(body)
+	runes := []rune(body)
+	if len(runes) > n {
+		body = string(runes[:n])
+	}
+	return body
 }
 
 // looksLikeMediaTracker is a thin wrapper that calls into the mediaextract

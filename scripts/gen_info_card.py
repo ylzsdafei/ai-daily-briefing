@@ -92,23 +92,64 @@ def load_font(path, size):
 # ----- Text wrapping ------------------------------------------------------
 
 def wrap_by_width(draw, text, font, max_width):
-    """Greedy character-level wrap for CJK. Returns a list of lines."""
+    """Smart wrap: ASCII alphanumeric runs are pulled as whole words
+    (so "Spark" never gets split into "Spar" + "k"); CJK characters
+    and punctuation still wrap per-char. If a single ASCII word is wider
+    than max_width it falls back to char-level break for that word only.
+    """
     if not text:
         return []
     out = []
     line = ""
-    for ch in text:
+    i = 0
+    n = len(text)
+
+    def measure(s):
+        bbox = draw.textbbox((0, 0), s, font=font)
+        return bbox[2] - bbox[0]
+
+    while i < n:
+        ch = text[i]
         if ch == "\n":
             out.append(line)
             line = ""
+            i += 1
             continue
-        test = line + ch
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] > max_width and line:
-            out.append(line)
-            line = ch
+        # ASCII alnum: pull entire word as a unit so we don't split
+        # "Spark" / "App" / "Anthropic" mid-word.
+        if ord(ch) < 128 and ch.isalnum():
+            j = i + 1
+            while j < n and ord(text[j]) < 128 and (text[j].isalnum() or text[j] in "._'-"):
+                j += 1
+            word = text[i:j]
+            i = j
+            candidate = line + word
+            if measure(candidate) > max_width and line.strip():
+                out.append(line.rstrip())
+                # If the word itself is wider than max_width, split it char-wise.
+                if measure(word) > max_width:
+                    chunk = ""
+                    for w_ch in word:
+                        test = chunk + w_ch
+                        if measure(test) > max_width and chunk:
+                            out.append(chunk)
+                            chunk = w_ch
+                        else:
+                            chunk = test
+                    line = chunk
+                else:
+                    line = word
+            else:
+                line = candidate
+            continue
+        # CJK / 标点 / 空格: 逐字符
+        candidate = line + ch
+        if measure(candidate) > max_width and line:
+            out.append(line.rstrip() if line.endswith(" ") else line)
+            line = "" if ch == " " else ch
         else:
-            line = test
+            line = candidate
+        i += 1
     if line:
         out.append(line)
     return out
@@ -346,33 +387,51 @@ def render_item_card(data, output_path, width, height,
 
 def render_header_card(data, output_path, width, height,
                        font_bold_path, font_regular_path):
-    """One big banner for the whole issue — the 大字报 top of page.
+    """Hero 大字报 — newspaper-style 左右分栏 layout.
 
-    v1.0.0 急救版：从原来 7 个稀疏元素扩展到 11 个区域，把 1600x1600
-    画布从 ~40% 留白填到 ~90% 密度。新区域：edition 期号、加大的
-    main_headline、lead_paragraph 导语段、6 条 stories 双行布局、
-    key_numbers 横排数字。LLM prompt 同步加长字数限制，让每个区域
-    都有内容可填。
+    v1.0.0 hubtoday-参考版: 学习 source.hubtoday.app 的排版精神
+    1) 左右分栏 (LEFT 62% / RIGHT 38%, col_gap)
+    2) 多个 named sections, 每 section 一个红色 LABEL + 内容
+    3) 数字 cell 大字号 + 小标签
+    4) section 之间 horizontal rule 分隔
+    5) 高密度无大段空白
+
+    布局区域 (1600x1600):
+       0- 60   masthead bar
+      80-150   date + edition meta line + rule
+     150-720   主区   LEFT  L1 巨字 + 导语 lead
+                      RIGHT [今日要闻] L2 + [次要看点] L3
+     720-740   rule
+     740-1100  中区   LEFT  TOP STORIES 6 entries 2×3 grid
+                      RIGHT BY THE NUMBERS 4 cells 2×2 grid
+    1100-1130  rule
+    1130-1480  下区   LEFT  MORE STORIES 3 stories list
+                      RIGHT 今日板块速览 5 sections + count
+    1480-1600  footer bar
     """
     img = Image.new("RGB", (width, height), BG_MAIN)
     draw = ImageDraw.Draw(img)
 
     scale = width / 1600
 
+    # ---- Fonts ----
     f_mono = load_font(font_bold_path, int(26 * scale))
-    f_edition = load_font(font_bold_path, int(34 * scale))
+    f_edition = load_font(font_bold_path, int(32 * scale))
     f_date = load_font(font_bold_path, int(40 * scale))
-    f_headline = load_font(font_bold_path, int(108 * scale))
-    f_sub = load_font(font_bold_path, int(46 * scale))
-    f_lead = load_font(font_regular_path, int(34 * scale))
-    f_section_label = load_font(font_bold_path, int(24 * scale))
-    f_story_tag = load_font(font_bold_path, int(24 * scale))
-    f_story_title = load_font(font_bold_path, int(34 * scale))
-    f_keynum_value = load_font(font_bold_path, int(96 * scale))
-    f_keynum_label = load_font(font_regular_path, int(24 * scale))
-    f_slogan = load_font(font_regular_path, int(28 * scale))
+    f_l1 = load_font(font_bold_path, int(64 * scale))                # L1 main headline (左大栏) 64 让 1 行容纳更多字
+    f_lead = load_font(font_regular_path, int(26 * scale))           # 导语
+    f_l2 = load_font(font_bold_path, int(40 * scale))                # L2 right top (44→40 让 1 行容纳更多)
+    f_l3 = load_font(font_bold_path, int(30 * scale))                # L3 right top (36→30 防截断)
+    f_section_label = load_font(font_bold_path, int(22 * scale))     # 红色 SECTION LABEL
+    f_story_tag = load_font(font_bold_path, int(20 * scale))         # 故事 tag
+    f_story_title = load_font(font_bold_path, int(28 * scale))       # 中区故事 title
+    f_keynum_value = load_font(font_bold_path, int(72 * scale))      # 数字 cell 大字
+    f_keynum_label = load_font(font_regular_path, int(20 * scale))   # 数字 cell label
+    f_more_story = load_font(font_bold_path, int(26 * scale))        # 下区 more stories
+    f_section_name = load_font(font_bold_path, int(28 * scale))      # 板块名
+    f_section_count = load_font(font_bold_path, int(34 * scale))     # 板块计数
 
-    # Masthead
+    # ---- Masthead ----
     draw_masthead(
         draw, width,
         left_text="BRIEFING-V3 · DAILY",
@@ -383,10 +442,16 @@ def render_header_card(data, output_path, width, height,
     pad_x = int(56 * scale)
     content_w = width - pad_x * 2
 
-    # ---- Edition + Date line: red bar | issue_date | edition ----------
-    y = int(120 * scale)
+    # 左右分栏几何
+    col_gap = int(40 * scale)
+    left_w = int(content_w * 0.62)
+    right_x = pad_x + left_w + col_gap
+    right_w = width - pad_x - right_x
+
+    # ===== HEADER META: red bar | date | edition =====
+    y = int(112 * scale)
     draw.rectangle(
-        [pad_x, y + int(6 * scale), pad_x + int(12 * scale), y + int(44 * scale)],
+        [pad_x, y + int(6 * scale), pad_x + int(12 * scale), y + int(46 * scale)],
         fill=ACCENT_RED,
     )
     issue_date = data.get("issue_date", "")
@@ -395,115 +460,176 @@ def render_header_card(data, output_path, width, height,
     edition = data.get("edition", "").strip()
     if edition:
         edition_bbox = draw.textbbox((0, 0), edition, font=f_edition)
-        edition_w = edition_bbox[2] - edition_bbox[0]
+        edition_w_px = edition_bbox[2] - edition_bbox[0]
         draw.text(
-            (width - pad_x - edition_w, y + int(2 * scale)),
+            (width - pad_x - edition_w_px, y + int(4 * scale)),
             edition,
             font=f_edition,
             fill=INK_SOFT,
         )
-
-    # ---- Main headline (huge, up to 4 lines) --------------------------
-    y += int(80 * scale)
-    headline = data.get("main_headline") or "AI 资讯日报"
-    y = draw_wrapped(draw, (pad_x, y), headline, f_headline,
-                     INK_MAIN, content_w, line_spacing=1.12, max_lines=4)
-    y += int(20 * scale)
-
-    # ---- Sub-headline (blue accent) -----------------------------------
-    sub = data.get("sub_headline", "")
-    if sub:
-        y = draw_wrapped(draw, (pad_x, y), sub, f_sub,
-                         ACCENT_BLUE, content_w, line_spacing=1.28, max_lines=2)
-        y += int(28 * scale)
-
-    # ---- Horizontal rule before lead paragraph ------------------------
+    y += int(72 * scale)
     draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=3)
     y += int(28 * scale)
 
-    # ---- Lead paragraph (导语段) --------------------------------------
-    # New v1.0.0 region: 100-160 字 narrative summarising today's top
-    # stories in a single connected paragraph, like a real newspaper lead.
+    # ===== MAIN ZONE: LEFT L1 + lead, RIGHT L2 + L3 =====
+    main_zone_top = y
+
+    # LEFT col: L1 + lead
+    left_y = main_zone_top
+    headline = data.get("main_headline") or "AI 资讯日报"
+    left_y = draw_wrapped(
+        draw, (pad_x, left_y), headline, f_l1, INK_MAIN,
+        left_w, line_spacing=1.08, max_lines=3,
+    )
+    left_y += int(18 * scale)
     lead = data.get("lead_paragraph", "").strip()
     if lead:
-        y = draw_wrapped(
-            draw, (pad_x, y), lead, f_lead,
-            INK_MAIN, content_w, line_spacing=1.45, max_lines=6,
+        left_y = draw_wrapped(
+            draw, (pad_x, left_y), lead, f_lead, INK_MAIN,
+            left_w, line_spacing=1.40, max_lines=7,
         )
-        y += int(36 * scale)
-        # Section divider rule
-        draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=2)
-        y += int(28 * scale)
 
-    # ---- Top stories block (6 entries, 3 columns × 2 rows) ------------
-    stories = (data.get("top_stories") or [])[:6]
-    if stories:
-        # "TOP STORIES" section label on the left
-        draw.text((pad_x, y), "TOP STORIES",
+    # RIGHT col: 2 highlights with red labels
+    right_y = main_zone_top
+    sub_raw = data.get("sub_headline", "")
+    sub_lines = [s.strip() for s in sub_raw.split("\n") if s.strip()]
+    highlight_specs = [
+        ("今日要闻", f_l2, INK_MAIN, 3),
+        ("次要看点", f_l3, INK_MAIN, 3),
+    ]
+    for i, (label, font, color, ml) in enumerate(highlight_specs):
+        if i >= len(sub_lines):
+            break
+        draw.text((right_x, right_y), label,
                   font=f_section_label, fill=ACCENT_RED)
-        y += int(40 * scale)
+        right_y += int(30 * scale)
+        right_y = draw_wrapped(
+            draw, (right_x, right_y), sub_lines[i], font, color,
+            right_w, line_spacing=1.18, max_lines=ml,
+        )
+        right_y += int(28 * scale)
 
-        col_gap = int(40 * scale)
-        row_gap = int(30 * scale)
-        col_w = (content_w - col_gap * 2) // 3
-        # Each story cell is roughly 140px high in 1600 frame.
-        row_h = int(170 * scale)
+    # 主区底部对齐 (取较深的列)
+    y = max(left_y, right_y) + int(24 * scale)
+    draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=3)
+    y += int(24 * scale)
 
-        for i, st in enumerate(stories):
-            row = i // 3
-            col = i % 3
-            cx = pad_x + col * (col_w + col_gap)
-            cy = y + row * (row_h + row_gap)
-            tag = st.get("tag", "").upper()
+    # ===== MID ZONE: LEFT TOP STORIES 2×3 grid, RIGHT BY THE NUMBERS 2×2 grid =====
+    mid_zone_top = y
+    stories = data.get("top_stories") or []
+    key_numbers = data.get("key_numbers") or []
+
+    # LEFT: TOP STORIES (6 in 2 cols × 3 rows)
+    left_y = mid_zone_top
+    draw.text((pad_x, left_y), "TOP STORIES", font=f_section_label, fill=ACCENT_RED)
+    left_y += int(34 * scale)
+
+    # 用户反馈"截断到一半看不懂": 改回 6 (2×3) 但加大 row_h 让每 cell
+    # 能容纳 3 行 wrap, title 长 60 字至少能一句话讲清楚.
+    grid_stories = stories[:6]
+    if grid_stories:
+        col_inner_gap = int(28 * scale)
+        cell_w = (left_w - col_inner_gap) // 2
+        row_h = int(140 * scale)  # 96 → 140, 容纳 tag + 3 行 title
+        for i, st in enumerate(grid_stories):
+            row = i // 2
+            col = i % 2
+            cx = pad_x + col * (cell_w + col_inner_gap)
+            cy = left_y + row * row_h
+            tag = (st.get("tag") or "").upper()
             if tag:
                 draw.text((cx, cy), tag, font=f_story_tag, fill=ACCENT_RED)
-                cy += int(34 * scale)
+                cy += int(26 * scale)
             draw_wrapped(
                 draw, (cx, cy), st.get("title", ""),
-                f_story_title, INK_MAIN, col_w,
-                line_spacing=1.3, max_lines=3,
+                f_story_title, INK_MAIN, cell_w,
+                line_spacing=1.20, max_lines=3,
             )
+        n_rows = (len(grid_stories) + 1) // 2
+        left_y += n_rows * row_h
 
-        n_rows = (len(stories) + 2) // 3
-        y += n_rows * (row_h + row_gap) + int(20 * scale)
+    # RIGHT: BY THE NUMBERS (4 cells in 2×2 grid)
+    right_y = mid_zone_top
+    draw.text((right_x, right_y), "BY THE NUMBERS", font=f_section_label, fill=ACCENT_RED)
+    right_y += int(34 * scale)
 
-        # Section divider rule
-        draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=2)
-        y += int(40 * scale)
-
-    # ---- Key numbers strip (3 cells with huge value + label) ---------
-    # New v1.0.0 region: editorial-style "by the numbers" panel.
-    key_numbers = (data.get("key_numbers") or [])[:3]
-    if key_numbers:
-        draw.text((pad_x, y), "BY THE NUMBERS",
-                  font=f_section_label, fill=ACCENT_RED)
-        y += int(36 * scale)
-
-        cell_w = content_w // len(key_numbers)
-        for i, kn in enumerate(key_numbers):
-            cx = pad_x + i * cell_w
+    grid_nums = key_numbers[:6]  # 4 → 6 (2×3 grid 加密)
+    if grid_nums:
+        num_col_gap = int(20 * scale)
+        num_cell_w = (right_w - num_col_gap) // 2
+        num_row_h = int(128 * scale)  # 150 → 128 让 3 行 fit
+        for i, kn in enumerate(grid_nums):
+            row = i // 2
+            col = i % 2
+            cx = right_x + col * (num_cell_w + num_col_gap)
+            cy = right_y + row * num_row_h
             value = (kn.get("value") or "").strip()
             label = (kn.get("label") or "").strip()
             if value:
-                draw.text((cx, y), value, font=f_keynum_value, fill=ACCENT_BLUE)
+                draw.text((cx, cy), value, font=f_keynum_value, fill=ACCENT_BLUE)
             if label:
-                draw.text(
-                    (cx, y + int(108 * scale)),
-                    label,
-                    font=f_keynum_label,
-                    fill=INK_SOFT,
-                )
+                draw.text((cx, cy + int(76 * scale)), label,
+                          font=f_keynum_label, fill=INK_SOFT)
+        n_num_rows = (len(grid_nums) + 1) // 2
+        right_y += n_num_rows * num_row_h
 
-        y += int(160 * scale)
+    y = max(left_y, right_y) + int(24 * scale)
+    draw.line([(pad_x, y), (width - pad_x, y)], fill=RULE, width=3)
+    y += int(24 * scale)
 
-    # ---- Footer slogan (centered) -------------------------------------
-    slogan = data.get("footer_slogan", "briefing-v3 · 每日早读")
-    sy = int(height * 0.93)
-    bbox = draw.textbbox((0, 0), slogan, font=f_slogan)
-    sx = (width - (bbox[2] - bbox[0])) // 2
-    draw.text((sx, sy), slogan, font=f_slogan, fill=INK_SOFT)
+    # ===== BOTTOM ZONE: LEFT MORE STORIES, RIGHT 今日板块速览 =====
+    bot_zone_top = y
 
-    # ---- Footer bar ---------------------------------------------------
+    # LEFT: MORE STORIES — 把剩余的 stories 全显示出来 (8 之后).
+    # 注意 mid zone 现在用了 stories[:8], 这里用 stories[8:] 接着列.
+    # 但 stories 通常 9-12 条, 不够就把 stories[6:] 都拉进来加密.
+    left_y = bot_zone_top
+    draw.text((pad_x, left_y), "MORE STORIES", font=f_section_label, fill=ACCENT_RED)
+    left_y += int(30 * scale)
+
+    # 中区用 stories[:6], 这里取 stories[6:11] 把剩下的全列出来
+    more_stories = stories[6:11]
+    for st in more_stories[:5]:
+        tag = (st.get("tag") or "").upper()
+        title = (st.get("title") or "").strip()
+        if tag:
+            draw.text((pad_x, left_y), tag, font=f_story_tag, fill=ACCENT_RED)
+            left_y += int(22 * scale)
+        left_y = draw_wrapped(
+            draw, (pad_x, left_y), title, f_more_story, INK_MAIN,
+            left_w, line_spacing=1.18, max_lines=2,
+        )
+        left_y += int(10 * scale)
+
+    # RIGHT: 今日板块速览 — 用 stories 的 tag 计数推算 sections distribution
+    right_y = bot_zone_top
+    draw.text((right_x, right_y), "今日板块速览", font=f_section_label, fill=ACCENT_RED)
+    right_y += int(32 * scale)
+
+    sections_data = data.get("sections_overview") or []
+    if not sections_data:
+        from collections import Counter
+        tag_counter = Counter()
+        for st in stories:
+            t = (st.get("tag") or "").strip()
+            if t:
+                tag_counter[t] += 1
+        sections_data = [{"name": name, "count": str(cnt)} for name, cnt in tag_counter.most_common(5)]
+
+    for sec in sections_data[:5]:
+        name = (sec.get("name") or "").strip()
+        count = (sec.get("count") or "").strip()
+        if not name:
+            continue
+        draw.text((right_x, right_y), name, font=f_section_name, fill=INK_MAIN)
+        if count:
+            count_bbox = draw.textbbox((0, 0), count, font=f_section_count)
+            count_w_px = count_bbox[2] - count_bbox[0]
+            draw.text((right_x + right_w - count_w_px, right_y - int(2 * scale)),
+                      count, font=f_section_count, fill=ACCENT_BLUE)
+        right_y += int(40 * scale)
+
+    # ===== Footer bar =====
     draw_footer_bar(
         draw, width, height,
         left_text="briefing-v3 · hero",
