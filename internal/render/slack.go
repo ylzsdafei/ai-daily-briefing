@@ -55,14 +55,10 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 		})
 	}
 
-	// 2. Header block. When the upstream gate reported a soft-warn state
-	// (v1.0.0 D7b), prefix the header with "🟡 质量待审 | " so downstream
-	// readers immediately see the briefing passed through a degraded
-	// state and should be double-checked before any prod promotion.
+	// 2. Header block. v1.0.0+: 之前 gate warn 时会前缀 "🟡 质量待审 | "
+	// 但用户反馈"切正式频道时这个标签不应出现", 一次性删除. 测试 + 正式
+	// 频道 header 都干净, 内部 quality warn 仍由 gate + journal 记录.
 	headerText := fmt.Sprintf("🤖 AI 资讯日报 - %s", chineseDate)
-	if rendered.QualityWarn {
-		headerText = "🟡 质量待审 | " + headerText
-	}
 	blocks = append(blocks, map[string]any{
 		"type": "header",
 		"text": map[string]any{

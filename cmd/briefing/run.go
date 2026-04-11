@@ -981,7 +981,7 @@ func enrichLLMHeader(h *infocard.HeaderCard, items []*store.IssueItem, summary s
 			seen[strings.TrimSpace(s.Title)] = true
 		}
 		for _, s := range fb.TopStories {
-			if len(h.TopStories) >= 11 {
+			if len(h.TopStories) >= 14 {
 				break
 			}
 			t := strings.TrimSpace(s.Title)
@@ -1127,14 +1127,14 @@ func buildFallbackHeaderCard(items []*store.IssueItem, summary string, issueNumb
 		"opensource":     "开源",
 		"social":         "社会",
 	}
-	// quota 总和 = 11, 让 buildFallbackHeaderCard 输出 11 条 stories,
-	// PIL bot zone (stories[6:11]) MORE STORIES 区能填满 5 条.
+	// quota 总和 = 14, 让 buildFallbackHeaderCard 输出 14 条 stories,
+	// PIL mid (6) + bot (stories[6:14] 8 条) MORE STORIES 区能填满 8 条.
 	sectionQuota := map[string]int{
-		"product_update": 3,
+		"product_update": 4,
 		"research":       3,
-		"industry":       2,
+		"industry":       3,
 		"opensource":     2,
-		"social":         1,
+		"social":         2,
 	}
 	tagFor := func(section string) string {
 		if t := sectionLabels[section]; t != "" {
@@ -1145,18 +1145,42 @@ func buildFallbackHeaderCard(items []*store.IssueItem, summary string, issueNumb
 		}
 		return strings.ToUpper(section)
 	}
+	// cleanTitleWithBody 把 title 跟 body 描述段拼接成完整的"一句话信息".
+	// 关键: BodyMD 通常是 [image]\n\n[title heading]\n[描述段...] 结构,
+	// title heading 跟 IssueItem.Title 完全一致 (LLM 同时输出). 我们用
+	// string Index 找到 title 在 body 里的位置, trim 掉 title 之前+包括
+	// title 的部分, 剩下的就是真正的描述段.
+	cleanTitleWithBody := func(title, body string) string {
+		t := strings.TrimSpace(title)
+		t = strings.TrimLeft(t, "*")
+		t = strings.TrimSpace(t)
+		// 取大点的 body excerpt (200 字), 后面 trim title 后再缩到 80 字
+		bodyExcerpt := buildPromptExcerpt(body, 200)
+		if idx := strings.Index(bodyExcerpt, t); idx >= 0 {
+			bodyExcerpt = strings.TrimSpace(bodyExcerpt[idx+len(t):])
+			bodyExcerpt = strings.TrimLeft(bodyExcerpt, "·。.，,!?！？ \t")
+			bodyExcerpt = strings.TrimSpace(bodyExcerpt)
+		}
+		// trim 完之后取前 80 字 (按 rune)
+		runes := []rune(bodyExcerpt)
+		if len(runes) > 80 {
+			bodyExcerpt = string(runes[:80])
+		}
+		if bodyExcerpt != "" {
+			t = t + " · " + bodyExcerpt
+		}
+		return truncRunes(t, 140)
+	}
 	cleanTitle := func(title string) string {
 		t := strings.TrimSpace(title)
 		t = strings.TrimLeft(t, "*")
 		t = strings.TrimSpace(t)
-		// 26 → 60 字: 让每条 story 至少能用一句话把信息交代清楚, 不会出现
-		// "Anthropic 限制Mythos发布,引发..." 这种看不懂的截断 (用户原话).
 		return truncRunes(t, 60)
 	}
 	var stories []infocard.TopStory
 	sectionCount := map[string]int{}
 	for _, it := range items {
-		if len(stories) >= 9 {
+		if len(stories) >= 14 {
 			break
 		}
 		if it == nil {
@@ -1170,16 +1194,24 @@ func buildFallbackHeaderCard(items []*store.IssueItem, summary string, issueNumb
 			continue
 		}
 		sectionCount[it.Section]++
-		stories = append(stories, infocard.TopStory{Title: cleanTitle(it.Title), Tag: tagFor(it.Section)})
+		// 前 6 条 (mid TOP STORIES grid) 保持短 title 适配 cell width
+		// 后 8 条 (bot MORE STORIES) 用 cleanTitleWithBody 拼接 body 摘要
+		var titleStr string
+		if len(stories) < 6 {
+			titleStr = cleanTitle(it.Title)
+		} else {
+			titleStr = cleanTitleWithBody(it.Title, it.BodyMD)
+		}
+		stories = append(stories, infocard.TopStory{Title: titleStr, Tag: tagFor(it.Section)})
 	}
-	// 不够 9 条放宽 quota 再选一轮
-	if len(stories) < 9 {
+	// 不够 11 条放宽 quota 再选一轮 (PIL bot zone 用 stories[6:11])
+	if len(stories) < 11 {
 		seen := map[string]struct{}{}
 		for _, s := range stories {
 			seen[s.Title] = struct{}{}
 		}
 		for _, it := range items {
-			if len(stories) >= 9 {
+			if len(stories) >= 14 {
 				break
 			}
 			if it == nil {
@@ -1835,26 +1867,54 @@ func enrichItemsWithMedia(ctx context.Context, items []*store.IssueItem) int {
 	return enriched + illusCount
 }
 
-// buildPromptExcerpt 把 markdown body 剥成纯文本, 取前 n 字符 (按 rune 切,
-// 避免切到 utf-8 字符中间). 用于给 Pollinations 提供 item 内容摘要作为 prompt
-// 上下文, 让生成的图更贴近实际内容. n 通常 60-100 字符即可, 太长 diffusion
-// 反而抓不住重点.
+// buildPromptExcerpt 把 markdown body 剥成纯文本, 取**第二段以后**的前 n
+// 字符 (按 rune 切). BodyMD 的结构通常是:
+//
+//	![card image](url)\n\n1. **title heading.**\n正文段落 1...\n\n正文段落 2...
+//
+// 第一段是 title heading (跟 IssueItem.Title 重复), 必须跳过, 否则拼接到
+// title 后面会重复. 我们取第二段及之后作为真正的描述摘要.
+var markdownImageRe = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
+var markdownLinkRe = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+var listNumPrefixRe = regexp.MustCompile(`^\d+\.\s+`)
+
 func buildPromptExcerpt(body string, n int) string {
-	body = strings.ReplaceAll(body, "**", "")
-	body = strings.ReplaceAll(body, "*", "")
-	body = strings.ReplaceAll(body, "_", "")
-	body = strings.ReplaceAll(body, "`", "")
-	body = strings.ReplaceAll(body, "#", "")
-	body = strings.ReplaceAll(body, "\n", " ")
-	for strings.Contains(body, "  ") {
-		body = strings.ReplaceAll(body, "  ", " ")
+	// 1. 删除 markdown image
+	body = markdownImageRe.ReplaceAllString(body, "")
+	// 2. 删除 markdown link 保留 text
+	body = markdownLinkRe.ReplaceAllString(body, "$1")
+	// 3. 按段落 split, 跳过第一段 (title heading)
+	paragraphs := strings.Split(body, "\n\n")
+	var nonEmpty []string
+	for _, p := range paragraphs {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			nonEmpty = append(nonEmpty, p)
+		}
 	}
-	body = strings.TrimSpace(body)
-	runes := []rune(body)
+	var text string
+	if len(nonEmpty) > 1 {
+		text = strings.Join(nonEmpty[1:], " ")
+	} else if len(nonEmpty) == 1 {
+		text = nonEmpty[0]
+	}
+	// 4. 删除 emphasis / heading / 列表序号 等
+	text = strings.ReplaceAll(text, "**", "")
+	text = strings.ReplaceAll(text, "*", "")
+	text = strings.ReplaceAll(text, "_", "")
+	text = strings.ReplaceAll(text, "`", "")
+	text = strings.ReplaceAll(text, "#", "")
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = listNumPrefixRe.ReplaceAllString(text, "")
+	for strings.Contains(text, "  ") {
+		text = strings.ReplaceAll(text, "  ", " ")
+	}
+	text = strings.TrimSpace(text)
+	runes := []rune(text)
 	if len(runes) > n {
-		body = string(runes[:n])
+		text = string(runes[:n])
 	}
-	return body
+	return text
 }
 
 // looksLikeMediaTracker is a thin wrapper that calls into the mediaextract

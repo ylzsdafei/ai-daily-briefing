@@ -60,7 +60,7 @@ func RenderMarkdown(issue *store.Issue, items []*store.IssueItem, insight *store
 
 	// 2. Subtitle blockquote. Kept minimal and brand-neutral; upstream
 	// has a long link row here but we replace it with our own tagline.
-	b.WriteString("> briefing-v3 · 每日早读 · 全网深度聚合\n\n")
+	b.WriteString("> AI 早报 · 每日早读 · 全网深度聚合\n\n")
 
 	// 3. Today's summary, wrapped in a fenced code block like upstream.
 	summary := strings.TrimSpace(issue.Summary)

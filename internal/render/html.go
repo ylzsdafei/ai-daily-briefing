@@ -384,7 +384,7 @@ func buildIssueTemplateData(in *IssueHTMLInput, sidebarYears []sidebarYear) issu
 		Title:          fmt.Sprintf("AI 资讯日报 %s", dateZH),
 		DateZH:         dateZH,
 		DateStr:        dateStr,
-		Subtitle:       "briefing-v3 · 每日早读 · 全网深度聚合",
+		Subtitle:       "AI 早报 · 每日早读 · 全网深度聚合",
 		HeadlineImg:    headlineImg,
 		SummaryLines:   summaryLines,
 		Sections:       sections,

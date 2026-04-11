@@ -429,7 +429,7 @@ def render_header_card(data, output_path, width, height,
     f_keynum_label = load_font(font_regular_path, int(20 * scale))   # 数字 cell label
     f_more_story = load_font(font_bold_path, int(26 * scale))        # 下区 more stories
     f_section_name = load_font(font_bold_path, int(28 * scale))      # 板块名
-    f_section_count = load_font(font_bold_path, int(34 * scale))     # 板块计数
+    f_section_count = load_font(font_bold_path, int(28 * scale))     # 板块计数 34→28 跟 name 对齐
 
     # ---- Masthead ----
     draw_masthead(
@@ -558,6 +558,12 @@ def render_header_card(data, output_path, width, height,
         num_col_gap = int(20 * scale)
         num_cell_w = (right_w - num_col_gap) // 2
         num_row_h = int(128 * scale)  # 150 → 128 让 3 行 fit
+        # value 字号自适应: LLM 生成的 value 可能是长字符串 (e.g. "100 亿美元",
+        # "27B@Q4"), 固定 78px 会撑出 cell 宽度跟旁边重叠. 测量实际宽度,
+        # 太宽就降级到更小字号.
+        value_size_steps = [78, 62, 50, 42, 34]
+        value_fonts = [load_font(font_bold_path, int(s * scale)) for s in value_size_steps]
+        max_value_w = num_cell_w - int(8 * scale)
         for i, kn in enumerate(grid_nums):
             row = i // 2
             col = i % 2
@@ -566,7 +572,14 @@ def render_header_card(data, output_path, width, height,
             value = (kn.get("value") or "").strip()
             label = (kn.get("label") or "").strip()
             if value:
-                draw.text((cx, cy), value, font=f_keynum_value, fill=ACCENT_BLUE)
+                # 选第一个能塞下的字号
+                vfont = value_fonts[-1]
+                for f in value_fonts:
+                    bbox = draw.textbbox((0, 0), value, font=f)
+                    if bbox[2] - bbox[0] <= max_value_w:
+                        vfont = f
+                        break
+                draw.text((cx, cy), value, font=vfont, fill=ACCENT_BLUE)
             if label:
                 draw.text((cx, cy + int(76 * scale)), label,
                           font=f_keynum_label, fill=INK_SOFT)
@@ -580,54 +593,48 @@ def render_header_card(data, output_path, width, height,
     # ===== BOTTOM ZONE: LEFT MORE STORIES, RIGHT 今日板块速览 =====
     bot_zone_top = y
 
-    # LEFT: MORE STORIES — 把剩余的 stories 全显示出来 (8 之后).
-    # 注意 mid zone 现在用了 stories[:8], 这里用 stories[8:] 接着列.
-    # 但 stories 通常 9-12 条, 不够就把 stories[6:] 都拉进来加密.
+    # MORE STORIES — 占满整个 bot zone width (full content_w).
+    # 板块速览已删 (用户原话: "中间那一列看不懂, 跟 MORE STORIES 不对应"),
+    # 把全局板块条目数信息让给 BY THE NUMBERS 的统计 cell, MORE STORIES
+    # 独占整行不再分栏.
     left_y = bot_zone_top
     draw.text((pad_x, left_y), "MORE STORIES", font=f_section_label, fill=ACCENT_RED)
-    left_y += int(30 * scale)
+    left_y += int(32 * scale)
 
-    # 中区用 stories[:6], 这里取 stories[6:11] 把剩下的全列出来
-    more_stories = stories[6:11]
-    for st in more_stories[:5]:
-        tag = (st.get("tag") or "").upper()
+    # 1 col × 8 rows, 每行 1488px width. title 后面拼接了 body 摘要,
+    # 单行长内容能填满整个 width, 没有 right 空白.
+    more_stories = stories[6:14]
+    for st in more_stories[:8]:
+        tag = (st.get("tag") or "").strip()
         title = (st.get("title") or "").strip()
         if tag:
-            draw.text((pad_x, left_y), tag, font=f_story_tag, fill=ACCENT_RED)
-            left_y += int(22 * scale)
-        left_y = draw_wrapped(
-            draw, (pad_x, left_y), title, f_more_story, INK_MAIN,
-            left_w, line_spacing=1.18, max_lines=2,
-        )
-        left_y += int(10 * scale)
+            tag_text = tag + " · "
+            tag_bbox = draw.textbbox((0, 0), tag_text, font=f_more_story)
+            tag_w = tag_bbox[2] - tag_bbox[0]
+            draw.text((pad_x, left_y), tag_text, font=f_more_story, fill=ACCENT_RED)
+            title_x = pad_x + tag_w
+            avail_w = content_w - tag_w
+        else:
+            title_x = pad_x
+            avail_w = content_w
+        # title 单行硬截断 (按 pixel), 拼接了 body 摘要的长 title 能填满
+        title_runes = list(title)
+        fit_title = title
+        for cut in range(len(title_runes), 0, -1):
+            tt = "".join(title_runes[:cut])
+            if cut < len(title_runes):
+                tt += "…"
+            tbbox = draw.textbbox((0, 0), tt, font=f_more_story)
+            if tbbox[2] - tbbox[0] <= avail_w:
+                fit_title = tt
+                break
+        draw.text((title_x, left_y), fit_title, font=f_more_story, fill=INK_MAIN)
+        left_y += int(40 * scale)
 
-    # RIGHT: 今日板块速览 — 用 stories 的 tag 计数推算 sections distribution
-    right_y = bot_zone_top
-    draw.text((right_x, right_y), "今日板块速览", font=f_section_label, fill=ACCENT_RED)
-    right_y += int(32 * scale)
-
-    sections_data = data.get("sections_overview") or []
-    if not sections_data:
-        from collections import Counter
-        tag_counter = Counter()
-        for st in stories:
-            t = (st.get("tag") or "").strip()
-            if t:
-                tag_counter[t] += 1
-        sections_data = [{"name": name, "count": str(cnt)} for name, cnt in tag_counter.most_common(5)]
-
-    for sec in sections_data[:5]:
-        name = (sec.get("name") or "").strip()
-        count = (sec.get("count") or "").strip()
-        if not name:
-            continue
-        draw.text((right_x, right_y), name, font=f_section_name, fill=INK_MAIN)
-        if count:
-            count_bbox = draw.textbbox((0, 0), count, font=f_section_count)
-            count_w_px = count_bbox[2] - count_bbox[0]
-            draw.text((right_x + right_w - count_w_px, right_y - int(2 * scale)),
-                      count, font=f_section_count, fill=ACCENT_BLUE)
-        right_y += int(40 * scale)
+    # RIGHT 板块速览已删 — MORE STORIES 占满整个 bot zone, 视觉上不再
+    # 出现 "row-by-row 对齐误解" 的问题. 各板块条目数信息可以用 BY THE
+    # NUMBERS 的统计 cell 表达 (e.g. 1 个 cell 显示总条目数).
+    pass
 
     # ===== Footer bar =====
     draw_footer_bar(
