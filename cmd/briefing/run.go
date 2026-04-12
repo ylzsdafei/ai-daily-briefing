@@ -691,15 +691,23 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	targetWantsProd := gf.target == "auto" || gf.target == "prod"
 	if targetWantsProd {
 		if !report.Pass {
-			// Gate failed but target wants prod: post alert to test, do not
-			// touch prod. This is the "不允许失败" safety rail.
-			alertMsg := buildGateFailAlert(issue, report)
+			if shouldPostGateAlert(report) {
+				alertMsg := buildGateFailAlert(issue, report)
+				alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
+				_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
+			}
+			if gateFailureBlocksRun(gf.target, report) {
+				return fmt.Errorf("gate failed, prod channel skipped: %s", gateFailureDetail(report))
+			}
+			stage("publish: gate warn → alert sent to test, continuing to prod publish")
+		}
+		if issues := prodPublishIssues(ctx, rendered); len(issues) > 0 {
+			alertMsg := buildProdReadinessAlert(issue, issues)
 			alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
 			_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
-			return fmt.Errorf("gate failed (%d reasons), prod channel skipped: %s",
-				len(report.Reasons), strings.Join(report.Reasons, "; "))
+			return fmt.Errorf("prod readiness failed: %s", strings.Join(issues, "; "))
 		}
-		stage("publish: gate passed → posting to Slack prod channel")
+		stage("publish: gate passed/warned → posting to Slack prod channel")
 		prodDelivery := postSlackPayload(ctx, store.ChannelSlackProd, cfg.Slack.ProdWebhook, slackPayload, issueID)
 		if err := s.InsertDelivery(ctx, prodDelivery); err != nil {
 			fmt.Printf("[WARN] insert prod delivery: %v\n", err)
@@ -1531,15 +1539,14 @@ func postAlert(ctx context.Context, webhookURL string, body []byte) error {
 	return nil
 }
 
-// buildGateFailAlert formats a Slack plain-text alert describing why the
-// gate rejected today's issue. Works for both hard-fail and soft-warn
-// paths — the caller only ever invokes this when !r.Pass, but the
-// wording is conditioned on r.Warn so Warn cases read "质量待审" instead
-// of "质量不达标".
+// buildGateFailAlert formats a Slack plain-text alert for the test
+// channel. Soft warnings still publish to prod, so the wording must
+// accurately say that the issue was delivered; hard failures still say
+// prod was skipped.
 func buildGateFailAlert(issue *store.Issue, r *gate.Report) string {
 	var b strings.Builder
 	if r.Warn {
-		fmt.Fprintf(&b, "⚠️ briefing-v3 %s 质量待审,正式频道已跳过\n", issue.IssueDate.Format("2006-01-02"))
+		fmt.Fprintf(&b, "⚠️ briefing-v3 %s 质量待审,已同步正式频道\n", issue.IssueDate.Format("2006-01-02"))
 	} else {
 		fmt.Fprintf(&b, "🚨 briefing-v3 %s 质量不达标,正式频道已跳过\n", issue.IssueDate.Format("2006-01-02"))
 	}
@@ -1563,6 +1570,110 @@ func buildGateFailAlert(issue *store.Issue, r *gate.Report) string {
 		}
 	}
 	return b.String()
+}
+
+func shouldPostGateAlert(r *gate.Report) bool {
+	return r != nil && !r.Pass
+}
+
+func gateFailureBlocksRun(target string, r *gate.Report) bool {
+	if r == nil || r.Pass {
+		return false
+	}
+	// Soft warnings are allowed to ship to prod; only hard failures block.
+	return !r.Warn
+}
+
+func buildProdReadinessAlert(issue *store.Issue, issues []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "⚠️ briefing-v3 %s 正式频道已跳过\n", issue.IssueDate.Format("2006-01-02"))
+	b.WriteString("未满足正式频道发送前提:\n")
+	for _, issue := range issues {
+		fmt.Fprintf(&b, "  - %s\n", issue)
+	}
+	return b.String()
+}
+
+func prodPublishIssues(ctx context.Context, rendered *publish.RenderedIssue) []string {
+	issues := make([]string, 0, 4)
+	if rendered == nil || rendered.Issue == nil {
+		return append(issues, "缺少日报对象")
+	}
+	if rendered.Insight == nil || strings.TrimSpace(rendered.Insight.IndustryMD) == "" {
+		issues = append(issues, "缺少完整行业洞察")
+	}
+	if rendered.Insight == nil || strings.TrimSpace(rendered.Insight.OurMD) == "" {
+		issues = append(issues, "缺少完整对我们的启发")
+	}
+	if strings.TrimSpace(rendered.Issue.Summary) == "" {
+		issues = append(issues, "缺少完整今日摘要")
+	}
+	if msg := checkPublicReportURL(ctx, rendered.ReportURL); msg != "" {
+		issues = append(issues, msg)
+	}
+	return issues
+}
+
+func checkPublicReportURL(ctx context.Context, rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "完整版在线链接为空"
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "完整版在线链接格式无效"
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "完整版在线链接不是公网 HTTP(S) 地址"
+	}
+
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	status, err := urlProbe(checkCtx, http.MethodHead, rawURL)
+	if err != nil || status >= 400 || status < 200 {
+		status, err = urlProbe(checkCtx, http.MethodGet, rawURL)
+		if err != nil {
+			return "完整版在线链接当前不可访问"
+		}
+		if status < 200 || status >= 400 {
+			return fmt.Sprintf("完整版在线链接返回异常状态 %d", status)
+		}
+	}
+	return ""
+}
+
+var urlProbe = probeURL
+
+func probeURL(ctx context.Context, method, rawURL string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	hc := &http.Client{Timeout: 5 * time.Second}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.CopyN(io.Discard, resp.Body, 1)
+	return resp.StatusCode, nil
+}
+
+func gateFailureDetail(r *gate.Report) string {
+	if r == nil {
+		return "unknown gate state"
+	}
+	if r.Warn {
+		if len(r.Warnings) == 0 {
+			return "quality warning"
+		}
+		return strings.Join(r.Warnings, "; ")
+	}
+	if len(r.Reasons) == 0 {
+		return "quality gate failed"
+	}
+	return strings.Join(r.Reasons, "; ")
 }
 
 // extractTopHeadline picks a short, punchy headline for the cover image.
