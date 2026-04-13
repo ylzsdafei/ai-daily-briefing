@@ -44,6 +44,8 @@ func sectionDisplayTitle(sec SectionMeta) string {
 	return sec.Title
 }
 
+var mermaidCodeBlockRe = regexp.MustCompile("(?s)```mermaid\\s*\n.+?```")
+
 // RenderMarkdown renders a complete daily briefing as markdown, structured
 // to match the upstream ai.hubtoday.app layout (see tmp/upstream-baseline/
 // 2026-04-09.md). It includes:
@@ -142,6 +144,17 @@ func RenderMarkdown(issue *store.Issue, items []*store.IssueItem, insight *store
 	}
 
 	b.WriteString("---\n\n")
+
+	// v1.0.1: extract mermaid diagram from insight and render it BEFORE
+	// the analysis sections (reader sees the map, then reads the analysis).
+	combined := industryMD + "\n" + ourMD
+	if mermaidBlock := mermaidCodeBlockRe.FindString(combined); mermaidBlock != "" {
+		b.WriteString(mermaidBlock)
+		b.WriteString("\n\n")
+		// Remove the mermaid block from wherever it was.
+		industryMD = strings.TrimSpace(mermaidCodeBlockRe.ReplaceAllString(industryMD, ""))
+		ourMD = strings.TrimSpace(mermaidCodeBlockRe.ReplaceAllString(ourMD, ""))
+	}
 
 	if industryMD != "" {
 		industryN := countNumberedLines(industryMD)
