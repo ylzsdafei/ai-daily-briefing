@@ -414,7 +414,7 @@ type focusTopic struct {
 	insight string // first sentence of the analysis (as the 【洞察】)
 }
 
-// extractFocusTopics extracts ### title + first meaningful sentence per topic.
+// extractFocusTopics extracts ### title + first 1-2 complete sentences as insight.
 func extractFocusTopics(md string) []focusTopic {
 	var topics []focusTopic
 	lines := strings.Split(md, "\n")
@@ -425,16 +425,17 @@ func extractFocusTopics(md string) []focusTopic {
 		}
 		title := strings.TrimSpace(strings.TrimPrefix(line, "### "))
 
-		// Find first non-empty, non-mermaid, non-HTML line after the heading.
-		insight := ""
+		// Collect text lines after heading (skip mermaid/HTML blocks).
+		var textBuf strings.Builder
 		for j := i + 1; j < len(lines); j++ {
 			l := strings.TrimSpace(lines[j])
+			if l == "" && textBuf.Len() > 0 {
+				break // stop at first blank line after we have text
+			}
 			if l == "" {
 				continue
 			}
-			// Skip mermaid fences and content.
-			if strings.HasPrefix(l, "```") || strings.HasPrefix(l, "<") {
-				// Skip until end of block.
+			if strings.HasPrefix(l, "```") {
 				if strings.HasPrefix(l, "```mermaid") {
 					for j++; j < len(lines); j++ {
 						if strings.HasPrefix(strings.TrimSpace(lines[j]), "```") {
@@ -444,28 +445,52 @@ func extractFocusTopics(md string) []focusTopic {
 				}
 				continue
 			}
-			// Take first sentence (up to first period or 60 chars).
-			runes := []rune(l)
-			for _, sep := range []string{"。", "；", ".", ";"} {
-				if idx := strings.Index(l, sep); idx > 0 && idx < 120 {
-					insight = string(runes[:len([]rune(l[:idx]))])
-					break
-				}
+			if strings.HasPrefix(l, "<") {
+				continue
 			}
-			if insight == "" {
-				if len(runes) > 60 {
-					insight = string(runes[:60]) + "…"
-				} else {
-					insight = l
-				}
+			if strings.HasPrefix(l, "### ") {
+				break // next topic
 			}
-			break
+			textBuf.WriteString(l)
 		}
+
+		// Extract first 1-2 complete sentences as the insight.
+		fullText := textBuf.String()
+		insight := extractLeadSentences(fullText, 2)
 		if insight != "" {
 			topics = append(topics, focusTopic{title: title, insight: insight})
 		}
 	}
 	return topics
+}
+
+// extractLeadSentences takes the first N complete sentences from text.
+func extractLeadSentences(text string, n int) string {
+	seps := []rune{'。', '；', '.', ';'}
+	runes := []rune(text)
+	count := 0
+	for i, r := range runes {
+		for _, sep := range seps {
+			if r == sep {
+				count++
+				if count >= n {
+					return strings.TrimSpace(string(runes[:i+1]))
+				}
+				break
+			}
+		}
+	}
+	// If not enough sentences found, return up to 100 chars at a natural break.
+	if len(runes) > 100 {
+		sub := string(runes[:100])
+		for _, sep := range []string{"，", ","} {
+			if idx := strings.LastIndex(sub, sep); idx > 30 {
+				return strings.TrimSpace(sub[:idx+len(sep)])
+			}
+		}
+		return strings.TrimSpace(sub)
+	}
+	return strings.TrimSpace(text)
 }
 
 // ensureOrderedList adds "N. " prefix to lines that don't already have it.
