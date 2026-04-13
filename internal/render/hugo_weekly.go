@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"briefing-v3/internal/store"
@@ -25,6 +26,14 @@ func WriteWeeklyPost(
 	}
 	if weekly == nil {
 		return "", fmt.Errorf("weekly hugo: weekly is nil")
+	}
+
+	// Read basePath from hugo.yaml for GitHub Pages subpath support.
+	basePath := ""
+	if hugoYAML, err := os.ReadFile(filepath.Join(siteDir, "hugo.yaml")); err == nil {
+		if m := regexp.MustCompile(`(?m)^baseURL:\s*https?://[^/]+(/.+?)/?$`).FindSubmatch(hugoYAML); len(m) > 1 {
+			basePath = string(m[1])
+		}
 	}
 
 	// --- directory ---
@@ -71,7 +80,8 @@ func WriteWeeklyPost(
 				continue
 			}
 			d := di.IssueDate
-			link := fmt.Sprintf("/%d/%s/%s/",
+			link := fmt.Sprintf("%s/%d/%s/%s/",
+				basePath,
 				d.Year(),
 				d.Format("2006-01"),
 				d.Format("2006-01-02"))
