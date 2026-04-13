@@ -529,13 +529,15 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 	replacement := "<!-- LATEST_6_CARDS_START -->\n" + cardsBlock.String() + "\n<!-- LATEST_6_CARDS_END -->"
 	text = cardsRe.ReplaceAllString(text, replacement)
 
-	// --- replace TODAY_LINK href ---
+	// --- replace TODAY_LINK (using Hextra card shortcode for relURL support) ---
 	if len(cards) > 0 {
 		todayRe := regexp.MustCompile(`(?s)<!-- TODAY_LINK_START -->.*?<!-- TODAY_LINK_END -->`)
 		todayLink := fmt.Sprintf(
-			`<!-- TODAY_LINK_START -->`+"\n"+
-				`<a href=%q class="hx-inline-block hx-rounded-lg hx-border hx-border-gray-200 hx-px-6 hx-py-3 hx-font-semibold hx-text-gray-700 hover:hx-bg-gray-100 dark:hx-border-neutral-700 dark:hx-text-neutral-300 dark:hover:hx-bg-neutral-800">查看今日早报 →</a>`+"\n"+
-				`<!-- TODAY_LINK_END -->`,
+			"<!-- TODAY_LINK_START -->\n"+
+				"{{< cards >}}\n"+
+				"  {{< card link=%q title=\"查看今日早报 →\" icon=\"arrow-circle-right\" >}}\n"+
+				"{{< /cards >}}\n"+
+				"<!-- TODAY_LINK_END -->",
 			cards[0].link)
 		text = todayRe.ReplaceAllString(text, todayLink)
 	}
