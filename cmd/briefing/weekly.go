@@ -12,6 +12,7 @@ import (
 
 	"briefing-v3/internal/config"
 	"briefing-v3/internal/generate"
+	"briefing-v3/internal/infocard"
 	"briefing-v3/internal/render"
 	"briefing-v3/internal/store"
 )
@@ -147,6 +148,21 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 		return nil
 	}
 
+	// --- generate weekly header card (大字报) ---
+	if !gf.noImages {
+		weeklyHeader := buildWeeklyHeaderCard(weekly, result)
+		weeklyDateStr := fmt.Sprintf("%d-W%02d", isoYear, isoWeek)
+		headerDir := fmt.Sprintf("data/images/cards/%s", weeklyDateStr)
+		if err := os.MkdirAll(headerDir, 0o755); err == nil {
+			headerPath := headerDir + "/header.png"
+			if err := renderInfoCardPNG(ctx, "header", weeklyHeader, headerPath); err != nil {
+				fmt.Printf("[WARN] weekly headercard: %v\n", err)
+			} else {
+				stage(fmt.Sprintf("weekly: header card → %s", headerPath))
+			}
+		}
+	}
+
 	// --- write Hugo post ---
 	hextraDir := os.Getenv("HEXTRA_SITE_DIR")
 	if hextraDir != "" {
@@ -173,7 +189,17 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 	// logs are not recorded because weekly_issues has its own table
 	// and the deliveries FK points to issues.id.
 	targetWantsProd := gf.target == "auto" || gf.target == "prod"
-	slackMsg := buildWeeklySlackMessage(weekly, dailyIssues)
+	// Build weekly page URL for Slack button.
+	weeklyPageURL := ""
+	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
+		// Extract scheme+host from the daily URL template.
+		// e.g. https://ylzsdafei.github.io/ai-daily-site/{{YEAR}}/... → https://ylzsdafei.github.io/ai-daily-site
+		if idx := strings.Index(base, "{{"); idx > 0 {
+			siteRoot := strings.TrimRight(base[:idx], "/")
+			weeklyPageURL = fmt.Sprintf("%s/blog/weekly/%d-w%02d/", siteRoot, isoYear, isoWeek)
+		}
+	}
+	slackMsg := buildWeeklySlackMessage(weekly, dailyIssues, weeklyPageURL)
 	slackBody, _ := json.Marshal(map[string]any{"text": slackMsg})
 
 	stage("weekly: posting to Slack test channel")
@@ -209,7 +235,7 @@ func isoWeekStart(isoYear, isoWeek int) time.Time {
 // buildWeeklySlackMessage creates a Slack mrkdwn message for the weekly report.
 // Slack does NOT support standard markdown (###, **bold**, [link](url)).
 // It uses its own format: *bold*, _italic_, <url|text>.
-func buildWeeklySlackMessage(w *store.WeeklyIssue, dailyIssues []*store.Issue) string {
+func buildWeeklySlackMessage(w *store.WeeklyIssue, dailyIssues []*store.Issue, weeklyPageURL string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "*%s*\n", w.Title)
 	fmt.Fprintf(&b, "_%s ~ %s | %d 期日报汇总_\n\n",
@@ -236,7 +262,11 @@ func buildWeeklySlackMessage(w *store.WeeklyIssue, dailyIssues []*store.Issue) s
 	if ponder := strings.TrimSpace(w.PonderMD); ponder != "" {
 		b.WriteString("*本周思考*\n")
 		b.WriteString(mdToSlack(ponder))
-		b.WriteString("\n")
+		b.WriteString("\n\n")
+	}
+
+	if weeklyPageURL != "" {
+		fmt.Fprintf(&b, "<%s|查看完整周报（含图谱）→>", weeklyPageURL)
 	}
 
 	return b.String()
@@ -255,6 +285,66 @@ func mdToSlack(s string) string {
 	// Links: [text](url) → <url|text>
 	s = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`).ReplaceAllString(s, "<$2|$1>")
 	return s
+}
+
+// buildWeeklyHeaderCard constructs a HeaderCard for the weekly report's
+// 大字报 PNG. Reuses the same PIL template as the daily headercard.
+func buildWeeklyHeaderCard(w *store.WeeklyIssue, result *generate.WeeklyResult) *infocard.HeaderCard {
+	truncRunes := func(s string, n int) string {
+		rs := []rune(strings.TrimSpace(s))
+		if len(rs) <= n {
+			return string(rs)
+		}
+		return string(rs[:n-1]) + "…"
+	}
+
+	// Main headline from title keywords.
+	mainHeadline := truncRunes(w.Title, 40)
+
+	// Sub headlines from the first line of each focus topic (### titles).
+	var subLines []string
+	for _, line := range strings.Split(result.FocusMD, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "### ") {
+			// Strip "### 1. " prefix → keep the topic title.
+			topic := strings.TrimPrefix(line, "### ")
+			// Remove leading number.
+			if idx := strings.Index(topic, " "); idx > 0 && idx < 5 {
+				topic = strings.TrimSpace(topic[idx:])
+			}
+			subLines = append(subLines, truncRunes(topic, 50))
+		}
+		if len(subLines) >= 3 {
+			break
+		}
+	}
+	subHeadline := strings.Join(subLines, "\n")
+
+	// Lead paragraph from trends summary.
+	lead := truncRunes(strings.ReplaceAll(strings.TrimSpace(result.TrendsMD), "\n", " "), 160)
+
+	// Key numbers: week number, daily count, keyword count.
+	keyNums := []infocard.KeyNum{
+		{Value: fmt.Sprintf("W%d", w.Week), Label: "本周期号"},
+		{Value: fmt.Sprintf("%s~%s", w.StartDate.Format("01/02"), w.EndDate.Format("01/02")), Label: "覆盖日期"},
+	}
+
+	// Top stories from focus topics.
+	var stories []infocard.TopStory
+	for _, sl := range subLines {
+		stories = append(stories, infocard.TopStory{Title: sl, Tag: "聚焦"})
+	}
+
+	return &infocard.HeaderCard{
+		IssueDate:     fmt.Sprintf("%d-W%02d", w.Year, w.Week),
+		Edition:       fmt.Sprintf("AI 周报 · 第 %d 周", w.Week),
+		MainHeadline:  mainHeadline,
+		SubHeadline:   subHeadline,
+		LeadParagraph: lead,
+		KeyNumbers:    keyNums,
+		TopStories:    stories,
+		FooterSlogan:  "每周一更 · 趋势尽览",
+	}
 }
 
 // hugoBuildf runs hugo --source {siteDir} with a timeout.

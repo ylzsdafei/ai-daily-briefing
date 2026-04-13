@@ -64,8 +64,27 @@ func WriteWeeklyPost(
 	fmt.Fprintf(&fm, "description: %q\n", description)
 	fm.WriteString("---\n\n")
 
+	// --- hero header card (大字报) ---
+	weeklyDateStr := fmt.Sprintf("%d-W%02d", weekly.Year, weekly.Week)
+	heroPrefix := ""
+	heroSrc := findExistingPath([]string{
+		filepath.Join("data", "images", "cards", weeklyDateStr, "header.png"),
+		filepath.Join("/root/briefing-v3/data/images/cards", weeklyDateStr, "header.png"),
+	})
+	if heroSrc != "" {
+		targetDir := filepath.Join(siteDir, "static", "images", "cards", weeklyDateStr)
+		if err := os.MkdirAll(targetDir, 0o755); err == nil {
+			targetPath := filepath.Join(targetDir, "header.png")
+			if err := copyFile(heroSrc, targetPath); err == nil {
+				heroPrefix = fmt.Sprintf("![AI 周报大字报 · %s](%s/images/cards/%s/header.png)\n\n",
+					weeklyDateStr, basePath, weeklyDateStr)
+			}
+		}
+	}
+
 	// --- body ---
 	var body strings.Builder
+	body.WriteString(heroPrefix)
 
 	// Header with date range and daily links.
 	fmt.Fprintf(&body, "> %s ~ %s | 本周共 %d 期日报\n\n",
