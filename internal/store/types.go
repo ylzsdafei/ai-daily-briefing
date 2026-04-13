@@ -101,8 +101,9 @@ type WeeklyIssue struct {
 	FocusMD       string     // 本周聚焦
 	SignalsMD     string     // 信号与噪音
 	TrendsMD       string     // 宏观趋势
-	TrendsDiagram  string     // Mermaid diagram for trends
-	TakeawaysMD    string     // 对我们的启发
+	TrendsDiagram       string     // Mermaid simple diagram for trends
+	TrendsDiagramDetail string     // Mermaid detailed diagram for trends
+	TakeawaysMD         string     // 对我们的启发
 	PonderMD      string     // 本周思考
 	FullMD        string     // rendered full markdown
 	DailyIssueIDs string     // JSON array of daily issue IDs

@@ -127,11 +127,18 @@ func WriteWeeklyPost(
 	}
 	if s := strings.TrimSpace(weekly.TrendsMD); s != "" {
 		body.WriteString("## 宏观趋势\n\n")
-		// Diagram first, then text.
+		// Simple diagram first.
 		if d := strings.TrimSpace(weekly.TrendsDiagram); d != "" {
 			body.WriteString("```mermaid\n")
 			body.WriteString(d)
 			body.WriteString("\n```\n\n")
+		}
+		// Detailed diagram in collapsible.
+		if d := strings.TrimSpace(weekly.TrendsDiagramDetail); d != "" {
+			body.WriteString("<details>\n<summary>展开详细图谱</summary>\n\n")
+			body.WriteString("```mermaid\n")
+			body.WriteString(d)
+			body.WriteString("\n```\n\n</details>\n\n")
 		}
 		body.WriteString(s)
 		body.WriteString("\n\n---\n\n")
