@@ -185,22 +185,17 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 	}
 
 	// --- Slack publish ---
-	// Weekly reports use a simple text message (not blocks). Delivery
-	// logs are not recorded because weekly_issues has its own table
-	// and the deliveries FK points to issues.id.
 	targetWantsProd := gf.target == "auto" || gf.target == "prod"
-	// Build weekly page URL for Slack button.
+	// Build weekly page URL from BRIEFING_REPORT_URL_BASE.
 	weeklyPageURL := ""
 	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
-		// Extract scheme+host from the daily URL template.
-		// e.g. https://ylzsdafei.github.io/ai-daily-site/{{YEAR}}/... → https://ylzsdafei.github.io/ai-daily-site
 		if idx := strings.Index(base, "{{"); idx > 0 {
 			siteRoot := strings.TrimRight(base[:idx], "/")
 			weeklyPageURL = fmt.Sprintf("%s/blog/weekly/%d-w%02d/", siteRoot, isoYear, isoWeek)
 		}
 	}
-	slackMsg := buildWeeklySlackMessage(weekly, dailyIssues, weeklyPageURL)
-	slackBody, _ := json.Marshal(map[string]any{"text": slackMsg})
+	slackBlocks := buildWeeklySlackBlocks(weekly, dailyIssues, weeklyPageURL)
+	slackBody, _ := json.Marshal(slackBlocks)
 
 	stage("weekly: posting to Slack test channel")
 	testDelivery := postSlackPayload(ctx, store.ChannelSlackTest, cfg.Slack.TestWebhook, slackBody, 0)
@@ -232,44 +227,90 @@ func isoWeekStart(isoYear, isoWeek int) time.Time {
 	return week1Monday.AddDate(0, 0, (isoWeek-1)*7)
 }
 
-// buildWeeklySlackMessage creates a Slack mrkdwn message for the weekly report.
-// Slack does NOT support standard markdown (###, **bold**, [link](url)).
-// It uses its own format: *bold*, _italic_, <url|text>.
-func buildWeeklySlackMessage(w *store.WeeklyIssue, dailyIssues []*store.Issue, weeklyPageURL string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "*%s*\n", w.Title)
-	fmt.Fprintf(&b, "_%s ~ %s | %d 期日报汇总_\n\n",
-		w.StartDate.Format("2006-01-02"),
-		w.EndDate.Format("2006-01-02"),
-		len(dailyIssues))
+// buildWeeklySlackBlocks creates a Slack blocks payload for the weekly report,
+// matching the daily report's button style (primary blue button).
+func buildWeeklySlackBlocks(w *store.WeeklyIssue, dailyIssues []*store.Issue, weeklyPageURL string) map[string]any {
+	var blocks []map[string]any
 
+	// Header
+	blocks = append(blocks, map[string]any{
+		"type": "header",
+		"text": map[string]any{"type": "plain_text", "text": w.Title, "emoji": true},
+	})
+
+	// Date range context
+	blocks = append(blocks, map[string]any{
+		"type": "context",
+		"elements": []map[string]any{
+			{"type": "mrkdwn", "text": fmt.Sprintf("📅 %s ~ %s | %d 期日报汇总",
+				w.StartDate.Format("2006-01-02"),
+				w.EndDate.Format("2006-01-02"),
+				len(dailyIssues))},
+		},
+	})
+
+	blocks = append(blocks, map[string]any{"type": "divider"})
+
+	// 本周聚焦 (truncated)
 	if focus := strings.TrimSpace(w.FocusMD); focus != "" {
-		b.WriteString("*本周聚焦*\n")
-		runes := []rune(focus)
-		if len(runes) > 500 {
-			focus = string(runes[:500]) + "..."
+		runes := []rune(mdToSlack(focus))
+		if len(runes) > 600 {
+			focus = string(runes[:600]) + "..."
+		} else {
+			focus = string(runes)
 		}
-		b.WriteString(mdToSlack(focus))
-		b.WriteString("\n\n")
+		blocks = append(blocks, map[string]any{
+			"type": "section",
+			"text": map[string]any{"type": "mrkdwn", "text": "*🎯 本周聚焦*\n" + focus},
+		})
 	}
 
+	blocks = append(blocks, map[string]any{"type": "divider"})
+
+	// 对我们的启发
 	if takeaways := strings.TrimSpace(w.TakeawaysMD); takeaways != "" {
-		b.WriteString("*对我们的启发*\n")
-		b.WriteString(mdToSlack(takeaways))
-		b.WriteString("\n\n")
+		blocks = append(blocks, map[string]any{
+			"type": "section",
+			"text": map[string]any{"type": "mrkdwn", "text": "*💡 对我们的启发*\n" + mdToSlack(takeaways)},
+		})
 	}
 
+	// 本周思考
 	if ponder := strings.TrimSpace(w.PonderMD); ponder != "" {
-		b.WriteString("*本周思考*\n")
-		b.WriteString(mdToSlack(ponder))
-		b.WriteString("\n\n")
+		blocks = append(blocks, map[string]any{
+			"type": "section",
+			"text": map[string]any{"type": "mrkdwn", "text": "*🤔 本周思考*\n" + mdToSlack(ponder)},
+		})
 	}
 
+	// Button — same style as daily report
 	if weeklyPageURL != "" {
-		fmt.Fprintf(&b, "<%s|查看完整周报（含图谱）→>", weeklyPageURL)
+		blocks = append(blocks, map[string]any{
+			"type": "actions",
+			"elements": []map[string]any{
+				{
+					"type": "button",
+					"text": map[string]any{
+						"type":  "plain_text",
+						"text":  "📖 查看完整周报",
+						"emoji": true,
+					},
+					"url":   weeklyPageURL,
+					"style": "primary",
+				},
+			},
+		})
 	}
 
-	return b.String()
+	// Footer
+	blocks = append(blocks, map[string]any{
+		"type": "context",
+		"elements": []map[string]any{
+			{"type": "mrkdwn", "text": "briefing-v3 自动生成 · AI 周报"},
+		},
+	})
+
+	return map[string]any{"blocks": blocks}
 }
 
 // mdToSlack converts standard markdown to Slack mrkdwn format:
