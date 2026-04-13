@@ -662,17 +662,10 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			for _, w := range report.Warnings {
 				fmt.Printf("[GATE WARN] %s\n", w)
 			}
-			// v1.0.1: gate warn → auto-retry via systemd.
-			// BRIEFING_RETRY_COUNT is set by the retry service units.
-			retryCount, _ := strconv.Atoi(os.Getenv("BRIEFING_RETRY_COUNT"))
-			if retryCount < 3 {
-				// Exit 1 → systemd OnFailure triggers next retry timer.
-				// Don't push to any channel — let the retry produce better content.
-				return fmt.Errorf("gate warn (retry %d/3), will retry: %s",
-					retryCount, strings.Join(report.Warnings, "; "))
-			}
-			// 3rd retry still warned → treat as pass, push normally.
-			stage(fmt.Sprintf("gate warn: retry %d/3 exhausted, treating as pass", retryCount))
+			// v1.0.1: gate warn → treat as pass, push normally.
+			// 内容质量略低于阈值不应阻塞推送，用户宁可看到略瘦的内容
+			// 也不想看到空频道。Warn 信息已记录在日志和 Slack 渲染中。
+			stage("gate warn: treating as pass, pushing normally")
 			report.Pass = true
 			report.Warn = false
 		} else {
