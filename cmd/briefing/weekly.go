@@ -251,21 +251,43 @@ func buildWeeklySlackBlocks(w *store.WeeklyIssue, dailyIssues []*store.Issue, we
 
 	blocks = append(blocks, map[string]any{"type": "divider"})
 
-	// 本周聚焦 (truncated)
+	// 本周聚焦 (truncated, mermaid stripped)
 	if focus := strings.TrimSpace(w.FocusMD); focus != "" {
-		runes := []rune(mdToSlack(focus))
+		// Extract first mermaid diagram for image rendering.
+		if mermaidCode := render.ExtractMermaidCode(focus); mermaidCode != "" {
+			if imgURL := render.MermaidInkURL(mermaidCode); imgURL != "" {
+				blocks = append(blocks, map[string]any{
+					"type":      "image",
+					"image_url": imgURL,
+					"alt_text":  "本周聚焦关系图",
+				})
+			}
+		}
+		// Strip mermaid blocks from text.
+		cleaned := mdToSlack(render.StripMermaidBlocks(focus))
+		runes := []rune(cleaned)
 		if len(runes) > 600 {
-			focus = string(runes[:600]) + "..."
-		} else {
-			focus = string(runes)
+			cleaned = string(runes[:600]) + "..."
 		}
 		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*🎯 本周聚焦*\n" + focus},
+			"text": map[string]any{"type": "mrkdwn", "text": "*🎯 本周聚焦*\n" + cleaned},
 		})
 	}
 
 	blocks = append(blocks, map[string]any{"type": "divider"})
+
+	// 趋势全景图
+	if d := strings.TrimSpace(w.TrendsDiagram); d != "" {
+		if imgURL := render.MermaidInkURL(d); imgURL != "" {
+			blocks = append(blocks, map[string]any{
+				"type":      "image",
+				"image_url": imgURL,
+				"alt_text":  "趋势全景图",
+			})
+			blocks = append(blocks, map[string]any{"type": "divider"})
+		}
+	}
 
 	// 对我们的启发
 	if takeaways := strings.TrimSpace(w.TakeawaysMD); takeaways != "" {
