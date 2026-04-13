@@ -176,13 +176,19 @@ func parseWeeklyJSON(raw string) (*WeeklyResult, error) {
 	if strings.TrimSpace(parsed.Focus) == "" {
 		return nil, fmt.Errorf("weekly: focus section is empty")
 	}
+	// LLM sometimes outputs literal "\n" (two chars) instead of real
+	// newlines inside JSON string values. Replace them so markdown
+	// renders correctly with proper paragraphs and headings.
+	fix := func(s string) string {
+		return strings.ReplaceAll(s, `\n`, "\n")
+	}
 	return &WeeklyResult{
 		TitleKeywords: parsed.TitleKeywords,
-		FocusMD:       parsed.Focus,
-		SignalsMD:     parsed.Signals,
-		TrendsMD:      parsed.Trends,
-		TakeawaysMD:   parsed.Takeaways,
-		PonderMD:      parsed.Ponder,
+		FocusMD:       fix(parsed.Focus),
+		SignalsMD:     fix(parsed.Signals),
+		TrendsMD:      fix(parsed.Trends),
+		TakeawaysMD:   fix(parsed.Takeaways),
+		PonderMD:      fix(parsed.Ponder),
 	}, nil
 }
 
