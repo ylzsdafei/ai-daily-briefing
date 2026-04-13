@@ -251,35 +251,43 @@ func buildWeeklySlackBlocks(w *store.WeeklyIssue, dailyIssues []*store.Issue, we
 	})
 	blocks = append(blocks, map[string]any{"type": "divider"})
 
-	// 3. 本周聚焦: 标题 + 各话题副标题列表
+	// 3. 本周聚焦: 每个话题 = 事实 + 【洞察】（和日报行业洞察版式一致）
 	if focus := strings.TrimSpace(w.FocusMD); focus != "" {
-		subtitles := extractAllH3(focus)
-		var focusText strings.Builder
-		focusText.WriteString("*🎯 本周聚焦*\n\n")
-		for i, s := range subtitles {
-			fmt.Fprintf(&focusText, "%d. %s\n", i+1, s)
+		topics := extractFocusTopics(focus)
+		if len(topics) > 0 {
+			var focusText strings.Builder
+			focusText.WriteString("*🎯 本周聚焦（" + fmt.Sprintf("%d", len(topics)) + " 条）*\n\n")
+			for i, t := range topics {
+				fmt.Fprintf(&focusText, "%d. %s\n  【洞察】%s\n", i+1, t.title, t.insight)
+			}
+			blocks = append(blocks, map[string]any{
+				"type": "section",
+				"text": map[string]any{"type": "mrkdwn", "text": focusText.String()},
+			})
+			blocks = append(blocks, map[string]any{"type": "divider"})
+		}
+	}
+
+	// 4. 对我们的启发（有序列表）
+	if t := strings.TrimSpace(w.TakeawaysMD); t != "" {
+		cleaned := cleanForSlack(t, 800)
+		cleaned = ensureOrderedList(cleaned)
+		blocks = append(blocks, map[string]any{
+			"type": "section",
+			"text": map[string]any{"type": "mrkdwn", "text": "*💡 对我们的启发*\n\n" + cleaned},
+		})
+	}
+
+	// 5. 本周思考（多条加序号，单条不加）
+	if t := strings.TrimSpace(w.PonderMD); t != "" {
+		cleaned := mdToSlack(t)
+		lines := nonEmptyLines(cleaned)
+		if len(lines) > 1 {
+			cleaned = ensureOrderedList(cleaned)
 		}
 		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": focusText.String()},
-		})
-		blocks = append(blocks, map[string]any{"type": "divider"})
-	}
-
-	// 4. 对我们的启发
-	if t := strings.TrimSpace(w.TakeawaysMD); t != "" {
-		cleaned := cleanForSlack(t, 800)
-		blocks = append(blocks, map[string]any{
-			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*💡 对我们的启发*\n" + cleaned},
-		})
-	}
-
-	// 5. 本周思考
-	if t := strings.TrimSpace(w.PonderMD); t != "" {
-		blocks = append(blocks, map[string]any{
-			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*🤔 本周思考*\n" + mdToSlack(t)},
+			"text": map[string]any{"type": "mrkdwn", "text": "*🤔 本周思考*\n\n" + cleaned},
 		})
 	}
 
@@ -401,13 +409,88 @@ func buildWeeklyHeaderCard(w *store.WeeklyIssue, result *generate.WeeklyResult) 
 	}
 }
 
-// extractAllH3 returns the text of all ### headings in md.
-func extractAllH3(md string) []string {
+type focusTopic struct {
+	title   string // ### heading
+	insight string // first sentence of the analysis (as the 【洞察】)
+}
+
+// extractFocusTopics extracts ### title + first meaningful sentence per topic.
+func extractFocusTopics(md string) []focusTopic {
+	var topics []focusTopic
+	lines := strings.Split(md, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "### ") {
+			continue
+		}
+		title := strings.TrimSpace(strings.TrimPrefix(line, "### "))
+
+		// Find first non-empty, non-mermaid, non-HTML line after the heading.
+		insight := ""
+		for j := i + 1; j < len(lines); j++ {
+			l := strings.TrimSpace(lines[j])
+			if l == "" {
+				continue
+			}
+			// Skip mermaid fences and content.
+			if strings.HasPrefix(l, "```") || strings.HasPrefix(l, "<") {
+				// Skip until end of block.
+				if strings.HasPrefix(l, "```mermaid") {
+					for j++; j < len(lines); j++ {
+						if strings.HasPrefix(strings.TrimSpace(lines[j]), "```") {
+							break
+						}
+					}
+				}
+				continue
+			}
+			// Take first sentence (up to first period or 60 chars).
+			runes := []rune(l)
+			for _, sep := range []string{"。", "；", ".", ";"} {
+				if idx := strings.Index(l, sep); idx > 0 && idx < 120 {
+					insight = string(runes[:len([]rune(l[:idx]))])
+					break
+				}
+			}
+			if insight == "" {
+				if len(runes) > 60 {
+					insight = string(runes[:60]) + "…"
+				} else {
+					insight = l
+				}
+			}
+			break
+		}
+		if insight != "" {
+			topics = append(topics, focusTopic{title: title, insight: insight})
+		}
+	}
+	return topics
+}
+
+// ensureOrderedList adds "N. " prefix to lines that don't already have it.
+func ensureOrderedList(s string) string {
+	lines := strings.Split(s, "\n")
+	n := 0
+	for i, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" {
+			continue
+		}
+		n++
+		if !regexp.MustCompile(`^\d+\.\s`).MatchString(trimmed) {
+			lines[i] = fmt.Sprintf("%d. %s", n, trimmed)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// nonEmptyLines returns non-blank lines from s.
+func nonEmptyLines(s string) []string {
 	var out []string
-	for _, line := range strings.Split(md, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "### ") {
-			out = append(out, strings.TrimSpace(strings.TrimPrefix(line, "### ")))
+	for _, l := range strings.Split(s, "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
 		}
 	}
 	return out
