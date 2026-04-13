@@ -13,6 +13,7 @@
 package render
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -70,8 +71,9 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 
 	// 3. Industry insight + 4. divider + 5. Our takeaways + 6. divider.
 	if rendered.Insight != nil {
-		industryMD := strings.TrimSpace(rendered.Insight.IndustryMD)
-		ourMD := strings.TrimSpace(rendered.Insight.OurMD)
+		// Strip mermaid blocks from Slack text (rendered as image separately).
+		industryMD := strings.TrimSpace(stripMermaidBlocks(rendered.Insight.IndustryMD))
+		ourMD := strings.TrimSpace(stripMermaidBlocks(rendered.Insight.OurMD))
 		if industryMD != "" {
 			n := countSlackNumberedItems(industryMD)
 			blocks = append(blocks, map[string]any{
@@ -95,6 +97,22 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 				},
 			})
 			blocks = append(blocks, map[string]any{"type": "divider"})
+		}
+	}
+
+	// 6b. Mermaid diagram as image (via mermaid.ink rendering service).
+	if rendered.Insight != nil {
+		combined := rendered.Insight.IndustryMD + "\n" + rendered.Insight.OurMD
+		if mermaidCode := extractMermaidCode(combined); mermaidCode != "" {
+			imgURL := mermaidInkURL(mermaidCode)
+			if imgURL != "" {
+				blocks = append(blocks, map[string]any{
+					"type":      "image",
+					"image_url": imgURL,
+					"alt_text":  "今日事件关系图",
+				})
+				blocks = append(blocks, map[string]any{"type": "divider"})
+			}
 		}
 	}
 
@@ -230,4 +248,35 @@ func convertToSlackMrkdwn(text string) string {
 // layer can compute bullet counts without a cross-package dependency.
 func countSlackNumberedItems(text string) int {
 	return len(slackNumberedRe.FindAllString(text, -1))
+}
+
+// --- Mermaid → image helpers (for Slack) ---
+
+var mermaidBlockRe = regexp.MustCompile("(?s)```mermaid\\s*\n(.+?)```")
+
+// extractMermaidCode finds the first mermaid code block in text and returns
+// the raw mermaid source (without fences). Returns "" if none found.
+func extractMermaidCode(text string) string {
+	m := mermaidBlockRe.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// mermaidInkURL returns a mermaid.ink image URL for the given mermaid code.
+// mermaid.ink is a free rendering service that converts Mermaid text to PNG/SVG.
+func mermaidInkURL(code string) string {
+	if code == "" {
+		return ""
+	}
+	encoded := base64.URLEncoding.EncodeToString([]byte(code))
+	return "https://mermaid.ink/img/" + encoded
+}
+
+// stripMermaidBlocks removes all ```mermaid ... ``` blocks from text,
+// used to clean insight text before sending to Slack (where raw mermaid
+// code would display as gibberish).
+func stripMermaidBlocks(text string) string {
+	return mermaidBlockRe.ReplaceAllString(text, "")
 }
