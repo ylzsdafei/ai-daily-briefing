@@ -50,6 +50,11 @@ type Store interface {
 	UpsertIssueInsight(ctx context.Context, insight *IssueInsight) error
 	GetIssueInsight(ctx context.Context, issueID int64) (*IssueInsight, error)
 
+	// WeeklyIssue
+	UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (int64, error)
+	GetWeeklyIssue(ctx context.Context, domainID string, year, week int) (*WeeklyIssue, error)
+	ListDailyIssuesByDateRange(ctx context.Context, domainID string, start, end time.Time) ([]*Issue, error)
+
 	// Delivery
 	InsertDelivery(ctx context.Context, delivery *Delivery) error
 	ListDeliveries(ctx context.Context, issueID int64) ([]*Delivery, error)

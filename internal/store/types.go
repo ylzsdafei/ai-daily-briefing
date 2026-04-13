@@ -89,6 +89,27 @@ type IssueInsight struct {
 	GeneratedAt time.Time
 }
 
+// WeeklyIssue represents a weekly summary report aggregating daily Issues.
+type WeeklyIssue struct {
+	ID            int64
+	DomainID      string
+	Year          int
+	Week          int        // ISO 8601 week number
+	StartDate     time.Time  // Monday
+	EndDate       time.Time  // Sunday
+	Title         string
+	FocusMD       string     // 本周聚焦
+	SignalsMD     string     // 信号与噪音
+	TrendsMD      string     // 宏观趋势
+	TakeawaysMD   string     // 对我们的启发
+	PonderMD      string     // 本周思考
+	FullMD        string     // rendered full markdown
+	DailyIssueIDs string     // JSON array of daily issue IDs
+	Status        string
+	GeneratedAt   *time.Time
+	PublishedAt   *time.Time
+}
+
 // Delivery records an attempt to publish an Issue to a specific channel.
 type Delivery struct {
 	ID           int64

@@ -39,6 +39,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -119,6 +120,11 @@ func WriteHugoPost(
 	// --- scrub & relocate every remaining ![alt](url) ------------------
 	body = scrubAndRelocateImages(body, siteDir, dateStr)
 
+	// --- v1.0.1: weekly report back-link --------------------------------
+	isoYear, isoWeek := date.ISOWeek()
+	weeklyLink := fmt.Sprintf("/blog/weekly/%d-w%02d/", isoYear, isoWeek)
+	body += fmt.Sprintf("\n\n---\n\n> 本周周报：[第%d周综合分析](%s)\n", isoWeek, weeklyLink)
+
 	// --- frontmatter ----------------------------------------------------
 	linkTitle := fmt.Sprintf("%02d-%02d AI资讯", int(date.Month()), date.Day())
 	title := fmt.Sprintf("AI资讯日报 %d/%d/%d",
@@ -153,6 +159,12 @@ func WriteHugoPost(
 	if err := os.WriteFile(outPath, []byte(full), 0o644); err != nil {
 		return "", fmt.Errorf("hugo: write %s: %w", outPath, err)
 	}
+
+	// v1.0.1: update homepage with latest 6 cards + today link.
+	if err := updateHomepage(siteDir, date); err != nil {
+		fmt.Printf("[WARN] updateHomepage: %v (continuing)\n", err)
+	}
+
 	return outPath, nil
 }
 
@@ -385,6 +397,155 @@ func verifyExternalImage(url string) bool {
 // whitespace at both ends and collapsing any embedded newlines to a
 // single space so the result is safe to embed inside a double-quoted
 // YAML scalar. Double quotes are escaped via the caller's %q.
+// updateHomepage rewrites two dynamic regions in the site's root _index.md:
+//
+//  1. LATEST_6_CARDS — the most recent 6 daily briefing cards
+//  2. TODAY_LINK     — the "查看今日早报" button href
+//
+// It scans content/cn/{YYYY}/{YYYY-MM}/*.md (excluding _index.md and
+// anything under blog/) to discover published dailies, sorts them by
+// filename date descending, and takes the first 6.
+//
+// Fail-soft: any error is returned but the caller logs and continues,
+// so a homepage update failure never blocks the daily pipeline.
+func updateHomepage(siteDir string, latestDate time.Time) error {
+	indexPath := filepath.Join(siteDir, "content", "cn", "_index.md")
+	original, err := os.ReadFile(indexPath)
+	if err != nil {
+		return fmt.Errorf("read homepage: %w", err)
+	}
+
+	// --- discover daily .md files ---
+	contentDir := filepath.Join(siteDir, "content", "cn")
+	var dailyFiles []string
+
+	// Walk year directories (2026, 2027, ...)
+	yearEntries, err := os.ReadDir(contentDir)
+	if err != nil {
+		return fmt.Errorf("read content dir: %w", err)
+	}
+	for _, ye := range yearEntries {
+		if !ye.IsDir() || ye.Name() == "blog" || ye.Name() == "tags" {
+			continue
+		}
+		yearPath := filepath.Join(contentDir, ye.Name())
+		monthEntries, err := os.ReadDir(yearPath)
+		if err != nil {
+			continue
+		}
+		for _, me := range monthEntries {
+			if !me.IsDir() {
+				continue
+			}
+			monthPath := filepath.Join(yearPath, me.Name())
+			fileEntries, err := os.ReadDir(monthPath)
+			if err != nil {
+				continue
+			}
+			for _, fe := range fileEntries {
+				name := fe.Name()
+				if fe.IsDir() || name == "_index.md" || !strings.HasSuffix(name, ".md") {
+					continue
+				}
+				// Validate it looks like a date-named file: YYYY-MM-DD.md
+				base := strings.TrimSuffix(name, ".md")
+				if len(base) == 10 && base[4] == '-' && base[7] == '-' {
+					dailyFiles = append(dailyFiles, filepath.Join(monthPath, name))
+				}
+			}
+		}
+	}
+
+	// Sort by filename descending (newest first).
+	sort.Slice(dailyFiles, func(i, j int) bool {
+		return filepath.Base(dailyFiles[i]) > filepath.Base(dailyFiles[j])
+	})
+
+	// Take at most 6.
+	if len(dailyFiles) > 6 {
+		dailyFiles = dailyFiles[:6]
+	}
+
+	// --- parse frontmatter from each file ---
+	type cardInfo struct {
+		date  string // YYYY-MM-DD
+		title string
+		desc  string
+		link  string // Hugo page path
+	}
+
+	fmTitleRe := regexp.MustCompile(`(?m)^title:\s*"?([^"\n]+)"?\s*$`)
+	fmDescRe := regexp.MustCompile(`(?m)^description:\s*"?([^"\n]+)"?\s*$`)
+
+	var cards []cardInfo
+	for _, fpath := range dailyFiles {
+		raw, err := os.ReadFile(fpath)
+		if err != nil {
+			continue
+		}
+		content := string(raw)
+		dateStr := strings.TrimSuffix(filepath.Base(fpath), ".md")
+
+		title := dateStr + " AI资讯"
+		if m := fmTitleRe.FindStringSubmatch(content); len(m) > 1 {
+			title = strings.TrimSpace(m[1])
+		}
+		desc := ""
+		if m := fmDescRe.FindStringSubmatch(content); len(m) > 1 {
+			desc = strings.TrimSpace(m[1])
+		}
+
+		// Build Hugo link: /YYYY/YYYY-MM/YYYY-MM-DD/
+		year := dateStr[:4]
+		yearMonth := dateStr[:7]
+		link := fmt.Sprintf("/%s/%s/%s/", year, yearMonth, dateStr)
+
+		cards = append(cards, cardInfo{date: dateStr, title: title, desc: desc, link: link})
+	}
+
+	// --- generate cards block ---
+	var cardsBlock strings.Builder
+	if len(cards) > 0 {
+		cardsBlock.WriteString("{{< cards cols=\"3\" >}}\n")
+		for _, c := range cards {
+			subtitle := c.desc
+			if len([]rune(subtitle)) > 80 {
+				subtitle = string([]rune(subtitle)[:80]) + "..."
+			}
+			if subtitle == "" {
+				subtitle = c.date
+			}
+			fmt.Fprintf(&cardsBlock, "  {{< card link=%q title=%q subtitle=%q >}}\n",
+				c.link, c.title, subtitle)
+		}
+		cardsBlock.WriteString("{{< /cards >}}")
+	} else {
+		cardsBlock.WriteString("*暂无日报内容*")
+	}
+
+	// --- replace LATEST_6_CARDS region ---
+	text := string(original)
+	cardsRe := regexp.MustCompile(`(?s)<!-- LATEST_6_CARDS_START -->.*?<!-- LATEST_6_CARDS_END -->`)
+	replacement := "<!-- LATEST_6_CARDS_START -->\n" + cardsBlock.String() + "\n<!-- LATEST_6_CARDS_END -->"
+	text = cardsRe.ReplaceAllString(text, replacement)
+
+	// --- replace TODAY_LINK href ---
+	if len(cards) > 0 {
+		todayRe := regexp.MustCompile(`(?s)<!-- TODAY_LINK_START -->.*?<!-- TODAY_LINK_END -->`)
+		todayLink := fmt.Sprintf(
+			`<!-- TODAY_LINK_START -->`+"\n"+
+				`<a href=%q class="hx-inline-block hx-rounded-lg hx-border hx-border-gray-200 hx-px-6 hx-py-3 hx-font-semibold hx-text-gray-700 hover:hx-bg-gray-100 dark:hx-border-neutral-700 dark:hx-text-neutral-300 dark:hover:hx-bg-neutral-800">查看今日早报 →</a>`+"\n"+
+				`<!-- TODAY_LINK_END -->`,
+			cards[0].link)
+		text = todayRe.ReplaceAllString(text, todayLink)
+	}
+
+	if text == string(original) {
+		return nil // nothing changed
+	}
+	return os.WriteFile(indexPath, []byte(text), 0o644)
+}
+
 func truncateDescription(s string, maxRunes int) string {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "\r\n", " ")

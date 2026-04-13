@@ -146,6 +146,17 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		return errors.New("dedup: every item in window already published — nothing new to push (consider clearing data/sent_urls.txt)")
 	}
 
+	// v1.0.1: title-based dedup (same news from different sources).
+	sentTitles := loadSentTitles()
+	if len(sentTitles) > 0 {
+		beforeTitleDedup := len(filtered)
+		filtered = dedupRawItemsByTitle(filtered, sentTitles)
+		if dropped := beforeTitleDedup - len(filtered); dropped > 0 {
+			stage(fmt.Sprintf("title-dedup: %d → %d items (skipped %d similar titles)",
+				beforeTitleDedup, len(filtered), dropped))
+		}
+	}
+
 	// --- 5a. Build sourceID → category map for rank + classify ---------
 	// v1.0.0 INTERFACE CHANGE (T2/C-stage): rank + classify now take a
 	// sourceCategories map so they can apply per-category quota and
@@ -337,9 +348,16 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		// filename. Build a UID-remapped shadow slice where every item has
 		// a globally-unique Seq (1..totalItems), pass the shadows to the
 		// infocard LLM, then match the returned cards back via UID.
-		shadowItems := make([]*store.IssueItem, 0, len(issueItems))
-		uidToItem := make(map[int]*store.IssueItem, len(issueItems))
-		for i, it := range issueItems {
+		// v1.0.1 L1: only pass top 12 items to infocard LLM to reduce
+		// prompt size and avoid 6-minute timeouts. Items are already
+		// rank-ordered, so the first 12 are the highest quality.
+		infocardSrc := issueItems
+		if len(infocardSrc) > 12 {
+			infocardSrc = infocardSrc[:12]
+		}
+		shadowItems := make([]*store.IssueItem, 0, len(infocardSrc))
+		uidToItem := make(map[int]*store.IssueItem, len(infocardSrc))
+		for i, it := range infocardSrc {
 			if it == nil {
 				continue
 			}
@@ -644,6 +662,19 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			for _, w := range report.Warnings {
 				fmt.Printf("[GATE WARN] %s\n", w)
 			}
+			// v1.0.1: gate warn → auto-retry via systemd.
+			// BRIEFING_RETRY_COUNT is set by the retry service units.
+			retryCount, _ := strconv.Atoi(os.Getenv("BRIEFING_RETRY_COUNT"))
+			if retryCount < 3 {
+				// Exit 1 → systemd OnFailure triggers next retry timer.
+				// Don't push to any channel — let the retry produce better content.
+				return fmt.Errorf("gate warn (retry %d/3), will retry: %s",
+					retryCount, strings.Join(report.Warnings, "; "))
+			}
+			// 3rd retry still warned → treat as pass, push normally.
+			stage(fmt.Sprintf("gate warn: retry %d/3 exhausted, treating as pass", retryCount))
+			report.Pass = true
+			report.Warn = false
 		} else {
 			for _, reason := range report.Reasons {
 				fmt.Printf("[GATE FAIL] %s\n", reason)
@@ -732,6 +763,18 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	if newSent := collectIssueItemSourceURLs(issueItems); len(newSent) > 0 {
 		appendSentURLs(newSent)
 		stage(fmt.Sprintf("dedup: persisted %d new URLs to sent set", len(newSent)))
+	}
+
+	// v1.0.1: persist sent titles for title-based dedup.
+	var newTitles []string
+	for _, it := range issueItems {
+		if it != nil && strings.TrimSpace(it.Title) != "" {
+			newTitles = append(newTitles, it.Title)
+		}
+	}
+	if len(newTitles) > 0 {
+		appendSentTitles(newTitles)
+		stage(fmt.Sprintf("title-dedup: persisted %d new titles", len(newTitles)))
 	}
 
 	stage("pipeline complete: issue published")
@@ -1314,6 +1357,135 @@ func dedupRawItemsBySent(items []*store.RawItem, sent map[string]bool) []*store.
 			continue
 		}
 		out = append(out, it)
+	}
+	return out
+}
+
+// --- v1.0.1: title-based dedup ---
+
+const sentTitlesPath = "data/sent_titles.txt"
+
+func loadSentTitles() map[string]bool {
+	set := map[string]bool{}
+	data, err := os.ReadFile(sentTitlesPath)
+	if err != nil {
+		return set
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			set[line] = true
+		}
+	}
+	return set
+}
+
+func appendSentTitles(titles []string) {
+	if len(titles) == 0 {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(sentTitlesPath), 0o755); err != nil {
+		fmt.Printf("[WARN] title dedup: mkdir: %v\n", err)
+		return
+	}
+	f, err := os.OpenFile(sentTitlesPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Printf("[WARN] title dedup: open: %v\n", err)
+		return
+	}
+	defer f.Close()
+	for _, t := range titles {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			_, _ = f.WriteString(t + "\n")
+		}
+	}
+}
+
+// titleKeywordRe extracts English proper nouns (4+ chars, capitalized)
+// and Chinese phrases.
+var titleKeywordRe = regexp.MustCompile(`[A-Z][a-zA-Z]{3,}|[\p{Han}]{3,}`)
+
+func extractTitleKeywords(title string) []string {
+	matches := titleKeywordRe.FindAllString(title, -1)
+	// Deduplicate and lowercase for comparison.
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range matches {
+		key := strings.ToLower(m)
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// titleOverlap returns the Jaccard similarity between two keyword sets.
+func titleOverlap(a, b []string) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	setA := map[string]bool{}
+	for _, k := range a {
+		setA[k] = true
+	}
+	inter := 0
+	for _, k := range b {
+		if setA[k] {
+			inter++
+		}
+	}
+	union := len(setA)
+	for _, k := range b {
+		if !setA[k] {
+			union++
+		}
+	}
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
+}
+
+// dedupRawItemsByTitle removes items whose title keywords overlap >= 60%
+// with already-sent titles. fail-soft: any error returns the original slice.
+func dedupRawItemsByTitle(items []*store.RawItem, sentTitles map[string]bool) []*store.RawItem {
+	if len(sentTitles) == 0 {
+		return items
+	}
+	// Build keyword sets for all sent titles.
+	var sentKWs [][]string
+	for t := range sentTitles {
+		kws := extractTitleKeywords(t)
+		if len(kws) > 0 {
+			sentKWs = append(sentKWs, kws)
+		}
+	}
+	if len(sentKWs) == 0 {
+		return items
+	}
+
+	out := make([]*store.RawItem, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		itemKWs := extractTitleKeywords(it.Title)
+		if len(itemKWs) == 0 {
+			out = append(out, it)
+			continue
+		}
+		dup := false
+		for _, skw := range sentKWs {
+			if titleOverlap(itemKWs, skw) >= 0.6 {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, it)
+		}
 	}
 	return out
 }

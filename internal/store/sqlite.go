@@ -20,6 +20,9 @@ import (
 //go:embed migrations/001_initial.sql
 var initialSchema string
 
+//go:embed migrations/002_weekly.sql
+var weeklySchema string
+
 // New opens (or creates) a SQLite database at dbPath and returns a Store.
 // The caller must invoke Migrate(ctx) before using the Store for reads/writes.
 func New(dbPath string) (Store, error) {
@@ -46,7 +49,10 @@ type sqliteStore struct {
 
 func (s *sqliteStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, initialSchema); err != nil {
-		return fmt.Errorf("migrate: %w", err)
+		return fmt.Errorf("migrate 001: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, weeklySchema); err != nil {
+		return fmt.Errorf("migrate 002: %w", err)
 	}
 	return nil
 }
@@ -512,6 +518,132 @@ func (s *sqliteStore) GetIssueInsight(ctx context.Context, issueID int64) (*Issu
 		return nil, fmt.Errorf("get insight for issue %d: %w", issueID, err)
 	}
 	return &in, nil
+}
+
+// -------- WeeklyIssue --------
+
+func (s *sqliteStore) UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (int64, error) {
+	const q = `
+		INSERT INTO weekly_issues
+			(domain_id, year, week, start_date, end_date, title,
+			 focus_md, signals_md, trends_md, takeaways_md, ponder_md,
+			 full_md, daily_issue_ids, status, generated_at, published_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(domain_id, year, week) DO UPDATE SET
+			start_date = excluded.start_date,
+			end_date = excluded.end_date,
+			title = excluded.title,
+			focus_md = excluded.focus_md,
+			signals_md = excluded.signals_md,
+			trends_md = excluded.trends_md,
+			takeaways_md = excluded.takeaways_md,
+			ponder_md = excluded.ponder_md,
+			full_md = excluded.full_md,
+			daily_issue_ids = excluded.daily_issue_ids,
+			status = excluded.status,
+			generated_at = excluded.generated_at,
+			published_at = excluded.published_at
+		RETURNING id
+	`
+	status := w.Status
+	if status == "" {
+		status = IssueStatusDraft
+	}
+	var id int64
+	err := s.db.QueryRowContext(ctx, q,
+		w.DomainID, w.Year, w.Week,
+		w.StartDate.Format("2006-01-02"), w.EndDate.Format("2006-01-02"),
+		w.Title,
+		w.FocusMD, w.SignalsMD, w.TrendsMD, w.TakeawaysMD, w.PonderMD,
+		w.FullMD, w.DailyIssueIDs, status,
+		nullTimePtr(w.GeneratedAt), nullTimePtr(w.PublishedAt),
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("upsert weekly %s/%d-W%02d: %w", w.DomainID, w.Year, w.Week, err)
+	}
+	return id, nil
+}
+
+func (s *sqliteStore) GetWeeklyIssue(ctx context.Context, domainID string, year, week int) (*WeeklyIssue, error) {
+	const q = `
+		SELECT id, domain_id, year, week, start_date, end_date,
+		       COALESCE(title, ''), COALESCE(focus_md, ''),
+		       COALESCE(signals_md, ''), COALESCE(trends_md, ''),
+		       COALESCE(takeaways_md, ''), COALESCE(ponder_md, ''),
+		       COALESCE(full_md, ''), COALESCE(daily_issue_ids, ''),
+		       status, generated_at, published_at
+		FROM weekly_issues
+		WHERE domain_id = ? AND year = ? AND week = ?
+	`
+	var w WeeklyIssue
+	var generatedAt, publishedAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, q, domainID, year, week).Scan(
+		&w.ID, &w.DomainID, &w.Year, &w.Week, &w.StartDate, &w.EndDate,
+		&w.Title, &w.FocusMD, &w.SignalsMD, &w.TrendsMD,
+		&w.TakeawaysMD, &w.PonderMD, &w.FullMD, &w.DailyIssueIDs,
+		&w.Status, &generatedAt, &publishedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get weekly %s/%d-W%02d: %w", domainID, year, week, err)
+	}
+	if generatedAt.Valid {
+		t := generatedAt.Time
+		w.GeneratedAt = &t
+	}
+	if publishedAt.Valid {
+		t := publishedAt.Time
+		w.PublishedAt = &t
+	}
+	return &w, nil
+}
+
+func (s *sqliteStore) ListDailyIssuesByDateRange(ctx context.Context, domainID string, start, end time.Time) ([]*Issue, error) {
+	const q = `
+		SELECT id, domain_id, issue_date, COALESCE(issue_number, 0),
+		       COALESCE(title, ''), COALESCE(summary, ''), status,
+		       COALESCE(source_count, 0), COALESCE(item_count, 0),
+		       generated_at, published_at
+		FROM issues
+		WHERE domain_id = ? AND issue_date >= ? AND issue_date <= ?
+		ORDER BY issue_date ASC
+	`
+	rows, err := s.db.QueryContext(ctx, q, domainID,
+		start.Format("2006-01-02"), end.Format("2006-01-02"))
+	if err != nil {
+		return nil, fmt.Errorf("list issues %s [%s..%s]: %w",
+			domainID, start.Format("2006-01-02"), end.Format("2006-01-02"), err)
+	}
+	defer rows.Close()
+
+	var out []*Issue
+	for rows.Next() {
+		var is Issue
+		var generatedAt, publishedAt sql.NullTime
+		if err := rows.Scan(
+			&is.ID, &is.DomainID, &is.IssueDate, &is.IssueNumber,
+			&is.Title, &is.Summary, &is.Status,
+			&is.SourceCount, &is.ItemCount,
+			&generatedAt, &publishedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan issue: %w", err)
+		}
+		if generatedAt.Valid {
+			t := generatedAt.Time
+			is.GeneratedAt = &t
+		}
+		if publishedAt.Valid {
+			t := publishedAt.Time
+			is.PublishedAt = &t
+		}
+		out = append(out, &is)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate issues: %w", err)
+	}
+	return out, nil
 }
 
 // -------- Delivery --------

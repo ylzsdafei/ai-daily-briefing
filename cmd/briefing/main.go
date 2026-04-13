@@ -25,6 +25,7 @@ Commands:
     migrate     Initialize or migrate the SQLite schema
     seed        Load sources from config/ai.yaml into the database
     run         Fetch + classify + compose + render + publish (main pipeline)
+    weekly      Generate weekly analysis report from this week's daily issues
     regen       Reuse existing SQLite data, rebuild infocard + HTML + push
     serve       Start static file server for docs/ (web viewer)
     promote     Manually promote an existing issue to Slack prod channel
@@ -122,6 +123,8 @@ func main() {
 		err = seedCommand(ctx, cfg)
 	case "run":
 		err = runCommand(ctx, cfg, date, gf)
+	case "weekly":
+		err = weeklyCommand(ctx, cfg, date, gf)
 	case "regen":
 		err = regenCommand(ctx, cfg, date, gf)
 	case "promote":
