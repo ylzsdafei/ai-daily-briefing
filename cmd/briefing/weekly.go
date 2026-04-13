@@ -251,9 +251,24 @@ func buildWeeklySlackBlocks(w *store.WeeklyIssue, dailyIssues []*store.Issue, we
 
 	blocks = append(blocks, map[string]any{"type": "divider"})
 
-	// 本周聚焦 (truncated, mermaid stripped)
+	// 本周聚焦: 标题 → 副标题 → 图 → 正文
 	if focus := strings.TrimSpace(w.FocusMD); focus != "" {
-		// Extract first mermaid diagram for image rendering.
+		blocks = append(blocks, map[string]any{
+			"type": "section",
+			"text": map[string]any{"type": "mrkdwn", "text": "*🎯 本周聚焦*"},
+		})
+
+		// Extract first ### subtitle as context for the diagram.
+		if subtitle := extractFirstH3(focus); subtitle != "" {
+			blocks = append(blocks, map[string]any{
+				"type": "context",
+				"elements": []map[string]any{
+					{"type": "mrkdwn", "text": "📌 " + subtitle},
+				},
+			})
+		}
+
+		// Diagram image.
 		if mermaidCode := render.ExtractMermaidCode(focus); mermaidCode != "" {
 			if imgURL := render.MermaidInkURL(mermaidCode); imgURL != "" {
 				blocks = append(blocks, map[string]any{
@@ -263,30 +278,36 @@ func buildWeeklySlackBlocks(w *store.WeeklyIssue, dailyIssues []*store.Issue, we
 				})
 			}
 		}
-		// Strip mermaid blocks from text.
+
+		// Text body (stripped of mermaid + HTML tags).
 		cleaned := mdToSlack(render.StripMermaidBlocks(focus))
+		cleaned = stripHTMLTags(cleaned)
 		runes := []rune(cleaned)
 		if len(runes) > 600 {
 			cleaned = string(runes[:600]) + "..."
 		}
 		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*🎯 本周聚焦*\n" + cleaned},
+			"text": map[string]any{"type": "mrkdwn", "text": cleaned},
 		})
 	}
 
 	blocks = append(blocks, map[string]any{"type": "divider"})
 
-	// 趋势全景图
+	// 趋势全景图: 标题 → 图
 	if d := strings.TrimSpace(w.TrendsDiagram); d != "" {
+		blocks = append(blocks, map[string]any{
+			"type": "section",
+			"text": map[string]any{"type": "mrkdwn", "text": "*🗺️ 趋势全景图*"},
+		})
 		if imgURL := render.MermaidInkURL(d); imgURL != "" {
 			blocks = append(blocks, map[string]any{
 				"type":      "image",
 				"image_url": imgURL,
 				"alt_text":  "趋势全景图",
 			})
-			blocks = append(blocks, map[string]any{"type": "divider"})
 		}
+		blocks = append(blocks, map[string]any{"type": "divider"})
 	}
 
 	// 对我们的启发
@@ -408,6 +429,24 @@ func buildWeeklyHeaderCard(w *store.WeeklyIssue, result *generate.WeeklyResult) 
 		TopStories:    stories,
 		FooterSlogan:  "每周一更 · 趋势尽览",
 	}
+}
+
+// extractFirstH3 returns the text of the first ### heading in md.
+func extractFirstH3(md string) string {
+	for _, line := range strings.Split(md, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "### ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "### "))
+		}
+	}
+	return ""
+}
+
+// stripHTMLTags removes HTML tags from text (for Slack which doesn't render HTML).
+var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
+
+func stripHTMLTags(s string) string {
+	return htmlTagRe.ReplaceAllString(s, "")
 }
 
 // hugoBuildf runs hugo --source {siteDir} with a timeout.
