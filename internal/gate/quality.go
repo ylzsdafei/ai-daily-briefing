@@ -239,9 +239,10 @@ func (g *Gate) Check(
 		if r.SourceDomainCount < g.cfg.MinSourceDomains {
 			r.Warnings = append(r.Warnings, "源多样性不足")
 		}
-		if len(failedSections) > 0 {
-			r.Warnings = append(r.Warnings, "部分 section 撰稿失败: "+strings.Join(failedSections, ","))
-		}
+		// v1.0.0+: failedSections 不单独触发 warn. 如果 sections >= min,
+		// 部分 section LLM 502 降级是 fail-soft 正常行为, 不应阻塞 prod.
+		// compose 阶段已经打印了 degraded section 日志, 这里不重复.
+		_ = failedSections
 	}
 
 	// ----- Finalize -----
