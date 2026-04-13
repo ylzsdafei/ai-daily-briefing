@@ -76,8 +76,8 @@ func WriteWeeklyPost(
 		if err := os.MkdirAll(targetDir, 0o755); err == nil {
 			targetPath := filepath.Join(targetDir, "header.png")
 			if err := copyFile(heroSrc, targetPath); err == nil {
-				heroPrefix = fmt.Sprintf("![AI 周报大字报 · %s](%s/images/cards/%s/header.png)\n\n",
-					weeklyDateStr, basePath, weeklyDateStr)
+				heroPrefix = fmt.Sprintf("![AI 周报大字报 · %s](/images/cards/%s/header.png)\n\n",
+					weeklyDateStr, weeklyDateStr)
 			}
 		}
 	}
