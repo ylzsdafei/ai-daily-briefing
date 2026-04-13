@@ -127,16 +127,14 @@ func WriteWeeklyPost(
 	}
 	if s := strings.TrimSpace(weekly.TrendsMD); s != "" {
 		body.WriteString("## 宏观趋势\n\n")
-		body.WriteString(s)
-		body.WriteString("\n\n")
-		// Mermaid trends diagram (if LLM generated one).
+		// Diagram first, then text.
 		if d := strings.TrimSpace(weekly.TrendsDiagram); d != "" {
-			body.WriteString("### 趋势全景图\n\n")
 			body.WriteString("```mermaid\n")
 			body.WriteString(d)
 			body.WriteString("\n```\n\n")
 		}
-		body.WriteString("---\n\n")
+		body.WriteString(s)
+		body.WriteString("\n\n---\n\n")
 	}
 	if s := strings.TrimSpace(weekly.TakeawaysMD); s != "" {
 		body.WriteString("## 对我们的启发\n\n")
