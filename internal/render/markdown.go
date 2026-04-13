@@ -28,6 +28,22 @@ type SectionMeta struct {
 	Title string
 }
 
+// sectionEmoji returns a colored emoji marker for visual section scanning.
+var sectionEmoji = map[string]string{
+	"product_update": "🔵",
+	"research":       "🟢",
+	"industry":       "🟡",
+	"opensource":     "🟣",
+	"social":         "🔴",
+}
+
+func sectionDisplayTitle(sec SectionMeta) string {
+	if emoji, ok := sectionEmoji[sec.ID]; ok {
+		return emoji + " " + sec.Title
+	}
+	return sec.Title
+}
+
 // RenderMarkdown renders a complete daily briefing as markdown, structured
 // to match the upstream ai.hubtoday.app layout (see tmp/upstream-baseline/
 // 2026-04-09.md). It includes:
@@ -93,14 +109,12 @@ func RenderMarkdown(issue *store.Issue, items []*store.IssueItem, insight *store
 	// 5. Emit each section in config order.
 	for _, sec := range sections {
 		secItems := bySection[sec.ID]
+		displayTitle := sectionDisplayTitle(sec)
 		if len(secItems) == 0 {
-			// We still emit the header so readers see the full ToC,
-			// but leave the body empty. If a section is missing
-			// entirely the quality gate will catch it.
-			fmt.Fprintf(&b, "### %s\n\n", sec.Title)
+			fmt.Fprintf(&b, "### %s\n\n", displayTitle)
 			continue
 		}
-		fmt.Fprintf(&b, "### %s\n\n", sec.Title)
+		fmt.Fprintf(&b, "### %s\n\n", displayTitle)
 		for _, it := range secItems {
 			body := strings.TrimSpace(it.BodyMD)
 			if body == "" {
