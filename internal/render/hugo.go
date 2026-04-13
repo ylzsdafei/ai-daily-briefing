@@ -415,6 +415,14 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 		return fmt.Errorf("read homepage: %w", err)
 	}
 
+	// Read basePath from hugo.yaml so links work on GitHub Pages subpaths.
+	basePath := ""
+	if hugoYAML, err := os.ReadFile(filepath.Join(siteDir, "hugo.yaml")); err == nil {
+		if m := regexp.MustCompile(`(?m)^baseURL:\s*https?://[^/]+(/.+?)/?$`).FindSubmatch(hugoYAML); len(m) > 1 {
+			basePath = string(m[1]) // e.g. "/ai-daily-site"
+		}
+	}
+
 	// --- discover daily .md files ---
 	contentDir := filepath.Join(siteDir, "content", "cn")
 	var dailyFiles []string
@@ -495,18 +503,18 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 			desc = strings.TrimSpace(m[1])
 		}
 
-		// Build Hugo link: /YYYY/YYYY-MM/YYYY-MM-DD/
+		// Build Hugo link: {basePath}/YYYY/YYYY-MM/YYYY-MM-DD/
 		year := dateStr[:4]
 		yearMonth := dateStr[:7]
-		link := fmt.Sprintf("/%s/%s/%s/", year, yearMonth, dateStr)
+		link := fmt.Sprintf("%s/%s/%s/%s/", basePath, year, yearMonth, dateStr)
 
 		cards = append(cards, cardInfo{date: dateStr, title: title, desc: desc, link: link})
 	}
 
-	// --- generate cards block ---
+	// --- generate cards block (plain HTML, basePath already in links) ---
 	var cardsBlock strings.Builder
 	if len(cards) > 0 {
-		cardsBlock.WriteString("{{< cards cols=\"3\" >}}\n")
+		cardsBlock.WriteString("<div style=\"display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;\">\n")
 		for _, c := range cards {
 			subtitle := c.desc
 			if len([]rune(subtitle)) > 80 {
@@ -515,12 +523,14 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 			if subtitle == "" {
 				subtitle = c.date
 			}
-			fmt.Fprintf(&cardsBlock, "  {{< card link=%q title=%q subtitle=%q >}}\n",
+			fmt.Fprintf(&cardsBlock,
+				"<a href=%q style=\"display:block;padding:1rem;border:1px solid #e5e7eb;border-radius:0.5rem;text-decoration:none;color:inherit;transition:box-shadow 0.2s;\">"+
+					"<strong>%s</strong><br><small style=\"color:#6b7280;\">%s</small></a>\n",
 				c.link, c.title, subtitle)
 		}
-		cardsBlock.WriteString("{{< /cards >}}")
+		cardsBlock.WriteString("</div>")
 	} else {
-		cardsBlock.WriteString("*暂无日报内容*")
+		cardsBlock.WriteString("<p><em>暂无日报内容</em></p>")
 	}
 
 	// --- replace LATEST_6_CARDS region ---
@@ -529,14 +539,14 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 	replacement := "<!-- LATEST_6_CARDS_START -->\n" + cardsBlock.String() + "\n<!-- LATEST_6_CARDS_END -->"
 	text = cardsRe.ReplaceAllString(text, replacement)
 
-	// --- replace TODAY_LINK (using Hextra card shortcode for relURL support) ---
+	// --- replace TODAY_LINK (plain HTML with basePath) ---
 	if len(cards) > 0 {
 		todayRe := regexp.MustCompile(`(?s)<!-- TODAY_LINK_START -->.*?<!-- TODAY_LINK_END -->`)
 		todayLink := fmt.Sprintf(
 			"<!-- TODAY_LINK_START -->\n"+
-				"{{< cards >}}\n"+
-				"  {{< card link=%q title=\"查看今日早报 →\" icon=\"arrow-circle-right\" >}}\n"+
-				"{{< /cards >}}\n"+
+				"<div style=\"text-align:center;margin-bottom:2rem;\">\n"+
+				"<a href=%q style=\"display:inline-block;padding:0.75rem 1.5rem;border:1px solid #e5e7eb;border-radius:0.5rem;font-weight:600;text-decoration:none;color:inherit;\">查看今日早报 →</a>\n"+
+				"</div>\n"+
 				"<!-- TODAY_LINK_END -->",
 			cards[0].link)
 		text = todayRe.ReplaceAllString(text, todayLink)
