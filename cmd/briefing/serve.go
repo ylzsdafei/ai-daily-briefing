@@ -80,7 +80,7 @@ func serveCommand(args []string) error {
 	// serve process. This keeps the static file server always up even
 	// if chat breaks.
 	if cfg, loadErr := config.Load("config/ai.yaml"); loadErr == nil {
-		mux.Handle("/api/chat", logMiddleware(newChatHandler(cfg, "data/briefing.db")))
+		mux.Handle("/api/chat", corsMiddleware(logMiddleware(newChatHandler(cfg, "data/briefing.db"))))
 		log.Printf("briefing serve: /api/chat endpoint enabled (model=%s)", cfg.LLM.Model)
 	} else {
 		log.Printf("briefing serve: /api/chat DISABLED: %v", loadErr)
@@ -172,6 +172,21 @@ func logMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 		elapsed := time.Since(start)
 		log.Printf("%s %s %d %s %s", r.Method, r.URL.Path, rec.code, elapsed.Truncate(time.Millisecond), r.RemoteAddr)
+	})
+}
+
+// corsMiddleware adds CORS headers so the GitHub Pages chat widget can
+// call /api/chat cross-origin.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
