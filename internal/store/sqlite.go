@@ -23,6 +23,9 @@ var initialSchema string
 //go:embed migrations/002_weekly.sql
 var weeklySchema string
 
+//go:embed migrations/003_weekly_diagram.sql
+var weeklyDiagramSchema string
+
 // New opens (or creates) a SQLite database at dbPath and returns a Store.
 // The caller must invoke Migrate(ctx) before using the Store for reads/writes.
 func New(dbPath string) (Store, error) {
@@ -53,6 +56,12 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, weeklySchema); err != nil {
 		return fmt.Errorf("migrate 002: %w", err)
+	}
+	// 003 is ALTER TABLE — ignore "duplicate column" error if already applied.
+	if _, err := s.db.ExecContext(ctx, weeklyDiagramSchema); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate 003: %w", err)
+		}
 	}
 	return nil
 }
@@ -526,9 +535,9 @@ func (s *sqliteStore) UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (in
 	const q = `
 		INSERT INTO weekly_issues
 			(domain_id, year, week, start_date, end_date, title,
-			 focus_md, signals_md, trends_md, takeaways_md, ponder_md,
+			 focus_md, signals_md, trends_md, trends_diagram, takeaways_md, ponder_md,
 			 full_md, daily_issue_ids, status, generated_at, published_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(domain_id, year, week) DO UPDATE SET
 			start_date = excluded.start_date,
 			end_date = excluded.end_date,
@@ -536,6 +545,7 @@ func (s *sqliteStore) UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (in
 			focus_md = excluded.focus_md,
 			signals_md = excluded.signals_md,
 			trends_md = excluded.trends_md,
+			trends_diagram = excluded.trends_diagram,
 			takeaways_md = excluded.takeaways_md,
 			ponder_md = excluded.ponder_md,
 			full_md = excluded.full_md,
@@ -554,7 +564,7 @@ func (s *sqliteStore) UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (in
 		w.DomainID, w.Year, w.Week,
 		w.StartDate.Format("2006-01-02"), w.EndDate.Format("2006-01-02"),
 		w.Title,
-		w.FocusMD, w.SignalsMD, w.TrendsMD, w.TakeawaysMD, w.PonderMD,
+		w.FocusMD, w.SignalsMD, w.TrendsMD, w.TrendsDiagram, w.TakeawaysMD, w.PonderMD,
 		w.FullMD, w.DailyIssueIDs, status,
 		nullTimePtr(w.GeneratedAt), nullTimePtr(w.PublishedAt),
 	).Scan(&id)
@@ -569,6 +579,7 @@ func (s *sqliteStore) GetWeeklyIssue(ctx context.Context, domainID string, year,
 		SELECT id, domain_id, year, week, start_date, end_date,
 		       COALESCE(title, ''), COALESCE(focus_md, ''),
 		       COALESCE(signals_md, ''), COALESCE(trends_md, ''),
+		       COALESCE(trends_diagram, ''),
 		       COALESCE(takeaways_md, ''), COALESCE(ponder_md, ''),
 		       COALESCE(full_md, ''), COALESCE(daily_issue_ids, ''),
 		       status, generated_at, published_at
@@ -579,7 +590,7 @@ func (s *sqliteStore) GetWeeklyIssue(ctx context.Context, domainID string, year,
 	var generatedAt, publishedAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, q, domainID, year, week).Scan(
 		&w.ID, &w.DomainID, &w.Year, &w.Week, &w.StartDate, &w.EndDate,
-		&w.Title, &w.FocusMD, &w.SignalsMD, &w.TrendsMD,
+		&w.Title, &w.FocusMD, &w.SignalsMD, &w.TrendsMD, &w.TrendsDiagram,
 		&w.TakeawaysMD, &w.PonderMD, &w.FullMD, &w.DailyIssueIDs,
 		&w.Status, &generatedAt, &publishedAt,
 	)

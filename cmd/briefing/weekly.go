@@ -123,6 +123,7 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 		FocusMD:       result.FocusMD,
 		SignalsMD:     result.SignalsMD,
 		TrendsMD:      result.TrendsMD,
+		TrendsDiagram: result.TrendsDiagram,
 		TakeawaysMD:   result.TakeawaysMD,
 		PonderMD:      result.PonderMD,
 		FullMD:        fullMD.String(),
