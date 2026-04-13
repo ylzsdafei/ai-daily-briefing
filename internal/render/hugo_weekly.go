@@ -154,7 +154,8 @@ func WriteWeeklyPost(
 		body.WriteString("\n")
 	}
 
-	full := fm.String() + body.String()
+	// Convert all mermaid code blocks to <img> tags (real PNG via mermaid.ink).
+	full := fm.String() + MermaidToImg(body.String())
 	if err := os.WriteFile(outPath, []byte(full), 0o644); err != nil {
 		return "", fmt.Errorf("weekly hugo: write %s: %w", outPath, err)
 	}

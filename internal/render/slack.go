@@ -264,3 +264,21 @@ func MermaidInkURL(code string) string {
 func StripMermaidBlocks(text string) string {
 	return mermaidBlockRe.ReplaceAllString(text, "")
 }
+
+// MermaidToImg replaces all ```mermaid ... ``` code blocks in markdown
+// with <img> tags pointing to mermaid.ink rendered PNGs.
+// This produces real images that work everywhere (mobile pinch-zoom, etc).
+func MermaidToImg(md string) string {
+	return mermaidBlockRe.ReplaceAllStringFunc(md, func(block string) string {
+		m := mermaidBlockRe.FindStringSubmatch(block)
+		if len(m) < 2 {
+			return block
+		}
+		code := strings.TrimSpace(m[1])
+		if code == "" {
+			return block
+		}
+		url := MermaidInkURL(code)
+		return fmt.Sprintf(`<img src="%s" alt="图谱" style="max-width:100%%;border-radius:0.5rem;">`, url)
+	})
+}

@@ -145,13 +145,12 @@ func RenderMarkdown(issue *store.Issue, items []*store.IssueItem, insight *store
 
 	b.WriteString("---\n\n")
 
-	// v1.0.1: extract mermaid diagram from insight and render it BEFORE
-	// the analysis sections (reader sees the map, then reads the analysis).
+	// v1.0.1: extract mermaid diagram from insight, convert to <img>,
+	// and render it BEFORE the analysis sections.
 	combined := industryMD + "\n" + ourMD
 	if mermaidBlock := mermaidCodeBlockRe.FindString(combined); mermaidBlock != "" {
-		b.WriteString(mermaidBlock)
+		b.WriteString(MermaidToImg(mermaidBlock))
 		b.WriteString("\n\n")
-		// Remove the mermaid block from wherever it was.
 		industryMD = strings.TrimSpace(mermaidCodeBlockRe.ReplaceAllString(industryMD, ""))
 		ourMD = strings.TrimSpace(mermaidCodeBlockRe.ReplaceAllString(ourMD, ""))
 	}
