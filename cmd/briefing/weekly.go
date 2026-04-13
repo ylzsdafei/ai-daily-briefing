@@ -392,10 +392,60 @@ func buildWeeklyHeaderCard(w *store.WeeklyIssue, result *generate.WeeklyResult) 
 		{Value: fmt.Sprintf("%s~%s", w.StartDate.Format("01/02"), w.EndDate.Format("01/02")), Label: "覆盖日期"},
 	}
 
-	// Top stories from focus topics.
+	// Top stories: 聚焦话题 + 信号与噪音 + 趋势方向，填满 MORE STORIES 栏。
 	var stories []infocard.TopStory
+
+	// 聚焦话题 (2-3 条)
 	for _, sl := range subLines {
-		stories = append(stories, infocard.TopStory{Title: sl, Tag: "聚焦"})
+		stories = append(stories, infocard.TopStory{Title: truncRunes(sl, 30), Tag: "聚焦"})
+	}
+
+	// 信号与噪音：提取每条的第一句 (5-7 条)
+	for _, line := range strings.Split(result.SignalsMD, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		// 跳过非列表行
+		if len(line) < 3 || (line[0] < '0' || line[0] > '9') {
+			continue
+		}
+		// 去掉 "1. " 前缀
+		if idx := strings.Index(line, ". "); idx > 0 && idx < 4 {
+			line = strings.TrimSpace(line[idx+2:])
+		}
+		// 取到第一个句号
+		for _, sep := range []string{"。", "；", "."} {
+			if idx := strings.Index(line, sep); idx > 0 {
+				line = line[:idx]
+				break
+			}
+		}
+		stories = append(stories, infocard.TopStory{Title: truncRunes(line, 30), Tag: "信号"})
+		if len(stories) >= 12 {
+			break
+		}
+	}
+
+	// 趋势方向补充 (如果还不够)
+	for _, line := range strings.Split(result.TrendsMD, "\n") {
+		if len(stories) >= 14 {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if len(line) < 3 || (line[0] < '0' || line[0] > '9') {
+			continue
+		}
+		if idx := strings.Index(line, ". "); idx > 0 && idx < 4 {
+			line = strings.TrimSpace(line[idx+2:])
+		}
+		for _, sep := range []string{"。", "；", ".", "，"} {
+			if idx := strings.Index(line, sep); idx > 0 {
+				line = line[:idx]
+				break
+			}
+		}
+		stories = append(stories, infocard.TopStory{Title: truncRunes(line, 30), Tag: "趋势"})
 	}
 
 	return &infocard.HeaderCard{
