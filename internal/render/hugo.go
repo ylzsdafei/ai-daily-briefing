@@ -514,7 +514,7 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 	// --- generate cards block (plain HTML, basePath already in links) ---
 	var cardsBlock strings.Builder
 	if len(cards) > 0 {
-		cardsBlock.WriteString("<div style=\"display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1.5rem;\">\n")
+		cardsBlock.WriteString("<div style=\"display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1rem;\">\n")
 		for _, c := range cards {
 			subtitle := c.desc
 			if len([]rune(subtitle)) > 80 {
