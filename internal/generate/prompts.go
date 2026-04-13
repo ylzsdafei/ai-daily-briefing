@@ -61,7 +61,7 @@ const userPromptTemplate = `以下是今日AI行业日报全文和%d篇源链接
 - graph LR 格式（从左到右，像故事线）
 - 只放 4-6 个节点，文字极简（4-8字）
 - 一条主线 + 最多 1 个分支
-- 用 classDef 着色(名字用 blue/green，不要用 start/end 等保留字，行末不加分号): classDef blue fill:#dbeafe,stroke:#3b82f6 / classDef green fill:#d1fae5,stroke:#10b981
+- 用 classDef 着色(名字用 blue/green，不要用 start/end 等保留字，行末不加分号): classDef blue fill:#dbeafe,stroke:#3b82f6,color:#111827 / classDef green fill:#d1fae5,stroke:#10b981,color:#111827
 - 边标签必须用 -->|标签| 语法（不要用 -- 标签 --> 语法）
 - 越简单越好，把用户当不懂技术的人来设计
 

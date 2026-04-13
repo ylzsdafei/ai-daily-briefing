@@ -518,7 +518,7 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 		for _, c := range cards {
 			subtitle := c.desc
 			if len([]rune(subtitle)) > 80 {
-				subtitle = truncateAtSentenceBound(string([]rune(subtitle)), 80)
+				subtitle = TruncateAtSentence(string([]rune(subtitle)), 80)
 			}
 			if subtitle == "" {
 				subtitle = c.date
@@ -556,11 +556,6 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 		return nil // nothing changed
 	}
 	return os.WriteFile(indexPath, []byte(text), 0o644)
-}
-
-// truncateAtSentenceBound cuts text at a sentence boundary within maxRunes.
-func truncateAtSentenceBound(s string, maxRunes int) string {
-	return TruncateAtSentence(s, maxRunes)
 }
 
 func truncateDescription(s string, maxRunes int) string {

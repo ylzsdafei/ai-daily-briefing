@@ -81,7 +81,7 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 				"text": map[string]any{
 					"type": "mrkdwn",
 					"text": fmt.Sprintf("*📊 行业洞察（今日 %d 条）*\n\n%s",
-						n, convertToSlackMrkdwn(industryMD)),
+						n, ConvertToSlackMrkdwn(industryMD)),
 				},
 			})
 			blocks = append(blocks, map[string]any{"type": "divider"})
@@ -93,7 +93,7 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 				"text": map[string]any{
 					"type": "mrkdwn",
 					"text": fmt.Sprintf("*💭 对我们的启发（今日 %d 条）*\n\n%s",
-						n, convertToSlackMrkdwn(ourMD)),
+						n, ConvertToSlackMrkdwn(ourMD)),
 				},
 			})
 			blocks = append(blocks, map[string]any{"type": "divider"})
@@ -126,7 +126,7 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 				"text": map[string]any{
 					"type": "mrkdwn",
 					"text": fmt.Sprintf("*📋 今日摘要（%d 条）*\n\n%s",
-						len(kept), convertToSlackMrkdwn(strings.Join(numbered, "\n"))),
+						len(kept), ConvertToSlackMrkdwn(strings.Join(numbered, "\n"))),
 				},
 			})
 			blocks = append(blocks, map[string]any{"type": "divider"})
@@ -211,7 +211,7 @@ var (
 //
 // We intentionally do NOT touch headings or list bullets — Slack
 // renders them fine as-is, and stripping them would lose structure.
-func convertToSlackMrkdwn(text string) string {
+func ConvertToSlackMrkdwn(text string) string {
 	if text == "" {
 		return ""
 	}

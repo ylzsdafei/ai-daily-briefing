@@ -338,13 +338,7 @@ func cleanForSlack(md string, maxRunes int) string {
 //   - [text](url) → <url|text>
 //   - Strip remaining # prefixes
 func mdToSlack(s string) string {
-	// Headers: ### text → *text*
-	s = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`).ReplaceAllString(s, "*$1*")
-	// Bold: **text** → *text*
-	s = regexp.MustCompile(`\*\*([^*]+)\*\*`).ReplaceAllString(s, "*$1*")
-	// Links: [text](url) → <url|text>
-	s = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`).ReplaceAllString(s, "<$2|$1>")
-	return s
+	return render.ConvertToSlackMrkdwn(s)
 }
 
 // buildWeeklyHeaderCard constructs a HeaderCard for the weekly report's
@@ -551,7 +545,7 @@ func ensureOrderedList(s string) string {
 			continue
 		}
 		n++
-		if !regexp.MustCompile(`^\d+\.\s`).MatchString(trimmed) {
+		if !orderedListRe.MatchString(trimmed) {
 			lines[i] = fmt.Sprintf("%d. %s", n, trimmed)
 		}
 	}
@@ -568,6 +562,8 @@ func nonEmptyLines(s string) []string {
 	}
 	return out
 }
+
+var orderedListRe = regexp.MustCompile(`^\d+\.\s`)
 
 // stripDetailsBlocks removes entire <details>...</details> sections.
 var detailsBlockRe = regexp.MustCompile(`(?s)<details>.*?</details>`)
