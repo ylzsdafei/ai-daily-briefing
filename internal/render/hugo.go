@@ -511,10 +511,10 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 		cards = append(cards, cardInfo{date: dateStr, title: title, desc: desc, link: link})
 	}
 
-	// --- generate cards block (plain HTML, basePath already in links) ---
+	// --- generate cards block (CSS class based, dark mode + responsive) ---
 	var cardsBlock strings.Builder
 	if len(cards) > 0 {
-		cardsBlock.WriteString("<div style=\"display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1rem;\">\n")
+		cardsBlock.WriteString("<div class=\"briefing-card-grid\">\n")
 		for _, c := range cards {
 			subtitle := c.desc
 			if len([]rune(subtitle)) > 80 {
@@ -524,8 +524,8 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 				subtitle = c.date
 			}
 			fmt.Fprintf(&cardsBlock,
-				"<a href=%q style=\"display:block;padding:1rem;border:1px solid #e5e7eb;border-radius:0.5rem;text-decoration:none;color:inherit;transition:box-shadow 0.2s;\">"+
-					"<strong>%s</strong><br><small style=\"color:#6b7280;\">%s</small></a>\n",
+				"<a href=%q class=\"briefing-card\">"+
+					"<strong>%s</strong><br><small>%s</small></a>\n",
 				c.link, c.title, subtitle)
 		}
 		cardsBlock.WriteString("</div>")
@@ -545,7 +545,7 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 		todayLink := fmt.Sprintf(
 			"<!-- TODAY_LINK_START -->\n"+
 				"<div style=\"text-align:center;margin-bottom:2rem;\">\n"+
-				"<a href=%q style=\"display:inline-block;padding:0.75rem 1.5rem;border:1px solid #e5e7eb;border-radius:0.5rem;font-weight:600;text-decoration:none;color:inherit;\">查看今日早报 →</a>\n"+
+				"<a href=%q style=\"display:inline-block;padding:0.75rem 2rem;background:#3b82f6;color:#fff;border-radius:0.5rem;font-weight:600;text-decoration:none;font-size:1.05rem;transition:background 0.2s;\">查看今日早报 →</a>\n"+
 				"</div>\n"+
 				"<!-- TODAY_LINK_END -->",
 			cards[0].link)
