@@ -1,16 +1,15 @@
 package generate
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
 
+	"briefing-v3/internal/llm"
 	"briefing-v3/internal/store"
 )
 
@@ -93,9 +92,13 @@ func GenerateWeekly(ctx context.Context, cfg WeeklyConfig, startDate, endDate ti
 	userPrompt := buildWeeklyUserPrompt(startDate, endDate, dailies)
 
 	hc := &http.Client{}
+	llmCfg := llm.Config{
+		BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: cfg.Model,
+		Temperature: cfg.Temperature, MaxTokens: 16384, Timeout: cfg.Timeout,
+	}
 	var lastErr error
 	for attempt := 1; attempt <= cfg.MaxRetries; attempt++ {
-		raw, err := weeklyChat(ctx, hc, cfg, weeklySystemPrompt, userPrompt)
+		raw, err := llm.ChatComplete(ctx, hc, llmCfg, weeklySystemPrompt, userPrompt)
 		if err != nil {
 			lastErr = err
 			continue
@@ -200,76 +203,3 @@ func parseWeeklyJSON(raw string) (*WeeklyResult, error) {
 	}, nil
 }
 
-func weeklyChat(parent context.Context, hc *http.Client, cfg WeeklyConfig, system, user string) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, cfg.Timeout)
-	defer cancel()
-
-	type msg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	body := struct {
-		Model       string  `json:"model"`
-		Messages    []msg   `json:"messages"`
-		Temperature float64 `json:"temperature"`
-		MaxTokens   int     `json:"max_tokens"`
-	}{
-		Model:       cfg.Model,
-		Temperature: cfg.Temperature,
-		MaxTokens:   16384,
-		Messages: []msg{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
-	}
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return "", fmt.Errorf("marshal: %w", err)
-	}
-
-	apiURL := strings.TrimRight(cfg.BaseURL, "/") + "/v1/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(buf))
-	if err != nil {
-		return "", fmt.Errorf("new request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-
-	resp, err := hc.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http: %w", err)
-	}
-	defer resp.Body.Close()
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		snippet := string(b)
-		if len(snippet) > 500 {
-			snippet = snippet[:500]
-		}
-		return "", fmt.Errorf("http %d: %s", resp.StatusCode, snippet)
-	}
-	var parsed struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		return "", fmt.Errorf("unmarshal: %w", err)
-	}
-	if parsed.Error != nil && parsed.Error.Message != "" {
-		return "", fmt.Errorf("llm: %s", parsed.Error.Message)
-	}
-	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("empty choices")
-	}
-	return parsed.Choices[0].Message.Content, nil
-}

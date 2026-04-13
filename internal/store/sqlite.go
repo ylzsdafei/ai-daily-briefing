@@ -483,6 +483,36 @@ func (s *sqliteStore) ListIssueItems(ctx context.Context, issueID int64) ([]*Iss
 	return out, nil
 }
 
+func (s *sqliteStore) ListIssueItemsByIssueIDs(ctx context.Context, ids []int64) (map[int64][]*IssueItem, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := `SELECT id, issue_id, section, seq, title, body_md,
+	       COALESCE(source_urls_json, ''), COALESCE(raw_item_ids_json, ''), created_at
+	      FROM issue_items WHERE issue_id IN (` + strings.Join(placeholders, ",") + `) ORDER BY issue_id, section, seq`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list items by ids: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[int64][]*IssueItem)
+	for rows.Next() {
+		var it IssueItem
+		if err := rows.Scan(&it.ID, &it.IssueID, &it.Section, &it.Seq, &it.Title, &it.BodyMD,
+			&it.SourceURLsJSON, &it.RawItemIDsJSON, &it.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan item: %w", err)
+		}
+		out[it.IssueID] = append(out[it.IssueID], &it)
+	}
+	return out, rows.Err()
+}
+
 // -------- IssueInsight --------
 
 func (s *sqliteStore) UpsertIssueInsight(ctx context.Context, insight *IssueInsight) error {
@@ -663,6 +693,36 @@ func (s *sqliteStore) ListDailyIssuesByDateRange(ctx context.Context, domainID s
 		return nil, fmt.Errorf("iterate issues: %w", err)
 	}
 	return out, nil
+}
+
+func (s *sqliteStore) ListIssueInsightsByIssueIDs(ctx context.Context, ids []int64) (map[int64]*IssueInsight, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := `SELECT id, issue_id, COALESCE(industry_md, ''), COALESCE(our_md, ''),
+	       COALESCE(model, ''), COALESCE(temperature, 0), retry_count, generated_at
+	      FROM issue_insights WHERE issue_id IN (` + strings.Join(placeholders, ",") + `)`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list insights by ids: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[int64]*IssueInsight)
+	for rows.Next() {
+		var in IssueInsight
+		if err := rows.Scan(&in.ID, &in.IssueID, &in.IndustryMD, &in.OurMD,
+			&in.Model, &in.Temperature, &in.RetryCount, &in.GeneratedAt); err != nil {
+			return nil, fmt.Errorf("scan insight: %w", err)
+		}
+		out[in.IssueID] = &in
+	}
+	return out, rows.Err()
 }
 
 // -------- Delivery --------

@@ -56,25 +56,26 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 	}
 	stage(fmt.Sprintf("weekly: found %d daily issues", len(dailyIssues)))
 
-	// --- assemble daily bundles ---
-	var bundles []generate.DailyBundle
+	// --- assemble daily bundles (batch queries, not N+1) ---
 	var issueIDs []int64
 	for _, di := range dailyIssues {
-		items, err := s.ListIssueItems(ctx, di.ID)
-		if err != nil {
-			stage(fmt.Sprintf("[WARN] list items for issue %d: %v", di.ID, err))
-			continue
-		}
-		insight, err := s.GetIssueInsight(ctx, di.ID)
-		if err != nil {
-			stage(fmt.Sprintf("[WARN] get insight for issue %d: %v", di.ID, err))
-		}
+		issueIDs = append(issueIDs, di.ID)
+	}
+	allItems, err := s.ListIssueItemsByIssueIDs(ctx, issueIDs)
+	if err != nil {
+		return fmt.Errorf("batch list items: %w", err)
+	}
+	allInsights, err := s.ListIssueInsightsByIssueIDs(ctx, issueIDs)
+	if err != nil {
+		return fmt.Errorf("batch list insights: %w", err)
+	}
+	var bundles []generate.DailyBundle
+	for _, di := range dailyIssues {
 		bundles = append(bundles, generate.DailyBundle{
 			Issue:   di,
-			Items:   items,
-			Insight: insight,
+			Items:   allItems[di.ID],
+			Insight: allInsights[di.ID],
 		})
-		issueIDs = append(issueIDs, di.ID)
 	}
 	if len(bundles) == 0 {
 		return fmt.Errorf("weekly: no usable daily bundles")
@@ -96,20 +97,7 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 	}
 	stage("weekly: LLM generation OK")
 
-	// --- build full markdown ---
 	title := fmt.Sprintf("第%d周 AI周报：%s", isoWeek, result.TitleKeywords)
-
-	var fullMD strings.Builder
-	fullMD.WriteString("## 本周聚焦\n\n")
-	fullMD.WriteString(result.FocusMD)
-	fullMD.WriteString("\n\n## 信号与噪音\n\n")
-	fullMD.WriteString(result.SignalsMD)
-	fullMD.WriteString("\n\n## 宏观趋势\n\n")
-	fullMD.WriteString(result.TrendsMD)
-	fullMD.WriteString("\n\n## 对我们的启发\n\n")
-	fullMD.WriteString(result.TakeawaysMD)
-	fullMD.WriteString("\n\n## 本周思考\n\n")
-	fullMD.WriteString(result.PonderMD)
 
 	// --- persist to DB ---
 	issueIDsJSON, _ := json.Marshal(issueIDs)
@@ -128,7 +116,7 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 		TrendsDiagramDetail: result.TrendsDiagramDetail,
 		TakeawaysMD:         result.TakeawaysMD,
 		PonderMD:      result.PonderMD,
-		FullMD:        fullMD.String(),
+		FullMD:        "",
 		DailyIssueIDs: string(issueIDsJSON),
 		Status:        store.IssueStatusGenerated,
 		GeneratedAt:   &now,
@@ -143,9 +131,7 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 	// --- dry-run: print and exit ---
 	if gf.dryRun {
 		stage("dry-run: skipping hugo write and publish")
-		fmt.Println("\n================ WEEKLY MARKDOWN ================")
-		fmt.Println(fullMD.String())
-		fmt.Println("=================================================")
+		fmt.Printf("\n=== %s ===\n聚焦:\n%s\n趋势:\n%s\n", title, result.FocusMD, result.TrendsMD)
 		return nil
 	}
 

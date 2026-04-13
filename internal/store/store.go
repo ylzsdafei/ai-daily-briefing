@@ -40,15 +40,14 @@ type Store interface {
 	NextIssueNumber(ctx context.Context, domainID string) (int, error)
 
 	// IssueItem
-	// ReplaceIssueItems deletes existing items for the issue and inserts
-	// the provided set atomically. Used by compose to rewrite issue items
-	// on retry.
 	ReplaceIssueItems(ctx context.Context, issueID int64, items []*IssueItem) error
 	ListIssueItems(ctx context.Context, issueID int64) ([]*IssueItem, error)
+	ListIssueItemsByIssueIDs(ctx context.Context, ids []int64) (map[int64][]*IssueItem, error)
 
 	// IssueInsight
 	UpsertIssueInsight(ctx context.Context, insight *IssueInsight) error
 	GetIssueInsight(ctx context.Context, issueID int64) (*IssueInsight, error)
+	ListIssueInsightsByIssueIDs(ctx context.Context, ids []int64) (map[int64]*IssueInsight, error)
 
 	// WeeklyIssue
 	UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (int64, error)

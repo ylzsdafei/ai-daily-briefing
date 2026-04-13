@@ -12,17 +12,16 @@
 package infocard
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
 
+	"briefing-v3/internal/llm"
 	"briefing-v3/internal/store"
 )
 
@@ -200,9 +199,13 @@ func (g *llmGenerator) Generate(ctx context.Context, items []*store.IssueItem, s
 
 	userPrompt := buildInfoCardUserPrompt(items, summary)
 
+	llmCfg := llm.Config{
+		BaseURL: g.cfg.BaseURL, APIKey: g.cfg.APIKey, Model: g.cfg.Model,
+		Temperature: 0.3, MaxTokens: 8192, Timeout: g.cfg.Timeout,
+	}
 	var lastErr error
 	for attempt := 1; attempt <= g.cfg.MaxRetries; attempt++ {
-		raw, err := g.chatComplete(ctx, infoCardSystemPrompt, userPrompt)
+		raw, err := llm.ChatComplete(ctx, g.hc, llmCfg, infoCardSystemPrompt, userPrompt)
 		if err != nil {
 			lastErr = err
 			continue
@@ -293,79 +296,4 @@ func parseInfoCardJSON(raw string, items []*store.IssueItem) (*HeaderCard, []*Ca
 
 var fencedJSONRe = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*\\})\\s*```")
 
-// --- OpenAI-compatible HTTP client (copied from rank/classify pattern) ---
-
-type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens"`
-}
-type chatResponse struct {
-	Choices []struct {
-		Message chatMessage `json:"message"`
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-func (g *llmGenerator) chatComplete(parent context.Context, system, user string) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, g.cfg.Timeout)
-	defer cancel()
-
-	body := chatRequest{
-		Model:       g.cfg.Model,
-		Temperature: 0.3,
-		MaxTokens:   8192,
-		Messages: []chatMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
-	}
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return "", fmt.Errorf("marshal: %w", err)
-	}
-
-	apiURL := strings.TrimRight(g.cfg.BaseURL, "/") + "/v1/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(buf))
-	if err != nil {
-		return "", fmt.Errorf("new request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+g.cfg.APIKey)
-
-	resp, err := g.hc.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http: %w", err)
-	}
-	defer resp.Body.Close()
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		snippet := string(b)
-		if len(snippet) > 500 {
-			snippet = snippet[:500]
-		}
-		return "", fmt.Errorf("http %d: %s", resp.StatusCode, snippet)
-	}
-	var parsed chatResponse
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		return "", fmt.Errorf("unmarshal: %w", err)
-	}
-	if parsed.Error != nil && parsed.Error.Message != "" {
-		return "", fmt.Errorf("llm: %s", parsed.Error.Message)
-	}
-	if len(parsed.Choices) == 0 {
-		return "", errors.New("empty choices")
-	}
-	return parsed.Choices[0].Message.Content, nil
-}
+// LLM HTTP client moved to internal/llm/client.go
