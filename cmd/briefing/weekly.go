@@ -227,133 +227,103 @@ func isoWeekStart(isoYear, isoWeek int) time.Time {
 	return week1Monday.AddDate(0, 0, (isoWeek-1)*7)
 }
 
-// buildWeeklySlackBlocks creates a Slack blocks payload for the weekly report,
-// matching the daily report's button style (primary blue button).
+// buildWeeklySlackBlocks creates a Slack blocks payload for the weekly report.
+// Layout: Header → 日期 → [聚焦标题+图+摘要] → [趋势图] → 启发 → 思考 → 按钮
+// Slack limits: section text ≤ 3000 chars, max 50 blocks.
 func buildWeeklySlackBlocks(w *store.WeeklyIssue, dailyIssues []*store.Issue, weeklyPageURL string) map[string]any {
 	var blocks []map[string]any
 
-	// Header
+	// 1. Header
 	blocks = append(blocks, map[string]any{
 		"type": "header",
 		"text": map[string]any{"type": "plain_text", "text": w.Title, "emoji": true},
 	})
 
-	// Date range context
+	// 2. Date range
 	blocks = append(blocks, map[string]any{
 		"type": "context",
 		"elements": []map[string]any{
-			{"type": "mrkdwn", "text": fmt.Sprintf("📅 %s ~ %s | %d 期日报汇总",
-				w.StartDate.Format("2006-01-02"),
-				w.EndDate.Format("2006-01-02"),
+			{"type": "mrkdwn", "text": fmt.Sprintf("📅 %s ~ %s · %d 期日报",
+				w.StartDate.Format("01-02"),
+				w.EndDate.Format("01-02"),
 				len(dailyIssues))},
 		},
 	})
-
 	blocks = append(blocks, map[string]any{"type": "divider"})
 
-	// 本周聚焦: 标题 → 副标题 → 图 → 正文
+	// 3. 本周聚焦: 标题 + 各话题副标题列表
 	if focus := strings.TrimSpace(w.FocusMD); focus != "" {
-		blocks = append(blocks, map[string]any{
-			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*🎯 本周聚焦*"},
-		})
-
-		// Extract first ### subtitle as context for the diagram.
-		if subtitle := extractFirstH3(focus); subtitle != "" {
-			blocks = append(blocks, map[string]any{
-				"type": "context",
-				"elements": []map[string]any{
-					{"type": "mrkdwn", "text": "📌 " + subtitle},
-				},
-			})
-		}
-
-		// Diagram image.
-		if mermaidCode := render.ExtractMermaidCode(focus); mermaidCode != "" {
-			if imgURL := render.MermaidInkURL(mermaidCode); imgURL != "" {
-				blocks = append(blocks, map[string]any{
-					"type":      "image",
-					"image_url": imgURL,
-					"alt_text":  "本周聚焦关系图",
-				})
-			}
-		}
-
-		// Text body (stripped of mermaid + HTML tags).
-		cleaned := mdToSlack(render.StripMermaidBlocks(focus))
-		cleaned = stripHTMLTags(cleaned)
-		runes := []rune(cleaned)
-		if len(runes) > 600 {
-			cleaned = string(runes[:600]) + "..."
+		subtitles := extractAllH3(focus)
+		var focusText strings.Builder
+		focusText.WriteString("*🎯 本周聚焦*\n\n")
+		for i, s := range subtitles {
+			fmt.Fprintf(&focusText, "%d. %s\n", i+1, s)
 		}
 		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": cleaned},
+			"text": map[string]any{"type": "mrkdwn", "text": focusText.String()},
 		})
-	}
-
-	blocks = append(blocks, map[string]any{"type": "divider"})
-
-	// 趋势全景图: 标题 → 图
-	if d := strings.TrimSpace(w.TrendsDiagram); d != "" {
-		blocks = append(blocks, map[string]any{
-			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*🗺️ 趋势全景图*"},
-		})
-		if imgURL := render.MermaidInkURL(d); imgURL != "" {
-			blocks = append(blocks, map[string]any{
-				"type":      "image",
-				"image_url": imgURL,
-				"alt_text":  "趋势全景图",
-			})
-		}
 		blocks = append(blocks, map[string]any{"type": "divider"})
 	}
 
-	// 对我们的启发
-	if takeaways := strings.TrimSpace(w.TakeawaysMD); takeaways != "" {
+	// 4. 对我们的启发
+	if t := strings.TrimSpace(w.TakeawaysMD); t != "" {
+		cleaned := cleanForSlack(t, 800)
 		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*💡 对我们的启发*\n" + mdToSlack(takeaways)},
+			"text": map[string]any{"type": "mrkdwn", "text": "*💡 对我们的启发*\n" + cleaned},
 		})
 	}
 
-	// 本周思考
-	if ponder := strings.TrimSpace(w.PonderMD); ponder != "" {
+	// 5. 本周思考
+	if t := strings.TrimSpace(w.PonderMD); t != "" {
 		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": "*🤔 本周思考*\n" + mdToSlack(ponder)},
+			"text": map[string]any{"type": "mrkdwn", "text": "*🤔 本周思考*\n" + mdToSlack(t)},
 		})
 	}
 
-	// Button — same style as daily report
+	// 7. Button
 	if weeklyPageURL != "" {
 		blocks = append(blocks, map[string]any{
 			"type": "actions",
-			"elements": []map[string]any{
-				{
-					"type": "button",
-					"text": map[string]any{
-						"type":  "plain_text",
-						"text":  "📖 查看完整周报",
-						"emoji": true,
-					},
-					"url":   weeklyPageURL,
-					"style": "primary",
-				},
-			},
+			"elements": []map[string]any{{
+				"type":  "button",
+				"text":  map[string]any{"type": "plain_text", "text": "📖 查看完整周报", "emoji": true},
+				"url":   weeklyPageURL,
+				"style": "primary",
+			}},
 		})
 	}
 
-	// Footer
+	// 8. Footer
 	blocks = append(blocks, map[string]any{
 		"type": "context",
 		"elements": []map[string]any{
-			{"type": "mrkdwn", "text": "briefing-v3 自动生成 · AI 周报"},
+			{"type": "mrkdwn", "text": "briefing-v3 · AI 周报"},
 		},
 	})
 
 	return map[string]any{"blocks": blocks}
+}
+
+// cleanForSlack strips mermaid blocks, <details> blocks, HTML tags,
+// converts markdown to Slack mrkdwn, and truncates to maxRunes.
+func cleanForSlack(md string, maxRunes int) string {
+	s := render.StripMermaidBlocks(md)
+	s = detailsBlockRe.ReplaceAllString(s, "")
+	s = htmlTagRe.ReplaceAllString(s, "")
+	s = mdToSlack(s)
+	// Collapse multiple blank lines.
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+	}
+	s = strings.TrimSpace(s)
+	runes := []rune(s)
+	if len(runes) > maxRunes {
+		s = string(runes[:maxRunes]) + "..."
+	}
+	return s
 }
 
 // mdToSlack converts standard markdown to Slack mrkdwn format:
@@ -431,21 +401,26 @@ func buildWeeklyHeaderCard(w *store.WeeklyIssue, result *generate.WeeklyResult) 
 	}
 }
 
-// extractFirstH3 returns the text of the first ### heading in md.
-func extractFirstH3(md string) string {
+// extractAllH3 returns the text of all ### headings in md.
+func extractAllH3(md string) []string {
+	var out []string
 	for _, line := range strings.Split(md, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "### ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "### "))
+			out = append(out, strings.TrimSpace(strings.TrimPrefix(line, "### ")))
 		}
 	}
-	return ""
+	return out
 }
+
+// stripDetailsBlocks removes entire <details>...</details> sections.
+var detailsBlockRe = regexp.MustCompile(`(?s)<details>.*?</details>`)
 
 // stripHTMLTags removes HTML tags from text (for Slack which doesn't render HTML).
 var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
 
 func stripHTMLTags(s string) string {
+	s = detailsBlockRe.ReplaceAllString(s, "")
 	return htmlTagRe.ReplaceAllString(s, "")
 }
 

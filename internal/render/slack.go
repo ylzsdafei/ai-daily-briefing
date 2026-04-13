@@ -100,22 +100,6 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 		}
 	}
 
-	// 6b. Mermaid diagram as image (via mermaid.ink rendering service).
-	if rendered.Insight != nil {
-		combined := rendered.Insight.IndustryMD + "\n" + rendered.Insight.OurMD
-		if mermaidCode := ExtractMermaidCode(combined); mermaidCode != "" {
-			imgURL := MermaidInkURL(mermaidCode)
-			if imgURL != "" {
-				blocks = append(blocks, map[string]any{
-					"type":      "image",
-					"image_url": imgURL,
-					"alt_text":  "今日事件关系图",
-				})
-				blocks = append(blocks, map[string]any{"type": "divider"})
-			}
-		}
-	}
-
 	// 7. Today's summary. Upstream numbers each non-blank line; we keep
 	// that behaviour and skip double-numbering when the line already
 	// starts with "N.".
