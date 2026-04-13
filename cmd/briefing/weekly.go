@@ -261,10 +261,7 @@ func buildWeeklySlackBlocks(w *store.WeeklyIssue, dailyIssues []*store.Issue, we
 			for i, t := range topics {
 				fmt.Fprintf(&focusText, "%d. %s\n  【洞察】%s\n", i+1, t.title, t.insight)
 			}
-			focusStr := focusText.String()
-			if len([]rune(focusStr)) > 2900 {
-				focusStr = string([]rune(focusStr)[:2900]) + "..."
-			}
+			focusStr := render.TruncateAtSentence(focusText.String(), 2900)
 			blocks = append(blocks, map[string]any{
 				"type": "section",
 				"text": map[string]any{"type": "mrkdwn", "text": focusStr},
@@ -332,11 +329,7 @@ func cleanForSlack(md string, maxRunes int) string {
 		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}
 	s = strings.TrimSpace(s)
-	runes := []rune(s)
-	if len(runes) > maxRunes {
-		s = string(runes[:maxRunes]) + "..."
-	}
-	return s
+	return render.TruncateAtSentence(s, maxRunes)
 }
 
 // mdToSlack converts standard markdown to Slack mrkdwn format:

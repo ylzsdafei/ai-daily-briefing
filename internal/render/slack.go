@@ -217,13 +217,8 @@ func convertToSlackMrkdwn(text string) string {
 	}
 	out := slackBoldPattern.ReplaceAllString(text, `*$1*`)
 	out = slackLinkPattern.ReplaceAllString(out, `<$2|$1>`)
-	// Slack's hard limit on a section text is 3000 characters. Leave
-	// a small margin so emoji width and the "..." marker fit cleanly.
-	const limit = 2900
-	if len([]rune(out)) > limit {
-		runes := []rune(out)
-		out = string(runes[:limit]) + "..."
-	}
+	// Slack's hard limit on a section text is 3000 characters.
+	out = TruncateAtSentence(out, 2900)
 	return out
 }
 
@@ -263,6 +258,29 @@ func MermaidInkURL(code string) string {
 // code would display as gibberish).
 func StripMermaidBlocks(text string) string {
 	return mermaidBlockRe.ReplaceAllString(text, "")
+}
+
+// TruncateAtSentence cuts text to fit within maxRunes, always ending at
+// a complete sentence boundary. Never produces trailing "..." or half sentences.
+func TruncateAtSentence(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	// Scan backwards from the limit to find a sentence-ending punctuation.
+	sub := string(runes[:maxRunes])
+	for _, sep := range []string{"。", "；", "\n\n", "\n", ".", ";"} {
+		if idx := strings.LastIndex(sub, sep); idx > len(sub)/3 {
+			return strings.TrimSpace(sub[:idx+len(sep)])
+		}
+	}
+	// No sentence boundary found — cut at last comma or space.
+	for _, sep := range []string{"，", ",", " "} {
+		if idx := strings.LastIndex(sub, sep); idx > len(sub)/3 {
+			return strings.TrimSpace(sub[:idx])
+		}
+	}
+	return strings.TrimSpace(sub)
 }
 
 // MermaidToImg replaces all ```mermaid ... ``` code blocks in markdown
