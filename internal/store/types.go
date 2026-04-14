@@ -28,7 +28,12 @@ type Source struct {
 	// vs industry. Not persisted as its own column — the authoritative copy
 	// lives in config/ai.yaml and is re-parsed on every ListEnabledSources
 	// call.
-	Category  string
+	Category string
+	// Priority 是 0-10 的整数, 从 ConfigJSON (SourceConfig.Priority) 解析出.
+	// 用于 rank 阶段的加权评分 (v1.0.1 Phase 4.1): 同样 LLM 分数的两个 item,
+	// priority 高的源(如 DeepMind / Google AI 设为 10)会排在 priority 低的
+	// 源(无名博客设为 5)前面. 未设置 → 默认 5 (中性, 等同不加权).
+	Priority  int
 	Enabled   bool
 	CreatedAt time.Time
 }

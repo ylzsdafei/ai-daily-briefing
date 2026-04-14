@@ -69,25 +69,40 @@ func (c *Config) fillDefaults() {
 }
 
 // RankedItem carries the original RawItem plus the LLM's verdict.
+//
+// v1.0.1 Phase 4.1: WeightedScore = Score × sourcePriorityWeight, used as
+// the actual sort key. Score (raw LLM 0-10) is preserved for debugging /
+// display. sourcePriorityWeight = 0.5 + priority/10.0 (priority 0-10):
+//
+//	priority=10 → weight 1.5 (权威源上浮)
+//	priority=5  → weight 1.0 (中性)
+//	priority=0  → weight 0.5 (未设默认降权)
 type RankedItem struct {
-	Item   *store.RawItem
-	Score  float64
-	Reason string
+	Item          *store.RawItem
+	Score         float64 // raw LLM 0-10
+	WeightedScore float64 // Score × priorityWeight (used for sort)
+	Reason        string
 }
 
 // Ranker is the public interface: score a batch of RawItems and return a
 // ranked-and-filtered subset.
 //
-// v1.0.0: Rank now accepts a sourceCategories lookup so it can enforce
+// v1.0.0: Rank accepts a sourceCategories lookup so it can enforce
 // the per-category quota configured via Config.PerCategoryQuota. The
 // map is sourceID → category ("news"/"blog"/"paper"/"project"/"community").
 // Items whose source is absent from the map are treated as an "unknown"
 // category that is not subject to any quota.
+//
+// v1.0.1 Phase 4.1: sourcePriorities (sourceID → priority 0-10) is also
+// accepted for weighted scoring. Nil / empty map = no weighting (all
+// items treated as priority=5, neutral weight 1.0). Missing source in
+// an otherwise-populated map → priority=0 (降权, signals config drift).
 type Ranker interface {
 	Rank(
 		ctx context.Context,
 		items []*store.RawItem,
 		sourceCategories map[int64]string,
+		sourcePriorities map[int64]int,
 	) ([]*RankedItem, error)
 }
 
@@ -186,6 +201,7 @@ func (r *llmRanker) Rank(
 	ctx context.Context,
 	items []*store.RawItem,
 	sourceCategories map[int64]string,
+	sourcePriorities map[int64]int,
 ) ([]*RankedItem, error) {
 	if len(items) == 0 {
 		return nil, nil
@@ -240,15 +256,23 @@ func (r *llmRanker) Rank(
 		if v.Score < r.cfg.MinScore {
 			continue
 		}
+		// v1.0.1 Phase 4.1: 计算 priority-weighted score
+		item := byID[id]
+		weight := priorityWeight(sourcePriorities, item.SourceID)
 		ranked = append(ranked, &RankedItem{
-			Item:   byID[id],
-			Score:  v.Score,
-			Reason: strings.TrimSpace(v.Reason),
+			Item:          item,
+			Score:         v.Score,
+			WeightedScore: v.Score * weight,
+			Reason:        strings.TrimSpace(v.Reason),
 		})
 	}
 
-	// Sort by score desc, tie-break by RawItem ID asc for determinism.
+	// Sort by WeightedScore desc (v1.0.1 Phase 4.1), tie-break by raw Score
+	// then by RawItem ID for determinism.
 	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].WeightedScore != ranked[j].WeightedScore {
+			return ranked[i].WeightedScore > ranked[j].WeightedScore
+		}
 		if ranked[i].Score != ranked[j].Score {
 			return ranked[i].Score > ranked[j].Score
 		}
@@ -267,6 +291,37 @@ func (r *llmRanker) Rank(
 		ranked = ranked[:r.cfg.TopN]
 	}
 	return ranked, nil
+}
+
+// priorityWeight maps (sourceID → priority 0-10) to a multiplier on the
+// raw LLM score. v1.0.1 Phase 4.1.
+//
+// Formula: weight = 0.5 + priority/10.0
+//
+//	priority = 10 → weight 1.5 (权威源, 如 DeepMind / Google AI)
+//	priority =  5 → weight 1.0 (中性基线)
+//	priority =  0 → weight 0.5 (未设, 降权)
+//
+// Nil map or missing sourceID: treated as priority=5 (neutral) — backward
+// compat when sourcePriorities was not yet plumbed through. An explicitly
+// populated map whose sourceID entry is 0 / missing drops to 0.5 (signals
+// config drift: source row without priority field).
+func priorityWeight(sourcePriorities map[int64]int, sourceID int64) float64 {
+	if sourcePriorities == nil {
+		return 1.0 // backward compat: no priority info, neutral weight
+	}
+	p, ok := sourcePriorities[sourceID]
+	if !ok {
+		// Map populated but source absent: treat as unknown → neutral.
+		return 1.0
+	}
+	if p < 0 {
+		p = 0
+	}
+	if p > 10 {
+		p = 10
+	}
+	return 0.5 + float64(p)/10.0
 }
 
 // applyPerCategoryQuota walks a score-sorted ranked slice, groups items

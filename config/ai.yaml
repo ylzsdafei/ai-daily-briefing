@@ -48,9 +48,12 @@ llm:
 # then caps each source category at the quota below before passing
 # the top N to classify.
 rank:
+  # v1.0.1 Phase 4.1: 提高 news/blog 配额给 priority weighting 腾位置.
+  # news 从 8→12 (16+ news 源争 8 位挤不下), blog 从 6→10 (加了 4 个 substack).
+  # paper/project/community 保持不变 (arxiv 不能再挤 res).
   per_category_quota:
-    news: 8
-    blog: 6
+    news: 12
+    blog: 10
     paper: 8
     project: 6
     community: 6

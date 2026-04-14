@@ -226,6 +226,9 @@ func (s *sqliteStore) ListEnabledSources(ctx context.Context, domainID string) (
 		// leaves Category empty, which downstream rule-based classify will
 		// treat as "unknown → fall through to LLM".
 		src.Category = extractSourceCategory(src.ConfigJSON)
+		// v1.0.1 Phase 4.1: also surface Priority for rank weighting.
+		// 0 = not set (rank treats as neutral, weight 1.0).
+		src.Priority = extractSourcePriority(src.ConfigJSON)
 		out = append(out, &src)
 	}
 	if err := rows.Err(); err != nil {
@@ -256,6 +259,33 @@ func extractSourceCategory(configJSON string) string {
 		return ""
 	}
 	return strings.TrimSpace(cat)
+}
+
+// extractSourcePriority pulls the "priority" int out of config_json.
+// Returns 0 on any parse error / missing field (rank treats 0 as neutral).
+// v1.0.1 Phase 4.1.
+func extractSourcePriority(configJSON string) int {
+	if strings.TrimSpace(configJSON) == "" {
+		return 0
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(configJSON), &m); err != nil {
+		return 0
+	}
+	v, ok := m["priority"]
+	if !ok {
+		return 0
+	}
+	// JSON numbers come back as float64 even when YAML input was int.
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	}
+	return 0
 }
 
 // -------- RawItem --------

@@ -200,11 +200,13 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		return fmt.Errorf("list sources for category map: %w", err)
 	}
 	sourceCategories := make(map[int64]string, len(sourceRows))
+	sourcePriorities := make(map[int64]int, len(sourceRows)) // v1.0.1 Phase 4.1
 	for _, sr := range sourceRows {
 		if sr == nil {
 			continue
 		}
 		sourceCategories[sr.ID] = sr.Category
+		sourcePriorities[sr.ID] = sr.Priority
 	}
 
 	// --- 5. Rank (LLM quality scoring) ----------------------------------
@@ -219,7 +221,7 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	if err != nil {
 		return fmt.Errorf("rank new: %w", err)
 	}
-	ranked, err := ranker.Rank(ctx, filtered, sourceCategories)
+	ranked, err := ranker.Rank(ctx, filtered, sourceCategories, sourcePriorities)
 	if err != nil {
 		return fmt.Errorf("rank: %w", err)
 	}
@@ -317,7 +319,7 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		if len(filtered2) > len(filtered) {
 			stage(fmt.Sprintf("extended filter: %d items in %dh (vs %d in %dh)",
 				len(filtered2), cfg.Window.ExtendedHours, len(filtered), cfg.Window.LookbackHours))
-			if ranked2, rerr := ranker.Rank(ctx, filtered2, sourceCategories); rerr != nil {
+			if ranked2, rerr := ranker.Rank(ctx, filtered2, sourceCategories, sourcePriorities); rerr != nil {
 				stage(fmt.Sprintf("extended rank: failed (%v) — keeping original classify result", rerr))
 			} else {
 				rankedRaws2 := make([]*store.RawItem, 0, len(ranked2))
@@ -1146,16 +1148,20 @@ func filterByWindow(items []*store.RawItem, cutoff time.Time) []*store.RawItem {
 		if it == nil {
 			continue
 		}
-		// Try to recover a more reliable date from the adapter's title
-		// and content. If found, override whatever PublishedAt says —
-		// this is the single line that saves 04-11 from shipping Feb
-		// press releases.
-		if dt, ok := extractDateFromText(it.Title); ok {
-			it.PublishedAt = dt
-			fallbackHits++
-		} else if dt, ok := extractDateFromText(it.Content); ok {
-			it.PublishedAt = dt
-			fallbackHits++
+		// v1.0.1 Phase 4.1 BUG FIX (2026-04-14):
+		// 只在 PublishedAt 为空(adapter 没给日期)时才用 title-date fallback.
+		// 之前无条件 override 导致 smol.ai 的 2024 年 newsletter 正文里提到
+		// "April 14, 2026" 被 extractDateFromText 抓取, 老文章伪装成今天,
+		// 混进 24h 窗口 (142 items "recovered" 里有大量陈年 smol.ai).
+		// 现在: adapter 给了日期就信, 只在 zero 时才 fallback.
+		if it.PublishedAt.IsZero() {
+			if dt, ok := extractDateFromText(it.Title); ok {
+				it.PublishedAt = dt
+				fallbackHits++
+			} else if dt, ok := extractDateFromText(it.Content); ok {
+				it.PublishedAt = dt
+				fallbackHits++
+			}
 		}
 
 		ts := it.PublishedAt
