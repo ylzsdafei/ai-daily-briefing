@@ -46,7 +46,7 @@
 2. **ROI 优先**: 先修 bug 再扩量
 3. **Fail-soft**: 单源失败不阻塞 (已实现)，但长期失败要告警
 4. **Signal quality > quantity**: 信号强的源 > 更多的源
-5. **本土化**: 中文源不足是下一阶段重点
+5. **本土化**: 中文源不足是已知缺口, 但服务器在境外无法直连国内 CDN, 推到 Phase 5.3 自建 RSShub 时一起做
 
 ---
 
@@ -220,77 +220,19 @@ Anthropic News                   ✓   2026-04-14 05:58   13     0
 
 ---
 
-## Phase 2 — 中文技术媒体扩充 (1 天)
+## Phase 2 — 中文技术媒体扩充 (已废弃 / SKIPPED, 2026-04-14)
 
-### 2.1 加 5 个中文源
+**决议**: 跳过, 不实施。
 
-#### 优化事项
-当前中文源仅 2 博客（宝玉/阮一峰）+ 2 搜索（Google News），覆盖不足。用户目标"全公司包括非技术岗" 要求中文覆盖更全。
+**原因 (实测 2026-04-14)**:
+- 服务器位置在境外 (LLM endpoint 64.186.239.99 同地)
+- 国内 AI 媒体 (qbitai / jiqizhixin / 36kr / infoq.cn / paperweekly) 全部依托国内 CDN (腾讯云 / 阿里云 / 36kr 自建), 海外 IP 一律 connection timeout
+- 公开 RSShub 实例 (rsshub.app) 已全部 HTTP 403, 不能作为代理
+- 唯一可行路径需自建 RSShub on 国内 VPS, 工程量超出 Phase 2 预算
 
-#### 技术方案
-
-**加入 5 个新 source**（全走现有 `type: rss` 泛型 adapter，无需改代码）：
-
-| # | Source | 配置 |
-|---|---|---|
-| 1 | **量子位** | `id: qbitai, type: rss, category: news, url: https://www.qbitai.com/feed, priority: 9` |
-| 2 | **机器之心** | `id: jiqizhixin, type: rss, category: news, url: https://www.jiqizhixin.com/rss, priority: 9` |
-| 3 | **36氪 AI 栏目** | `id: 36kr-ai, type: rss, category: news, url: <待验证>, priority: 8` |
-| 4 | **InfoQ AI 中文** | `id: infoq-ai-cn, type: rss, category: news, url: https://www.infoq.cn/feed/rss, priority: 7` |
-| 5 | **PaperWeekly** | `id: paperweekly, type: rss, category: blog, url: https://www.paperweekly.site/feed, priority: 7` |
-
-**具体配置格式** (参考现有 config/ai.yaml):
-```yaml
-- id: qbitai
-  type: rss
-  category: news
-  name: "量子位"
-  url: "https://www.qbitai.com/feed"
-  enabled: true
-  priority: 9
-```
-
-#### 技术验证
-
-**Step 1 — URL 存活性**:
-```bash
-for url in "https://www.qbitai.com/feed" "https://www.jiqizhixin.com/rss" "https://www.infoq.cn/feed/rss" "https://www.paperweekly.site/feed"; do
-    echo "=== $url ==="
-    curl -sS -o /dev/null -w "HTTP=%{http_code} TIME=%{time_total}s\n" -m 10 "$url"
-done
-```
-**通过标准**: HTTP 200，content-type 含 xml / rss
-
-**Step 2 — RSS 格式验证**:
-```bash
-curl -sS https://www.qbitai.com/feed | xmllint --format - | head -30
-```
-确认 `<item>` 数量 > 5 且 `<pubDate>` 字段存在
-
-**Step 3 — 集成测**:
-```bash
-# 改 config/ai.yaml 加新源
-# 执行 seed + run --dry-run
-cd /root/briefing-v3
-./bin/briefing seed
-./bin/briefing run --dry-run 2>&1 | grep -E "量子位|机器之心|36kr|InfoQ|PaperWeekly"
-```
-**通过标准**: 每个新源 `[ingest] {name} → X items` 的 X > 5
-
-**Step 4 — 内容质量抽样**:
-手工看 5 条从新源来的 item 内容，确认不是广告/noise
-
-#### 影响范围
-| 维度 | 影响 |
-|---|---|
-| **代码文件** | **零改动** (走泛型 RSS adapter) |
-| **配置文件** | `config/ai.yaml` sources 节追加 5 个条目 |
-| **数据库** | `briefing seed` 后 sources 表多 5 行 |
-| **性能** | ingest 阶段增加 5 个并发 HTTP 请求（<2s 总延迟），+5-15MB 内存 |
-| **下游影响** | rank 阶段 LLM 数据量 +300-500 items/天，rank 耗时 +2-3min（可通过 Phase 1.1 修 OpenAI News 补偿） |
-| **rank 权重** | 新源 priority 7-9 偏高，会挤压 arxiv/openai 等的相对权重（符合预期，本来就要让中文读者友好内容更突出） |
-| **风险** | 国内站点可能有反爬，HTTP 429/403；服务器在境外，理论上没问题但需实测；若某源失败，fail-soft 不影响整体 |
-| **回滚** | 从 config/ai.yaml 删对应条目 + `briefing seed` 或直接 `UPDATE sources SET enabled=false WHERE id IN (...)` |
+**重新归位**:
+- 国内媒体覆盖**整体推到 Phase 5.3** (国内公众号爬取), 等有国内 VPS / 自建 RSShub 时一起做
+- 中文用户友好度由现有 Google News 中文 query (Phase 1.2 已扩 4 个 fallback 词) + 宝玉 + 阮一峰 维持
 
 ---
 
@@ -313,8 +255,11 @@ cd /root/briefing-v3
 | 4 | Mistral blog | `https://mistral.ai/news/rss` | news | 9 |
 | 5 | NVIDIA AI blog | `https://blogs.nvidia.com/blog/category/deep-learning/feed/` | news | 8 |
 
-#### 技术验证
-同 Phase 2.1 的 4 步骤（URL 存活、RSS 格式、集成测、内容抽样）
+#### 技术验证 (4 步骤通用模板)
+1. **URL 存活性**: `curl -sLS --max-time 10 -o /dev/null -w "HTTP=%{http_code}" $url`, 期望 HTTP 200
+2. **RSS 格式**: `curl -sL $url | xmllint --format - | head -30`, 确认 `<item>` 或 `<entry>` > 5
+3. **集成测**: 改 `config/ai.yaml` 加新源 → `briefing seed` → `briefing run --dry-run` → 确认 `[ingest] {name} → X items` 的 X > 5
+4. **内容质量抽样**: 手工 review 5 条新源 item, 排除广告/noise
 
 特别注意：
 - Microsoft Research blog 可能混杂非 AI 内容，需要 classify LLM 兜底过滤
@@ -353,7 +298,7 @@ cd /root/briefing-v3
 - **推荐方案 B** 作为起点，Phase 4 再优化
 
 #### 技术验证
-同 Phase 2.1 的 4 步骤
+同 Phase 3.1 的 4 步骤模板（URL 存活 / RSS 格式 / 集成测 / 内容抽样）
 
 内容抽样特别关注：
 - Platformer 每日 1-3 篇深度 → 保留率高
@@ -627,15 +572,14 @@ if item.Points < s.cfg.MinPoints { continue }
 
 ```
 Phase 1 (bug 修)          — ROI 最高,立刻
-Phase 2 (中文扩)          — 对"非技术读者"目标收益大
 Phase 3.1 (厂商官博)      — 零代码
 Phase 4.1 (priority 权重) — 小改大收益
 Phase 3.2 (商业/融资)     — 覆盖空白
 Phase 4.2 (多源交叉)      — signal 强度
-Phase 4.3 (语义去重)      — 锦上添花
+Phase 4.3 (语义去重)      — 锦上添花 (需 LLM key)
 Phase 4.4 (Reddit/HN)    — social 质量
 Phase 3.3 (政策)          — 立体化
-Phase 5 (长期)            — 按 ROI
+Phase 5 (长期)            — 按 ROI (含国内媒体, 原 Phase 2 推到这里)
 ```
 
 ### 6.2 每 phase DoD
@@ -656,16 +600,16 @@ Phase 5 (长期)            — 按 ROI
 | 1.1 OpenAI News fix | 诊断 RSS + 1 处代码改 + 单测 | 1-2 小时 |
 | 1.2 Google News fallback | queries 数组 + adapter 改 | 1 小时 |
 | 1.3 source_health 表 | migration + 2 方法 + status 子命令 | 3-4 小时 |
-| 2.x 5 个中文源 | 纯 YAML 配置 + 每源 URL 验证 | 2 小时 (平均 25 分钟/源) |
-| 3.1 5 个厂商官博 | 同 2.x | 2 小时 |
-| 3.2 4 个商业源 | 同 2.x | 1.5 小时 |
+| ~~2.x 5 个中文源~~ | **跳过 (服务器无法直连国内 CDN), 推到 Phase 5.3** | — |
+| 3.1 5 个厂商官博 | YAML 配置 + 每源 URL 验证 | 2 小时 (平均 25 分钟/源) |
+| 3.2 4 个商业源 | 同 3.1 | 1.5 小时 |
 | 3.3 政策源调研 + 接入 | 调研 URL + 1-2 源 + classify 规则 | 3-4 小时 |
 | 4.1 priority 权重 | rank.go 小改 + 单测 | 2-3 小时 |
 | 4.2 signal_strength | fuzzy match + 集成 + 单测 | 4-5 小时 |
 | 4.3 语义去重 | prompt + LLM 调用 + 集成 | 2-3 小时 |
 | 4.4 reddit/hn 分层 | config + adapter + classify 规则 | 2 小时 |
-| **Phase 1-4 合计** | — | **~24-30 小时** = **3-4 整天** |
-| 5 (长期 4 项) | — | 不在 Phase 1-4 预算内 |
+| **Phase 1+3+4 合计** | — | **~22-28 小时** = **3 整天** |
+| 5 (长期 4 项, 含原 Phase 2) | — | 不在 Phase 1-4 预算内 |
 
 ### 按"Claude 执行"的真实估算
 
@@ -679,7 +623,7 @@ Phase 5 (长期)            — 按 ROI
 | 1.1 OpenAI News fix | 30 min | 1 小时 (含 1 轮验证) |
 | 1.2 Google News fallback | 15 min | 15 min (单测为主) |
 | 1.3 source_health 表 | 45 min | 1 小时 |
-| 2.x 5 中文源 | 15 min | 30 分钟 (含 URL 验证) |
+| ~~2.x 5 中文源~~ | **跳过 (服务器条件不支持)** | — |
 | 3.1 5 厂商官博 | 15 min | 30 分钟 |
 | 3.2 4 商业源 | 15 min | 30 分钟 |
 | 3.3 2 政策源调研+接入 | 45 min | 1 小时 |
@@ -687,8 +631,8 @@ Phase 5 (长期)            — 按 ROI
 | 4.2 signal_strength | 45 min | 1 小时 |
 | 4.3 语义去重 | 40 min | 1 小时 |
 | 4.4 reddit/hn 分层 | 20 min | 30 分钟 |
-| **Phase 1-4 编码合计** | **~5 小时** | — |
-| **含验证合计** | — | **7-8 小时 = 一晚 session** |
+| **Phase 1+3+4 编码合计** | **~5 小时** | — |
+| **含验证合计** | — | **6-7 小时 = 一晚 session** |
 
 ### 三档执行计划 (按用户可用时长切)
 
@@ -707,7 +651,7 @@ Phase 5 (长期)            — 按 ROI
 
 删除前 check:
 - [ ] Phase 1.1-1.3 全 done
-- [ ] Phase 2 5 个中文源集成
+- [x] ~~Phase 2 5 个中文源集成~~ (跳过, 推到 Phase 5.3)
 - [ ] Phase 3.1-3.3 所有源集成
 - [ ] Phase 4.1-4.4 所有 signal quality 改动 merged
 - [ ] 每一项在 git log 可找到对应 commit
