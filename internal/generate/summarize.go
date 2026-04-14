@@ -43,7 +43,12 @@ const summarizeSystemPrompt = `你是一名专业的 AI 日报编辑。你的任
    - 每条至少 1 个超链接引用，最多 3 个
 3. 关键词用 **粗体** 强调
 4. 语言风格: 通俗易懂、流畅自然、生动不失深度，有适度口语化 (๑•̀ㅂ•́)و 但不低俗
-5. 非大众熟知的专业名词必须加括号注释 (非技术用户友好)
+5. 非大众熟知的专业名词必须加括号注释（非技术用户友好）
+   读者是公司里不懂技术的同事 —— HR、运营、业务、CEO 等，请默认他们只会用 ChatGPT 但不会写代码。
+   大众熟知不用注释：OpenAI、ChatGPT、Google、Meta、Anthropic、Claude、DeepSeek、Gemini、英伟达、GitHub、arxiv 等大公司大产品；Agent、AI、大模型、开源、API、prompt 等大众化概念。
+   必须注释示例：Skyscanner（全球机票比价平台）、HuggingFace（全球最大 AI 模型共享社区）、Sentry（帮程序员自动发现 bug 的工具）、PyTorch（最流行的 AI 开发框架）、Safetensors（一种更安全的 AI 模型文件打包方式）、GaN（一种比硅更省电的新型芯片材料）、Notion（团队协作办公工具）、RAG（检索增强生成，让 AI 回答前先查资料）、embedding（把文字变成向量便于 AI 比较相似度）、MoE（混合专家模型，多个小模型分工协作）、MCP（Anthropic 提出的模型上下文协议）、fine-tuning（用特定数据微调模型）。
+   需要注释的类别：编程框架、开发者工具、学术项目、底层技术概念、模型训练术语等纯技术名词。
+   判断标准：如果你的 HR 同事可能不认识这个词，就必须加注释。宁可多注释也不要漏。
 6. 严格来源于原材料，不捏造、不添加原文未提及的事实
 7. 输出必须是简体中文 Markdown
 8. 直接输出 markdown，不加任何前置说明或标题
@@ -88,18 +93,23 @@ func (g *openaiGenerator) Summarize(ctx context.Context, sectionTitle string, it
 		formatItemsForSummarize(items),
 	)
 
-	// Retry with exponential backoff. Summarize calls can hit transient
-	// upstream 502s on long prompts; simple linear retry without backoff
-	// often re-hits the same flaky worker. We use 5 attempts with
-	// 1s / 2s / 4s / 8s sleeps in between.
-	const maxAttempts = 5
+	// v1.0.1 Bug J 修复: retry 节奏由 cfg.RetryBackoffSeconds 驱动.
+	// 旧策略 1/2/4/8s 共 15s 对 LLM 上游分钟级抖动完全无效 (2026-04-14
+	// 故障实证: 5 次全挂). 默认序列 [10,30,90,180,300] 总 ~10 分钟,
+	// 给单 section 足够恢复窗口; 可通过 ai.yaml llm.retry_backoff_seconds
+	// 运维调. Length 决定有效 MaxAttempts.
+	backoffs := g.cfg.RetryBackoffSeconds
+	if len(backoffs) == 0 {
+		backoffs = []int{10, 30, 90, 180, 300}
+	}
+	maxAttempts := len(backoffs)
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		raw, err := g.chatComplete(ctx, summarizeSystemPrompt, userPrompt, g.cfg.MaxTokens*2)
 		if err != nil {
 			lastErr = err
 			if attempt < maxAttempts {
-				backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+				backoff := time.Duration(backoffs[attempt-1]) * time.Second
 				select {
 				case <-ctx.Done():
 					return "", ctx.Err()

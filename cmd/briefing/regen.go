@@ -67,12 +67,15 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	}
 	stage(fmt.Sprintf("loaded issue id=%d status=%s items=%d", issue.ID, issue.Status, issue.ItemCount))
 
-	issueItems, err := s.ListIssueItems(ctx, issue.ID)
+	// v1.0.1 Batch 2.12: regen 只取 validated 的 items, 避免把未验证
+	// (pending/failed) 的半成品 section 重新渲染出来 (应该交给 briefing
+	// repair 单独补救那些缺的 section).
+	issueItems, err := s.ListIssueItemsByStatus(ctx, issue.ID, "validated")
 	if err != nil {
 		return fmt.Errorf("list issue items: %w", err)
 	}
 	if len(issueItems) == 0 {
-		return errors.New("existing issue has zero items — nothing to regen")
+		return errors.New("existing issue has zero validated items — run `briefing repair` or `briefing run` first")
 	}
 	stage(fmt.Sprintf("loaded %d issue items", len(issueItems)))
 
@@ -147,8 +150,10 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 		found := enrichItemsWithMedia(ctx, issueItems)
 		stage(fmt.Sprintf("media-only: %d items got a hero image/video from og:image", found))
 
-		// Persist mutated BodyMD back to SQLite.
-		if err := s.ReplaceIssueItems(ctx, issue.ID, issueItems); err != nil {
+		// Persist mutated BodyMD back to SQLite. v1.0.1: use
+		// per-section upsert so a re-run touching only a subset of
+		// sections does not wipe items from sections it skipped.
+		if err := s.ReplaceIssueItemsBySections(ctx, issue.ID, issueItems); err != nil {
 			fmt.Printf("[WARN] replace issue items after media-only: %v\n", err)
 		}
 	} else {
@@ -246,8 +251,8 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	}
 	stage(fmt.Sprintf("infocard: rendered %d/%d item PNGs", renderedCount, len(cards)))
 
-	// Persist mutated BodyMD back to SQLite.
-	if err := s.ReplaceIssueItems(ctx, issue.ID, issueItems); err != nil {
+	// Persist mutated BodyMD back to SQLite. v1.0.1: per-section upsert.
+	if err := s.ReplaceIssueItemsBySections(ctx, issue.ID, issueItems); err != nil {
 		fmt.Printf("[WARN] replace issue items: %v\n", err)
 	}
 	} // end of: if gf.mediaOnly { ... } else { ... }
@@ -408,7 +413,15 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	}
 	stage("publish: slack test OK")
 
-	if (gf.target == "auto" || gf.target == "prod") && report.Pass {
+	// v1.0.1 Batch 2.6 parity: regen 也要遵守 BRIEFING_MODE=debug 不推 prod 规则
+	// (2026-04-14 修复: 之前 regen 漏了这个保护, 有误推风险)
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("BRIEFING_MODE")))
+	wantsProdTarget := gf.target == "auto" || gf.target == "prod"
+	targetWantsProd := wantsProdTarget && mode == "prod" && report.Pass
+	if wantsProdTarget && mode != "prod" {
+		stage("publish: BRIEFING_MODE=" + mode + ", skipping prod channel (仅 prod 模式推正式频道)")
+	}
+	if targetWantsProd {
 		stage("publish: posting to Slack prod channel")
 		prodDelivery := postSlackPayload(ctx, store.ChannelSlackProd, cfg.Slack.ProdWebhook, slackPayload, issue.ID)
 		if err := s.InsertDelivery(ctx, prodDelivery); err != nil {
@@ -418,8 +431,10 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 			return fmt.Errorf("slack prod publish failed: %s", prodDelivery.ResponseJSON)
 		}
 		stage("publish: slack prod OK")
+	} else if wantsProdTarget && !report.Pass {
+		stage("publish: gate failed, skipping prod")
 	} else {
-		stage("publish: target=test or gate failed, skipping prod")
+		stage("publish: target=test, skipping prod")
 	}
 
 	stage("regen complete")

@@ -74,6 +74,13 @@ type IssueItem struct {
 	SourceURLsJSON  string // JSON array of upstream URLs
 	RawItemIDsJSON  string // JSON array of contributing raw_items.id
 	CreatedAt       time.Time
+	// v1.0.1 per-section state tracking. Default 'validated' for rows
+	// inserted by the pipeline on success. Stub rows start as 'pending',
+	// failed sections become 'failed' without content, and regen of a
+	// previously-validated item bumps RetryCount.
+	Status        string
+	ValidatedAt   *time.Time
+	RetryCount    int
 }
 
 // IssueInsight captures the cross-item "industry insight" and "our takeaways"
@@ -87,6 +94,13 @@ type IssueInsight struct {
 	Temperature float64
 	RetryCount  int     // how many repair attempts were needed
 	GeneratedAt time.Time
+	// v1.0.1 per-stage state tracking. Status tracks the insight LLM
+	// call itself; InfocardStatus tracks the visual card render stage,
+	// which can degrade independently (e.g. insight text is validated
+	// but card PNGs failed to render).
+	Status          string
+	ValidatedAt     *time.Time
+	InfocardStatus  string
 }
 
 // WeeklyIssue represents a weekly summary report aggregating daily Issues.
@@ -153,3 +167,103 @@ const (
 	ChannelFeishuDoc = "feishu_doc"
 	ChannelFeishuBot = "feishu_bot"
 )
+
+// Per-section / per-stage status constants (v1.0.1 critical fix).
+//
+// The progression is: pending -> running -> {validated, degraded, failed}.
+//   pending   — row exists but no attempt yet (stub from InsertStubIssueItems)
+//   running   — worker holds it; if crashed, RecoverStaleRunningStages flips
+//               it to 'failed'
+//   validated — content is real, non-empty, passed every validator
+//   degraded  — content exists but a secondary validator warned (e.g.
+//               missing mermaid diagram); currently only used for images
+//   failed    — attempt completed but content is missing/invalid; DO NOT
+//               render to prod
+const (
+	SectionStatusPending   = "pending"
+	SectionStatusRunning   = "running"
+	SectionStatusValidated = "validated"
+	SectionStatusDegraded  = "degraded"
+	SectionStatusFailed    = "failed"
+)
+
+// Pipeline stage status constants (issue_stages.status).
+const (
+	StageStatusRunning   = "running"
+	StageStatusSucceeded = "succeeded"
+	StageStatusFailed    = "failed"
+	StageStatusSkipped   = "skipped"
+)
+
+// Canonical pipeline stage names used in issue_stages.stage. Kept here
+// so run.go, status.go, and repair.go agree on spelling.
+const (
+	StageIngest   = "ingest"
+	StageFilter   = "filter"
+	StageRank     = "rank"
+	StageClassify = "classify"
+	StageCompose  = "compose"
+	StageMedia    = "media"
+	StageInsight  = "insight"
+	StageSummary  = "summary"
+	StageInfocard = "infocard"
+	StageRender   = "render"
+	StageGate     = "gate"
+	StagePublish  = "publish"
+)
+
+// Delivery sub-status values (used by deliveries.sub_status UNIQUE
+// constraint to distinguish test vs prod vs alert publish on the same
+// channel).
+const (
+	DeliverySubStatusTest  = "test_pub"
+	DeliverySubStatusProd  = "prod_pub"
+	DeliverySubStatusAlert = "alert_pub"
+)
+
+// ClassifiedItem is the persisted output of the classify stage. One
+// row per (issue, section, raw_item). Introduced in v1.0.1 so
+// `briefing repair --section X` can re-run compose for a single
+// section without paying the LLM cost of a full classify round.
+type ClassifiedItem struct {
+	ID         int64
+	IssueID    int64
+	Section    string // one of SectionProductUpdate .. SectionSocial
+	RawItemID  int64
+	RankScore  float64 // 0..1 from the rank stage; pass-through
+	Seq        int     // order within section as produced by classify
+	CreatedAt  time.Time
+}
+
+// IssueStage records one execution of one pipeline stage for one
+// issue. A re-run of the same stage appends a new row with an
+// incremented Version, so history is preserved.
+type IssueStage struct {
+	ID              int64
+	IssueID         int64
+	Stage           string // one of StageIngest..StagePublish
+	Status          string // one of StageStatus*
+	InputHash       string // sha256 over normalized input JSON (may be empty)
+	Version         int    // 1-based; monotonic per (issue, stage)
+	ParentVersions  string // JSON array of parent stage versions this call depended on
+	StartedAt       time.Time
+	CompletedAt     *time.Time
+	ErrorText       string
+}
+
+// LLMCall is one row in the llm_calls audit log. Written once per LLM
+// request (success or failure) so postmortems can reconstruct exactly
+// what models were hit when and with what latency.
+type LLMCall struct {
+	ID              int64
+	IssueID         *int64 // nullable: some early-stage calls have no issue yet
+	Stage           string // one of StageCompose/StageInsight/StageSummary/...
+	Model           string
+	PromptHash      string // sha256 of the prompt body (for reproducibility)
+	RequestTokens   int
+	ResponseTokens  int
+	LatencyMS       int
+	HTTPStatus      int    // 200 on success, actual upstream code on failure
+	ErrorText       string // empty on success
+	CalledAt        time.Time
+}

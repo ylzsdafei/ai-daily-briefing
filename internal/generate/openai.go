@@ -78,6 +78,10 @@ type Config struct {
 	MaxTokens   int
 	Timeout     time.Duration
 	MaxRetries  int
+	// v1.0.1: retry backoff sequence in seconds (e.g. [10,30,90,180,300]).
+	// Length determines the effective max attempts; if empty, defaults to
+	// [10,30,90,180,300]. Read from ai.yaml llm.retry_backoff_seconds.
+	RetryBackoffSeconds []int
 }
 
 func (c *Config) fillDefaults() {
@@ -92,6 +96,10 @@ func (c *Config) fillDefaults() {
 	}
 	if c.MaxRetries == 0 {
 		c.MaxRetries = 5
+	}
+	if len(c.RetryBackoffSeconds) == 0 {
+		// Safe default: minute-scale backoff for upstream 502 tolerance.
+		c.RetryBackoffSeconds = []int{10, 30, 90, 180, 300}
 	}
 }
 
@@ -177,7 +185,23 @@ func (g *openaiGenerator) GenerateInsight(ctx context.Context, in *Input) (*stor
 		lastHTTPErr error
 	)
 
-	for attempt := 1; attempt <= g.cfg.MaxRetries; attempt++ {
+	// v1.0.1 Bug J 修复: insight 生成同样对 LLM 502 敏感 (compose 失败
+	// 补不上 section 会连带 insight 缺上下文). 加入分钟级退避, 和
+	// summarize 共享 cfg.RetryBackoffSeconds 序列 (ai.yaml 默认
+	// [10,30,90,180,300]). Length 是有效 MaxAttempts 上限.
+	backoffs := g.cfg.RetryBackoffSeconds
+	if len(backoffs) == 0 {
+		backoffs = []int{10, 30, 90, 180, 300}
+	}
+	maxAttempts := g.cfg.MaxRetries
+	if maxAttempts > len(backoffs) {
+		maxAttempts = len(backoffs) // 不超过 backoff 序列长度
+	}
+	if maxAttempts == 0 {
+		maxAttempts = len(backoffs)
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		attempts = attempt
 
 		system, user, maxTokens := g.promptForAttempt(
@@ -187,8 +211,16 @@ func (g *openaiGenerator) GenerateInsight(ctx context.Context, in *Input) (*stor
 		raw, err := g.chatComplete(ctx, system, user, maxTokens)
 		if err != nil {
 			// Network / API transport error. Retry with same stage prompt.
-			// Do not advance lastReasons (there was no validation).
+			// v1.0.1: sleep before next attempt to weather upstream抖动.
 			lastHTTPErr = err
+			if attempt < maxAttempts {
+				backoff := time.Duration(backoffs[attempt-1]) * time.Second
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(backoff):
+				}
+			}
 			continue
 		}
 		lastHTTPErr = nil
@@ -201,7 +233,8 @@ func (g *openaiGenerator) GenerateInsight(ctx context.Context, in *Input) (*stor
 		}
 
 		// Validation failed. Remember reasons and raw for the next attempt's
-		// repair/final prompt to reference.
+		// repair/final prompt to reference. 验证失败不走 backoff (LLM 能
+		// 回复但质量不好, 下一次 prompt 会升级到 repair/final strict).
 		lastReasons = vr.Reasons
 		lastRaw = raw
 	}

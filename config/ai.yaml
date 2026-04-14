@@ -37,6 +37,10 @@ llm:
   max_tokens: 2000
   timeout_seconds: 120
   max_retries: 5
+  # v1.0.1 Bug J 修复: LLM 502 分钟级退避序列 (秒)。
+  # 旧策略 1/2/4/8s 共 15s 对上游分钟级抖动无效 (2026-04-14 故障证据)。
+  # 数组长度决定最大重试次数, 每个元素是该次重试前等待的秒数。
+  retry_backoff_seconds: [10, 30, 90, 180, 300]
 
 # Rank-stage knobs. v1.0.0 introduces per-category quotas so a
 # single explosive source (e.g. arxiv with 300 papers/day) cannot

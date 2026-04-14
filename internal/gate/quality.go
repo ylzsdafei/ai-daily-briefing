@@ -181,8 +181,12 @@ func (g *Gate) Check(
 	if r.SectionCount == 0 {
 		r.Reasons = append(r.Reasons, "无有效 section 内容")
 	}
-	if totalSections > 0 && len(failedSections) >= totalSections {
-		r.Reasons = append(r.Reasons, "所有 section 撰稿均失败")
+	// v1.0.1 Bug B 修复: 任一 section 撰稿失败即 hard fail.
+	// 用户规则 "文字必齐 / 零降级": 5 个 section 任一缺失都不允许推 prod,
+	// 必须通过 orchestrator 重试 + briefing repair 补齐才能发出.
+	// (旧 v1.0.0 逻辑仅在"所有 section 都挂了"才 hard fail, 这是设计错误.)
+	if len(failedSections) > 0 {
+		r.Reasons = append(r.Reasons, "section 撰稿失败: "+strings.Join(failedSections, ","))
 	}
 
 	// Insight numeric checks: these are fatal if insight is present
@@ -239,10 +243,7 @@ func (g *Gate) Check(
 		if r.SourceDomainCount < g.cfg.MinSourceDomains {
 			r.Warnings = append(r.Warnings, "源多样性不足")
 		}
-		// v1.0.0+: failedSections 不单独触发 warn. 如果 sections >= min,
-		// 部分 section LLM 502 降级是 fail-soft 正常行为, 不应阻塞 prod.
-		// compose 阶段已经打印了 degraded section 日志, 这里不重复.
-		_ = failedSections
+		// v1.0.1: failedSections 已在上方 hard-fail 段处理, 此处不再涉及.
 	}
 
 	// ----- Finalize -----

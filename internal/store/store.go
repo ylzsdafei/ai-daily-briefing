@@ -44,10 +44,65 @@ type Store interface {
 	ListIssueItems(ctx context.Context, issueID int64) ([]*IssueItem, error)
 	ListIssueItemsByIssueIDs(ctx context.Context, ids []int64) (map[int64][]*IssueItem, error)
 
+	// IssueItem — per-section state tracking (v1.0.1 critical fix).
+	//
+	// UpsertIssueItemBySection deletes every existing item for the given
+	// (issue, section) tuple, then inserts the provided items. Unlike
+	// ReplaceIssueItems, other sections' items are untouched — this is
+	// the building block for `briefing repair --section X`.
+	UpsertIssueItemBySection(ctx context.Context, issueID int64, section string, items []*IssueItem) error
+	// ReplaceIssueItemsBySections is the multi-section wrapper: it
+	// groups items by Section and invokes UpsertIssueItemBySection for
+	// each distinct section. Sections NOT present in `items` are left
+	// alone. Replaces the old ReplaceIssueItems at call sites that need
+	// "write back the result of compose/infocard per-section" semantics.
+	ReplaceIssueItemsBySections(ctx context.Context, issueID int64, items []*IssueItem) error
+	// InsertStubIssueItems inserts placeholder rows (status='pending')
+	// for every section we plan to fill in this run, so gate/repair can
+	// tell the difference between "not attempted" and "attempted & failed".
+	InsertStubIssueItems(ctx context.Context, issueID int64, sections []string) error
+	// ListIssueItemsByStatus returns items filtered by status; callers
+	// that render to Slack/markdown should always pass "validated" so
+	// half-written content never escapes.
+	ListIssueItemsByStatus(ctx context.Context, issueID int64, status string) ([]*IssueItem, error)
+	// UpdateIssueItemStatus patches one item's status (and bumps
+	// retry_count when a prior attempt failed). validatedAt is set to
+	// CURRENT_TIMESTAMP iff status == "validated".
+	UpdateIssueItemStatus(ctx context.Context, itemID int64, status string) error
+
 	// IssueInsight
 	UpsertIssueInsight(ctx context.Context, insight *IssueInsight) error
 	GetIssueInsight(ctx context.Context, issueID int64) (*IssueInsight, error)
 	ListIssueInsightsByIssueIDs(ctx context.Context, ids []int64) (map[int64]*IssueInsight, error)
+
+	// IssueInsight — per-stage state tracking.
+	//
+	// MarkInsightValidated flips status to 'validated' and sets
+	// validated_at = CURRENT_TIMESTAMP. infocardStatus is an independent
+	// dimension (rendered image set) and is updated in the same call.
+	MarkInsightValidated(ctx context.Context, issueID int64, infocardStatus string) error
+
+	// ClassifiedItem — persisted classify output for compose-only reruns.
+	InsertClassifiedItems(ctx context.Context, items []*ClassifiedItem) error
+	ListClassifiedItems(ctx context.Context, issueID int64) ([]*ClassifiedItem, error)
+
+	// Stage ledger — every pipeline stage writes a row here so
+	// `briefing status` can surface progress and `briefing repair` can
+	// determine what to re-run.
+	UpdateStageStatus(ctx context.Context, stage *IssueStage) error
+	// RecoverStaleRunningStages marks every stage that has been in
+	// 'running' state for longer than `threshold` as 'failed'. Called on
+	// orchestrator start-up so a crashed pipeline doesn't block re-runs.
+	RecoverStaleRunningStages(ctx context.Context, threshold time.Duration) (int64, error)
+
+	// LLM audit log.
+	InsertLLMCall(ctx context.Context, call *LLMCall) error
+
+	// SelfHealPublishStatus repairs an issue row whose `status` was
+	// reset from 'published' to 'generated' by a careless rerun, iff we
+	// have deliveries evidence that slack_prod already accepted the push.
+	// Returns the number of rows updated (0 or 1).
+	SelfHealPublishStatus(ctx context.Context, domainID string, date time.Time) (int64, error)
 
 	// WeeklyIssue
 	UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (int64, error)

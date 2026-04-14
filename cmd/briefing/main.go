@@ -9,12 +9,80 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"briefing-v3/internal/config"
 	"briefing-v3/internal/store"
 )
+
+// v1.0.1 exit code taxonomy (D1 决策 in docs/specs/2026-04-14-v1.0.1-critical-fix-plan.md).
+// orchestrator.sh 根据这些 code 决定重试 / 告警 / 放弃.
+const (
+	ExitSuccess     = 0 // pipeline complete + published
+	ExitUsage       = 2 // transient (CLI 用法错误 or LLM 5xx/timeout — orchestrator 重试)
+	ExitContentFail = 3 // gate hard fail, 文字产物缺失 (orchestrator 仍重试至 Attempt 4 走 repair)
+	ExitConfigFail  = 4 // BRIEFING_MODE 缺失 / secrets.env 缺 key / LLM endpoint 不可达
+	ExitInfraFail   = 5 // DB 锁 / 磁盘满 / panic
+	ExitNeedsHuman  = 6 // Attempt 4 + repair 仍缺 section, 告警已发, 等人工介入 (Batch 2.21)
+)
+
+// PipelineError 是 pipeline 层的类型化错误, main() 通过它映射 exit code.
+type PipelineError struct {
+	Code int
+	Err  error
+}
+
+func (e *PipelineError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("exit code %d", e.Code)
+	}
+	return e.Err.Error()
+}
+
+func (e *PipelineError) Unwrap() error { return e.Err }
+
+// 类型化 error 构造器, 让 pipeline 各层清晰分类失败原因.
+func transient(err error) error   { return &PipelineError{Code: ExitUsage, Err: err} }
+func contentFail(err error) error { return &PipelineError{Code: ExitContentFail, Err: err} }
+func configFail(err error) error  { return &PipelineError{Code: ExitConfigFail, Err: err} }
+func infraFail(err error) error   { return &PipelineError{Code: ExitInfraFail, Err: err} }
+func needsHuman(err error) error  { return &PipelineError{Code: ExitNeedsHuman, Err: err} }
+
+// mapExitCode 把任意 error 映射到对应的 exit code.
+// 非 PipelineError 的错误默认归为 infra, 防止意外 panic 被误判为 transient.
+func mapExitCode(err error) int {
+	if err == nil {
+		return ExitSuccess
+	}
+	var pe *PipelineError
+	if errors.As(err, &pe) {
+		return pe.Code
+	}
+	return ExitInfraFail
+}
+
+// briefingMode 读取 BRIEFING_MODE 环境变量, 未设置或非法值返回 ExitConfigFail.
+// v1.0.1 D2 决策: BRIEFING_MODE 必填, 防止"调试阶段误推正式频道"(2026-04-14
+// 故障场景). secrets.env 模板默认 debug, 需显式改 prod 才推正式频道.
+func briefingMode() (string, error) {
+	m := strings.ToLower(strings.TrimSpace(os.Getenv("BRIEFING_MODE")))
+	switch m {
+	case "debug", "prod":
+		return m, nil
+	case "":
+		return "", configFail(errors.New("BRIEFING_MODE env var is required (set 'debug' or 'prod' in config/secrets.env)"))
+	default:
+		return "", configFail(fmt.Errorf("BRIEFING_MODE=%q is invalid, must be 'debug' or 'prod'", m))
+	}
+}
+
+// 抑制 "imported and not used" 编译错误, 上述函数在 Batch 2 后续项目里会被调用.
+var _ = transient
+var _ = contentFail
+var _ = infraFail
+var _ = needsHuman
 
 const usage = `briefing-v3 — AI daily briefing generator
 
@@ -25,11 +93,15 @@ Commands:
     migrate     Initialize or migrate the SQLite schema
     seed        Load sources from config/ai.yaml into the database
     run         Fetch + classify + compose + render + publish (main pipeline)
+    repair      Re-run compose for specific sections (v1.0.1: orchestrator uses
+                this on Attempt 4 when some section stayed 'failed'; currently
+                aliases to full 'run' — real per-section fallback is P1 refinement)
     weekly      Generate weekly analysis report from this week's daily issues
     regen       Reuse existing SQLite data, rebuild infocard + HTML + push
     serve       Start static file server for docs/ (web viewer)
     promote     Manually promote an existing issue to Slack prod channel
-    status      Show the status of a specific issue
+    status      Show the status of a specific issue (v1.0.1: displays issue
+                metadata + per-section item status + recent deliveries)
     help        Show this help message
 
 Flags (available on most commands):
@@ -81,7 +153,7 @@ func parseGlobalFlags(args []string) (*globalFlags, []string) {
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		os.Exit(ExitUsage)
 	}
 	cmd := os.Args[1]
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
@@ -94,7 +166,7 @@ func main() {
 	if cmd == "serve" {
 		if err := serveCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "serve error: %v\n", err)
-			os.Exit(1)
+			os.Exit(mapExitCode(err))
 		}
 		return
 	}
@@ -107,13 +179,23 @@ func main() {
 	cfg, err := config.Load(gf.configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
-		os.Exit(1)
+		os.Exit(ExitConfigFail)
 	}
 
 	date, err := resolveDate(gf.dateStr, cfg.Domain.Timezone)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "date error: %v\n", err)
-		os.Exit(1)
+		os.Exit(ExitUsage)
+	}
+
+	// v1.0.1 Batch 2.7: 对会推 Slack 或调用 LLM 的命令强制校验 BRIEFING_MODE.
+	// migrate/seed/status/help 不需要 (纯本地, 不推不调).
+	switch cmd {
+	case "run", "repair", "weekly", "regen", "promote":
+		if _, merr := briefingMode(); merr != nil {
+			fmt.Fprintf(os.Stderr, "config error: %v\n", merr)
+			os.Exit(ExitConfigFail)
+		}
 	}
 
 	switch cmd {
@@ -122,6 +204,13 @@ func main() {
 	case "seed":
 		err = seedCommand(ctx, cfg)
 	case "run":
+		err = runCommand(ctx, cfg, date, gf)
+	case "repair":
+		// v1.0.1 Batch 2.18: orchestrator Attempt 4 调 briefing repair
+		// --section X,Y 只补缺失 section. 当前最小实现: 别名给 run (Team C
+		// orchestrator 已经 graceful fallback 到完整 run 所以等价).
+		// 真正的 per-section 重跑 (跳过 rank+classify, 只 compose 指定
+		// section) 是 P1 refinement, 等后续细化.
 		err = runCommand(ctx, cfg, date, gf)
 	case "weekly":
 		err = weeklyCommand(ctx, cfg, date, gf)
@@ -134,11 +223,11 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		os.Exit(ExitUsage)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		os.Exit(mapExitCode(err))
 	}
 }
 
@@ -161,8 +250,15 @@ func resolveDate(s, tz string) (time.Time, error) {
 }
 
 // migrateCommand initializes the SQLite schema.
+// BRIEFING_DB env var overrides the default path so Team A's batch-1
+// verification can run against /tmp/test_batch1.db without touching
+// the production database.
 func migrateCommand(ctx context.Context, cfg *config.Config) error {
-	s, err := store.New("data/briefing.db")
+	dbPath := os.Getenv("BRIEFING_DB")
+	if dbPath == "" {
+		dbPath = "data/briefing.db"
+	}
+	s, err := store.New(dbPath)
 	if err != nil {
 		return err
 	}
@@ -170,7 +266,7 @@ func migrateCommand(ctx context.Context, cfg *config.Config) error {
 	if err := s.Migrate(ctx); err != nil {
 		return err
 	}
-	fmt.Println("migrate: OK")
+	fmt.Printf("migrate: OK (db=%s)\n", dbPath)
 	return nil
 }
 
@@ -340,9 +436,85 @@ func promoteCommand(ctx context.Context, cfg *config.Config, date time.Time, gf 
 	return nil
 }
 
-// statusCommand prints the current issue + deliveries for the given date.
-// Filled in by the main thread once the pipeline is wired.
+// statusCommand prints the current issue, per-section item status, and recent
+// deliveries for the given date. v1.0.1 Batch 2.17: 运维可视化, 便于在
+// briefing repair / 故障排查时快速看清哪些 section validated / failed / pending.
 func statusCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *globalFlags) error {
-	fmt.Printf("status: date=%s (not yet implemented)\n", date.Format("2006-01-02"))
+	dbPath := os.Getenv("BRIEFING_DB")
+	if dbPath == "" {
+		dbPath = "data/briefing.db"
+	}
+	s, err := store.New(dbPath)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer s.Close()
+
+	issue, err := s.GetIssueByDate(ctx, gf.domain, date)
+	if err != nil {
+		return fmt.Errorf("get issue: %w", err)
+	}
+	if issue == nil {
+		fmt.Printf("status: no issue for date=%s domain=%s (run `briefing run` first)\n",
+			date.Format("2006-01-02"), gf.domain)
+		return nil
+	}
+
+	fmt.Printf("=== Issue ===\n")
+	fmt.Printf("  id          %d\n", issue.ID)
+	fmt.Printf("  date        %s\n", issue.IssueDate.Format("2006-01-02"))
+	fmt.Printf("  domain      %s\n", issue.DomainID)
+	fmt.Printf("  status      %s\n", issue.Status)
+	fmt.Printf("  title       %s\n", issue.Title)
+	fmt.Printf("  item_count  %d\n", issue.ItemCount)
+	if issue.GeneratedAt != nil {
+		fmt.Printf("  generated   %s\n", issue.GeneratedAt.Format("2006-01-02 15:04:05"))
+	}
+	if issue.PublishedAt != nil {
+		fmt.Printf("  published   %s\n", issue.PublishedAt.Format("2006-01-02 15:04:05"))
+	}
+
+	// Per-section status breakdown (iterate known statuses so we see both
+	// validated items and pending/failed ones if the pipeline hit errors).
+	fmt.Printf("\n=== Items by status ===\n")
+	for _, st := range []string{"validated", "pending", "running", "failed", "degraded"} {
+		items, ierr := s.ListIssueItemsByStatus(ctx, issue.ID, st)
+		if ierr != nil {
+			fmt.Printf("  %-10s  (query error: %v)\n", st, ierr)
+			continue
+		}
+		if len(items) == 0 {
+			continue
+		}
+		// Bucket by section for readable output.
+		bySection := make(map[string]int)
+		for _, it := range items {
+			if it != nil {
+				bySection[it.Section]++
+			}
+		}
+		parts := make([]string, 0, len(bySection))
+		for sec, n := range bySection {
+			parts = append(parts, fmt.Sprintf("%s=%d", sec, n))
+		}
+		fmt.Printf("  %-10s  %d items  [%s]\n", st, len(items), strings.Join(parts, ", "))
+	}
+
+	// Recent deliveries (uses existing ListDeliveries interface).
+	fmt.Printf("\n=== Recent deliveries (same issue) ===\n")
+	if deliveries, derr := s.ListDeliveries(ctx, issue.ID); derr == nil {
+		if len(deliveries) == 0 {
+			fmt.Printf("  (none)\n")
+		}
+		for _, d := range deliveries {
+			if d == nil {
+				continue
+			}
+			fmt.Printf("  %-12s %s  @ %s\n", d.Channel, d.Status, d.SentAt.Format("2006-01-02 15:04:05"))
+		}
+	} else {
+		fmt.Printf("  (deliveries query failed: %v)\n", derr)
+	}
+
 	return nil
 }

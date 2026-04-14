@@ -339,7 +339,9 @@ func loadIssueContext(dbPath, issueDate string) string {
 	if err != nil || issue == nil {
 		return "(今日早报尚未生成)"
 	}
-	items, err := s.ListIssueItems(ctx, issue.ID)
+	// v1.0.1 Batch 2.13: chat 回答只基于 validated items, 防止把未验证
+	// (pending/failed) 的半成品 section 内容喂给 LLM 作为 context.
+	items, err := s.ListIssueItemsByStatus(ctx, issue.ID, "validated")
 	if err != nil {
 		items = nil
 	}

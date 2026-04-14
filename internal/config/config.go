@@ -61,6 +61,10 @@ type LLMConfig struct {
 	MaxTokens      int     `yaml:"max_tokens"`
 	TimeoutSeconds int     `yaml:"timeout_seconds"`
 	MaxRetries     int     `yaml:"max_retries"`
+	// v1.0.1: LLM 502 分钟级退避序列 (秒). 数组长度 = 最大重试次数.
+	// 每次重试前 sleep 对应索引的秒数. 旧 1/2/4/8s 共 15s 对上游分钟级
+	// 抖动无效, 是 2026-04-14 故障的根因之一.
+	RetryBackoffSeconds []int `yaml:"retry_backoff_seconds"`
 	// Resolved values (populated by Load).
 	BaseURL string `yaml:"-"`
 	APIKey  string `yaml:"-"`
@@ -143,8 +147,12 @@ func Load(path string) (*Config, error) {
 	cfg.LLM.BaseURL = firstNonEmpty(os.Getenv(cfg.LLM.BaseURLEnv), cfg.LLM.DefaultBaseURL)
 	cfg.LLM.APIKey = os.Getenv(cfg.LLM.APIKeyEnv)
 	cfg.LLM.Model = firstNonEmpty(os.Getenv(cfg.LLM.ModelEnv), cfg.LLM.DefaultModel)
+	// v1.0.1: API key 缺失只 warning, 不立即 error. 这样 migrate/seed/status
+	// 等不调用 LLM 的命令能独立跑 (方便本地测试 Step 3 migration dry-run).
+	// 真正用 LLM 的 sub-package (generate/classify/rank/infocard) 在
+	// New() 里自己校验 APIKey 非空并返回 error.
 	if cfg.LLM.APIKey == "" {
-		return nil, fmt.Errorf("config: %s env var is required for LLM API key", cfg.LLM.APIKeyEnv)
+		fmt.Fprintf(os.Stderr, "WARNING: %s not set — LLM commands (run/weekly/regen) will fail, but migrate/seed/status OK\n", cfg.LLM.APIKeyEnv)
 	}
 
 	// Resolve Slack env. Missing webhooks are warnings, not errors, so

@@ -156,7 +156,8 @@ func WriteHugoPost(
 		return "", fmt.Errorf("hugo: ensure month index: %w", err)
 	}
 	outPath := filepath.Join(monthDir, dateStr+".md")
-	if err := os.WriteFile(outPath, []byte(full), 0o644); err != nil {
+	// v1.0.1 Batch 2.15: atomic write (.tmp → rename) 防读到半写入文件.
+	if err := atomicWriteFile(outPath, []byte(full), 0o644); err != nil {
 		return "", fmt.Errorf("hugo: write %s: %w", outPath, err)
 	}
 
@@ -186,7 +187,19 @@ func ensureIndexFile(dir, title string, weight int) error {
 	b.WriteString("breadcrumbs: false\n")
 	b.WriteString("comments: false\n")
 	b.WriteString("---\n")
-	return os.WriteFile(indexPath, []byte(b.String()), 0o644)
+	// v1.0.1 Batch 2.15: atomic write.
+	return atomicWriteFile(indexPath, []byte(b.String()), 0o644)
+}
+
+// atomicWriteFile writes data to path atomically via a .tmp sibling file
+// + os.Rename. On Linux/POSIX, same-filesystem rename is atomic so readers
+// never observe a half-written state. v1.0.1 Batch 2.15.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // imageRefRe matches markdown image references: ![alt](url)
@@ -555,7 +568,8 @@ func updateHomepage(siteDir string, latestDate time.Time) error {
 	if text == string(original) {
 		return nil // nothing changed
 	}
-	return os.WriteFile(indexPath, []byte(text), 0o644)
+	// v1.0.1 Batch 2.15: atomic write.
+	return atomicWriteFile(indexPath, []byte(text), 0o644)
 }
 
 func truncateDescription(s string, maxRunes int) string {

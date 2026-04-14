@@ -69,6 +69,16 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		return fmt.Errorf("migrate: %w", err)
 	}
 
+	// v1.0.1 Batch 2.16: 启动时把卡在 'running' 超 10 分钟的 stage 归为
+	// 'failed', 防止前一次 pipeline 崩溃 (panic/OOM) 留下的 running 记录
+	// 阻塞本次 run. threshold 10min 比单 section compose 最坏 10min 长
+	// 一点点, 不会误伤真在跑的 stage (因为只影响上一个已终止的 process).
+	if recovered, rerr := s.RecoverStaleRunningStages(ctx, 10*time.Minute); rerr != nil {
+		fmt.Printf("[WARN] recover stale running stages: %v\n", rerr)
+	} else if recovered > 0 {
+		stage(fmt.Sprintf("recover: marked %d stale 'running' stages as 'failed'", recovered))
+	}
+
 	// --- 1. Upsert the Issue row for today ------------------------------
 	issue := &store.Issue{
 		DomainID:  gf.domain,
@@ -82,6 +92,27 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	}
 	issue.ID = issueID
 	stage(fmt.Sprintf("issue ready: id=%d", issueID))
+
+	// v1.0.1 Batch 2.10: record each pipeline stage into issue_stages for
+	// `briefing status` / `briefing repair` visibility. Best-effort — errors
+	// only log WARN, never block pipeline on telemetry failure.
+	recordStage := func(stageName, status, errText string) {
+		var completedAt *time.Time
+		if status == store.StageStatusSucceeded || status == store.StageStatusFailed || status == store.StageStatusSkipped {
+			now := time.Now()
+			completedAt = &now
+		}
+		if serr := s.UpdateStageStatus(ctx, &store.IssueStage{
+			IssueID:     issueID,
+			Stage:       stageName,
+			Status:      status,
+			Version:     1,
+			ErrorText:   errText,
+			CompletedAt: completedAt,
+		}); serr != nil {
+			fmt.Printf("[WARN] record stage %s/%s: %v\n", stageName, status, serr)
+		}
+	}
 
 	// --- 2. Concurrent ingest -------------------------------------------
 	stage("ingest: starting concurrent fetch")
@@ -218,10 +249,98 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	}
 	sectioned, err := classifier.Classify(ctx, rankedRaws, sourceCategories)
 	if err != nil {
+		recordStage(store.StageClassify, store.StageStatusFailed, err.Error())
 		return fmt.Errorf("classify: %w", err)
 	}
 	for secID, secItems := range sectioned {
 		stage(fmt.Sprintf("classify: %s → %d items", secID, len(secItems)))
+	}
+	recordStage(store.StageClassify, store.StageStatusSucceeded, "")
+
+	// v1.0.1 Batch 2.9: persist classified items to DB so `briefing repair
+	// --section X` can re-compose without paying classify LLM cost again.
+	// Best-effort — per-item insert with WARN 不用整批 TX (防 1 行 FK 错
+	// 回滚整个 section 数据). RawItemID=0 的项跳过, 避免 FK 约束错误日志.
+	// (FK 偶发问题: 极少数 item 在内存中有非零 ID 但 DB 里没这行 — 可能
+	//  由于 test DB 副本 / ON CONFLICT IGNORE / ingest ID 分配路径中某处.
+	//  详细排查推到明天 P1.)
+	classifiedInserted := 0
+	classifiedSkipped := 0
+	for secID, secItems := range sectioned {
+		for i, item := range secItems {
+			if item == nil || item.ID == 0 {
+				classifiedSkipped++
+				continue
+			}
+			row := []*store.ClassifiedItem{{
+				IssueID:   issueID,
+				Section:   secID,
+				RawItemID: item.ID,
+				RankScore: 0,
+				Seq:       i + 1,
+			}}
+			if cerr := s.InsertClassifiedItems(ctx, row); cerr != nil {
+				classifiedSkipped++
+				continue
+			}
+			classifiedInserted++
+		}
+	}
+	if classifiedInserted > 0 || classifiedSkipped > 0 {
+		stage(fmt.Sprintf("classify persist: %d inserted, %d skipped (FK / zero-id)", classifiedInserted, classifiedSkipped))
+	}
+
+	// --- 6b. Extended window fallback (Batch 2.20) ---------------------
+	// 防"opensource/social 0 信息"场景 (2026-04-14 故障教训): classify 完
+	// 后若某 section items < 配置的 min_items, 自动把 filter 窗口从 24h
+	// 扩到 ExtendedHours (默认 48h) 重跑 filter→rank→classify 一次.
+	// 整体替换 sectioned 和 rankedRaws, 让 compose/insight 都用新数据.
+	// L133 已经做过 total-level fallback (items < gate.MinItems), 这是更
+	// 细粒度的 per-section fallback.
+	shortSections := []string{}
+	for _, sec := range cfg.Sections {
+		if len(sectioned[sec.ID]) < sec.MinItems {
+			shortSections = append(shortSections, fmt.Sprintf("%s(%d<%d)", sec.ID, len(sectioned[sec.ID]), sec.MinItems))
+		}
+	}
+	if len(shortSections) > 0 && cfg.Window.ExtendedHours > cfg.Window.LookbackHours {
+		stage(fmt.Sprintf("extended window: sections short [%s], retrying filter→rank→classify with %dh",
+			strings.Join(shortSections, ","), cfg.Window.ExtendedHours))
+		cutoff2 := date.Add(-time.Duration(cfg.Window.ExtendedHours) * time.Hour)
+		filtered2 := filterByWindow(rawItems, cutoff2)
+		if len(sentURLs) > 0 {
+			filtered2 = dedupRawItemsBySent(filtered2, sentURLs)
+		}
+		if len(sentTitles) > 0 {
+			filtered2 = dedupRawItemsByTitle(filtered2, sentTitles)
+		}
+		if len(filtered2) > len(filtered) {
+			stage(fmt.Sprintf("extended filter: %d items in %dh (vs %d in %dh)",
+				len(filtered2), cfg.Window.ExtendedHours, len(filtered), cfg.Window.LookbackHours))
+			if ranked2, rerr := ranker.Rank(ctx, filtered2, sourceCategories); rerr != nil {
+				stage(fmt.Sprintf("extended rank: failed (%v) — keeping original classify result", rerr))
+			} else {
+				rankedRaws2 := make([]*store.RawItem, 0, len(ranked2))
+				for _, r := range ranked2 {
+					if r.Item != nil {
+						rankedRaws2 = append(rankedRaws2, r.Item)
+					}
+				}
+				if sectioned2, cerr := classifier.Classify(ctx, rankedRaws2, sourceCategories); cerr != nil {
+					stage(fmt.Sprintf("extended classify: failed (%v) — keeping original", cerr))
+				} else {
+					// 整体替换, compose+insight 都用新数据
+					sectioned = sectioned2
+					rankedRaws = rankedRaws2
+					stage("extended window: switched to extended result")
+					for secID, secItems := range sectioned {
+						stage(fmt.Sprintf("classify(ext): %s → %d items", secID, len(secItems)))
+					}
+				}
+			}
+		} else {
+			stage(fmt.Sprintf("extended window: no additional items in %dh (skipping re-run)", cfg.Window.ExtendedHours))
+		}
 	}
 
 	// --- 7. Compose (LLM Step 1B text generation per section) ----------
@@ -254,16 +373,22 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		})
 	}
 	// INTERFACE CHANGE (T2/C3): Compose() now returns (items, failedSections, err).
-	// failedSections drives the gate Warn downgrade in stage 14.
-	// T3 will take over refinement of how failedSections is surfaced to
-	// the render + Slack payload.
+	// v1.0.1: failedSections 现在会让 gate hard fail (Bug B 修复),
+	// 且每个 failed section 写入 issue_stages 便于 briefing repair 识别.
 	issueItems, composeFailedSections, err := composer.Compose(ctx, issueID, sectioned, composeSections, summarizer)
 	if err != nil {
+		recordStage(store.StageCompose, store.StageStatusFailed, err.Error())
 		return fmt.Errorf("compose: %w", err)
 	}
 	if len(composeFailedSections) > 0 {
 		stage(fmt.Sprintf("compose: %d section(s) degraded: %s",
 			len(composeFailedSections), strings.Join(composeFailedSections, ",")))
+		// v1.0.1 Batch 2.10/2.1: 把 failed sections 作为 compose stage 的
+		// error_text 持久化, 让 briefing repair 能按 section 重跑.
+		recordStage(store.StageCompose, store.StageStatusFailed,
+			"failed sections: "+strings.Join(composeFailedSections, ","))
+	} else {
+		recordStage(store.StageCompose, store.StageStatusSucceeded, "")
 	}
 	stage(fmt.Sprintf("compose: produced %d issue items", len(issueItems)))
 
@@ -280,8 +405,11 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		stage(fmt.Sprintf("media: %d items got a fallback hero image/video", mediaFound))
 	}
 
-	// --- 8. Persist IssueItems (replace any existing for this issue) ----
-	if err := s.ReplaceIssueItems(ctx, issueID, issueItems); err != nil {
+	// --- 8. Persist IssueItems (per-section upsert, Batch 1.10 接口) ----
+	// v1.0.1: 用 ReplaceIssueItemsBySections 替代 ReplaceIssueItems, 让
+	// briefing repair --section X 能只重跑某个 section 不误伤其它 section
+	// 的已验证内容 (per-section DELETE+INSERT 语义).
+	if err := s.ReplaceIssueItemsBySections(ctx, issueID, issueItems); err != nil {
 		return fmt.Errorf("replace issue items: %w", err)
 	}
 
@@ -293,24 +421,55 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		RawItems: rankedRaws,
 	})
 	if err != nil {
-		return fmt.Errorf("generate insight: %w", err)
+		recordStage(store.StageInsight, store.StageStatusFailed, err.Error())
+		return transient(fmt.Errorf("generate insight: %w (orchestrator 重试 or 人工介入)", err))
 	}
 	insight.IssueID = issueID
 	if err := s.UpsertIssueInsight(ctx, insight); err != nil {
+		recordStage(store.StageInsight, store.StageStatusFailed, err.Error())
 		return fmt.Errorf("upsert insight: %w", err)
 	}
+	recordStage(store.StageInsight, store.StageStatusSucceeded, "")
 	stage("insight: generated and persisted")
 
 	// --- 10. Daily summary (Step 2 — 3-line summary) --------------------
-	// v1.0.0: 之前是 hard stop, 上游 LLM 一次 502 就让整条 pipeline 退出.
-	// 改为 fail-soft: LLM 临时挂掉就用本地兜底 summary (取前 3 个 high-quality
-	// item 的标题), pipeline 继续走完, 早报照样推送, 只是 summary 行内容降级.
+	// v1.0.1 "零降级" (2026-04-14 用户原话 "局部缺信息, 应该是想办法补上,
+	// 不是一再降级") + 双层防御: 本地 retry 扛 transient 502, 全挂才 escalate
+	// 给 orchestrator. 退出路径:
+	//   (a) 本地 retry 中任一成功 → 正常继续
+	//   (b) 本地 retry 全挂 → transient exit → orchestrator 下一 Attempt 重跑
+	//   (c) 4 轮 Attempt 全挂 → exit 6 needs_human (orchestrator 告警)
+	// 已删除 buildFallbackSummary 兜底文案路径 (违反零降级原则).
 	stage("summary: generating 3-line daily summary")
-	summary, err := generateDailySummary(ctx, cfg.LLM, issueItems)
-	if err != nil {
-		fmt.Printf("[WARN] summary: %v — falling back to title-based local summary\n", err)
-		summary = buildFallbackSummary(issueItems)
+	summaryBackoffs := cfg.LLM.RetryBackoffSeconds
+	if len(summaryBackoffs) == 0 {
+		summaryBackoffs = []int{10, 30, 90, 180, 300}
 	}
+	var summary string
+	var summaryErr error
+	for summAttempt := 1; summAttempt <= len(summaryBackoffs); summAttempt++ {
+		summary, summaryErr = generateDailySummary(ctx, cfg.LLM, issueItems)
+		if summaryErr == nil {
+			break
+		}
+		if summAttempt < len(summaryBackoffs) {
+			backoff := time.Duration(summaryBackoffs[summAttempt-1]) * time.Second
+			fmt.Printf("[WARN] summary attempt %d failed: %v — retrying in %s\n",
+				summAttempt, summaryErr, backoff)
+			select {
+			case <-ctx.Done():
+				recordStage(store.StageSummary, store.StageStatusFailed, ctx.Err().Error())
+				return transient(ctx.Err())
+			case <-time.After(backoff):
+			}
+		}
+	}
+	if summaryErr != nil {
+		recordStage(store.StageSummary, store.StageStatusFailed, summaryErr.Error())
+		return transient(fmt.Errorf("summary LLM failed after %d retries: %w (orchestrator 重试)",
+			len(summaryBackoffs), summaryErr))
+	}
+	recordStage(store.StageSummary, store.StageStatusSucceeded, "")
 	issue.Summary = summary
 	issue.ItemCount = len(issueItems)
 	issue.SourceCount = countSourceDomains(issueItems)
@@ -450,9 +609,10 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			stage(fmt.Sprintf("infocard: rendered %d/%d item PNGs", renderedCount, len(cards)))
 
 			// Persist the mutated items (now with image markdown at top).
+			// v1.0.1: per-section 语义 (同上).
 			// A store failure here is non-fatal — HTML is re-rendered from
 			// the in-memory slice below anyway.
-			if err := s.ReplaceIssueItems(ctx, issueID, issueItems); err != nil {
+			if err := s.ReplaceIssueItemsBySections(ctx, issueID, issueItems); err != nil {
 				fmt.Printf("[WARN] replace issue items after infocard: %v\n", err)
 			}
 		}
@@ -637,6 +797,20 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		MinSourceDomains:       cfg.Gate.MinSourceDomains,
 	})
 	report := g.Check(issue, issueItems, insight, composeFailedSections, len(cfg.Sections))
+	// v1.0.1 Batch 2.10: 把 gate 结论写到 issue_stages, 便于 briefing status
+	// 一眼看出 gate 判定 pass / warn / fail + 具体原因.
+	{
+		gateStatus := store.StageStatusSucceeded
+		gateErrText := ""
+		if !report.Pass && !report.Warn {
+			gateStatus = store.StageStatusFailed
+			gateErrText = "hard fail: " + strings.Join(report.Reasons, "; ")
+		} else if !report.Pass && report.Warn {
+			gateStatus = store.StageStatusSucceeded
+			gateErrText = "warn: " + strings.Join(report.Warnings, "; ")
+		}
+		recordStage(store.StageGate, gateStatus, gateErrText)
+	}
 
 	// --- 13 (post-gate). Build RenderedIssue for downstream render/publish.
 	// Moved *after* the gate so v1.0.0 D7b can feed the Warn/Warnings/
@@ -657,21 +831,41 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		report.Pass, report.Warn, report.ItemCount, report.SectionCount, report.InsightChars,
 		report.IndustryBullets, report.TakeawayBullets, report.SourceDomainCount,
 		len(report.FailedSections)))
+	// v1.0.1 Batch 2.4+2.19: gate tri-state 处理
+	// - Pass=true                 → 正常推（任何 target）
+	// - Pass=false + Warn=true    → 质量偏低但文字齐, 继续推 + 发告警让 team 留意
+	// - Pass=false + Warn=false   → hard fail (文字产物缺失), 主动 POST alert
+	//   + 立即返回 contentFail (exit 3), 绝不推任何频道 — orchestrator 会
+	//   接住 exit 3 去跑下一次 Attempt (repair 或 re-run).
+	//
+	// (老 v1.0.0 的 "warn → treat as pass, push normally" 已删除 — 违反
+	//  用户 2026-04-14 规则 "文字必齐, 零降级".)
 	if !report.Pass {
 		if report.Warn {
 			for _, w := range report.Warnings {
 				fmt.Printf("[GATE WARN] %s\n", w)
 			}
-			// v1.0.1: gate warn → treat as pass, push normally.
-			// 内容质量略低于阈值不应阻塞推送，用户宁可看到略瘦的内容
-			// 也不想看到空频道。Warn 信息已记录在日志和 Slack 渲染中。
-			stage("gate warn: treating as pass, pushing normally")
-			report.Pass = true
-			report.Warn = false
+			stage("gate: warn state — continuing to publish with quality marker")
+			// 发一条 alert 到 test 频道, 标注这条早报是 "质量待审".
+			// 不阻塞发送 (warn 状态下文字产物仍齐全, 只是数量/多样性偏低).
+			if shouldPostGateAlert(report) {
+				alertMsg := buildGateFailAlert(issue, report)
+				alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
+				_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
+			}
 		} else {
+			// Hard fail: 某 section 缺失 / insight 缺 / items=0 等
 			for _, reason := range report.Reasons {
 				fmt.Printf("[GATE FAIL] %s\n", reason)
 			}
+			// Batch 2.19: 主动 POST 到 test webhook, 不依赖 systemd OnFailure
+			// (2026-04-14 故障证明 OnFailure 不可靠 — 因为 Bug B 让 exit=0).
+			// orchestrator.sh 看到 exit 3 也会兜底再发一条, 这是双保险.
+			alertMsg := buildGateFailAlert(issue, report)
+			alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
+			_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
+			// 返回 contentFail (exit 3), 让 orchestrator 去走下一次 Attempt.
+			return contentFail(fmt.Errorf("gate hard fail (文字产物缺失): %s", gateFailureDetail(report)))
 		}
 	}
 
@@ -712,7 +906,15 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	stage("publish: slack test OK")
 
 	// --- 17. Publish to Slack prod if gate passed & target == auto|prod -
-	targetWantsProd := gf.target == "auto" || gf.target == "prod"
+	// v1.0.1 Batch 2.6: BRIEFING_MODE=debug 一律不推 prod, 无论 gf.target.
+	// 这是为了防止"调试阶段误推正式频道"(2026-04-14 故障复发).
+	// BRIEFING_MODE 在 main.go 入口已被 briefingMode() 校验为 debug|prod.
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("BRIEFING_MODE")))
+	wantsProdTarget := gf.target == "auto" || gf.target == "prod"
+	targetWantsProd := wantsProdTarget && mode == "prod"
+	if wantsProdTarget && mode != "prod" {
+		stage("publish: BRIEFING_MODE=" + mode + ", skipping prod channel (仅 prod 模式推正式频道)")
+	}
 	if targetWantsProd {
 		if !report.Pass {
 			if shouldPostGateAlert(report) {
