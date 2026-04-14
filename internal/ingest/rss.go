@@ -17,8 +17,14 @@ import (
 // Any feed URL that gofeed can parse (RSS 1.0/2.0, Atom, JSON Feed) is
 // acceptable. smol.ai publishes a standard RSS 2.0 feed at
 // https://news.smol.ai/rss.xml.
+//
+// v1.0.1 Phase 1.1: MaxAgeHours caps items by pubDate age, guards against
+// feeds returning full historical archive (OpenAI News 935 items / smol.ai
+// 611 items both go back years; most other feeds self-limit). Zero value
+// = no filter (backward compat).
 type rssConfig struct {
-	URL string `json:"url"`
+	URL         string `json:"url"`
+	MaxAgeHours int    `json:"max_age_hours,omitempty"`
 }
 
 // rssSource is a generic RSS/Atom/JSON feed adapter backed by gofeed.
@@ -63,8 +69,16 @@ func (s *rssSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
 	}
 
 	now := time.Now().UTC()
-	out := make([]*store.RawItem, 0, len(feed.Items))
-	for _, fi := range feed.Items {
+	// v1.0.1 Phase 1.1: 按 pubDate 年龄过滤, 挡掉全量历史 feed (OpenAI News /
+	// smol.ai 返回多年前的老条目). MaxAgeHours=0 时不过滤 (保持默认行为,
+	// 其他 feed 自限"近几天"就不需要设这个).
+	items := feed.Items
+	if s.cfg.MaxAgeHours > 0 {
+		cutoff := now.Add(-time.Duration(s.cfg.MaxAgeHours) * time.Hour)
+		items = filterItemsByAge(items, cutoff)
+	}
+	out := make([]*store.RawItem, 0, len(items))
+	for _, fi := range items {
 		if fi == nil {
 			continue
 		}
@@ -118,6 +132,38 @@ func (s *rssSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
 		})
 	}
 	return out, nil
+}
+
+// filterItemsByAge returns the subset of items whose PublishedParsed (or
+// UpdatedParsed as fallback) is within cutoff. Items with neither date
+// are KEPT (we don't want to drop entries whose publisher omitted
+// pubDate — downstream filter stage will re-check against the 24h window).
+// v1.0.1 Phase 1.1 helper: kept as standalone function for table-driven
+// unit testing without spinning up httptest.Server.
+func filterItemsByAge(items []*gofeed.Item, cutoff time.Time) []*gofeed.Item {
+	out := make([]*gofeed.Item, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if it.PublishedParsed == nil && it.UpdatedParsed == nil {
+			// No date known → keep. Conservative: rather let downstream
+			// 24h filter drop it than drop here based on assumption.
+			out = append(out, it)
+			continue
+		}
+		var pub time.Time
+		if it.PublishedParsed != nil {
+			pub = *it.PublishedParsed
+		} else if it.UpdatedParsed != nil {
+			pub = *it.UpdatedParsed
+		}
+		if pub.Before(cutoff) {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 func init() {

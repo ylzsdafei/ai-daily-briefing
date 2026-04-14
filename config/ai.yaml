@@ -135,6 +135,9 @@ sources:
     category: news
     name: "smol.ai news"
     url: "https://news.smol.ai/rss.xml"
+    # v1.0.1 Phase 1.1: smol.ai 返回 611 items 全量历史 (最早 2024-07).
+    # 限 48h 避免老条目灌进 rank (rank LLM 耗时主因).
+    max_age_hours: 48
     enabled: true
     priority: 10
   - id: the-decoder
@@ -156,6 +159,9 @@ sources:
     category: news
     name: "OpenAI News"
     url: "https://openai.com/news/rss.xml"
+    # v1.0.1 Phase 1.1: OpenAI 返回 935 items 全量历史 (最早 2018-10).
+    # 限 48h, 让 rank 阶段数据量降 ~700+ items, 耗时 13min → ~8min.
+    max_age_hours: 48
     enabled: true
     priority: 10
 
@@ -200,7 +206,13 @@ sources:
     type: google_news
     category: news
     name: "Google News: 大语言模型"
-    query: "大语言模型"
+    # v1.0.1 Phase 1.2: 多 query fallback — 实测 "大语言模型" 某些天返回 0 items,
+    # 自动切下一个. 顺序尝试直到拿到非空 feed, 或全部空才 fail.
+    queries:
+      - "大语言模型"
+      - "LLM 大模型"
+      - "生成式AI"
+      - "ChatGPT OR Claude OR Gemini"
     hl: "zh-CN"
     gl: "US"
     ceid: "US:zh-Hans"
@@ -276,6 +288,104 @@ sources:
     url: "https://api.ossinsight.io/v1/trends/repos"
     enabled: true
     priority: 10
+
+  # === v1.0.1 Phase 3.1 — 海外 AI 厂商官博 (5 个) ===
+  - id: deepmind-blog
+    type: rss
+    category: news
+    name: "DeepMind Blog"
+    url: "https://deepmind.google/blog/rss.xml"
+    # DeepMind 一次返回 100 items 跨 6 周, 限 48h 只留近 1-3 条
+    max_age_hours: 48
+    enabled: true
+    priority: 10
+
+  - id: google-ai-blog
+    type: rss
+    category: news
+    name: "Google AI Blog"
+    url: "https://blog.google/technology/ai/rss/"
+    enabled: true
+    priority: 10
+
+  - id: ms-research
+    type: rss
+    category: news
+    name: "Microsoft Research Blog"
+    url: "https://www.microsoft.com/en-us/research/feed/"
+    # 通用 feed (含 AI + 非 AI 内容), 由 classify LLM 二次过滤
+    enabled: true
+    priority: 8
+
+  - id: nvidia-ai-blog
+    type: rss
+    category: news
+    name: "NVIDIA AI Blog"
+    url: "https://blogs.nvidia.com/blog/category/deep-learning/feed/"
+    max_age_hours: 48
+    enabled: true
+    priority: 8
+
+  - id: hf-blog
+    type: rss
+    category: blog
+    name: "Hugging Face Blog"
+    url: "https://huggingface.co/blog/feed.xml"
+    # HF 返回 762 items 跨 3 年, 必须限 48h
+    max_age_hours: 48
+    enabled: true
+    priority: 9
+
+  # === v1.0.1 Phase 3.2 — 商业 / 行业分析 Substack (4 个) ===
+  - id: platformer
+    type: rss
+    category: blog
+    name: "Platformer (Casey Newton)"
+    url: "https://www.platformer.news/rss/"
+    enabled: true
+    priority: 9
+
+  - id: big-technology
+    type: rss
+    category: blog
+    name: "Big Technology (Alex Kantrowitz)"
+    url: "https://www.bigtechnology.com/feed"
+    enabled: true
+    priority: 8
+
+  - id: semianalysis
+    type: rss
+    category: blog
+    name: "SemiAnalysis"
+    url: "https://semianalysis.com/feed/"
+    enabled: true
+    priority: 9
+
+  - id: stratechery
+    type: rss
+    category: blog
+    name: "Stratechery (Ben Thompson)"
+    url: "https://stratechery.com/feed/"
+    enabled: true
+    priority: 9
+
+  # === v1.0.1 Phase 3.3 — AI 政策 / 监管 (2 个) ===
+  - id: politico-tech
+    type: rss
+    category: news
+    name: "Politico Tech"
+    url: "https://www.politico.com/rss/politicopicks.xml"
+    # 通用 Politico picks (含 AI + 政策 + 政治), 由 classify 二次过滤
+    enabled: true
+    priority: 7
+
+  - id: eu-ai-act
+    type: rss
+    category: news
+    name: "EU AI Act Tracker"
+    url: "https://artificialintelligenceact.eu/feed/"
+    enabled: true
+    priority: 8
 
   # === HackerNews ===
   - id: hn-top

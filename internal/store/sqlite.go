@@ -32,6 +32,9 @@ var weeklyDiagramDetailSchema string
 //go:embed migrations/005_schema_versioning.sql
 var schemaVersioningSchema string
 
+//go:embed migrations/006_source_health.sql
+var sourceHealthSchema string
+
 // migration is one logical step in the schema evolution. `version` is
 // monotonically increasing and forms the primary key of the
 // schema_migrations audit table. `sql` is the SQL blob to execute.
@@ -56,6 +59,7 @@ func allMigrations() []migration {
 		{3, "003_weekly_diagram", weeklyDiagramSchema, true},
 		{4, "004_weekly_diagram_detail", weeklyDiagramDetailSchema, true},
 		{5, "005_schema_versioning", schemaVersioningSchema, true},
+		{6, "006_source_health", sourceHealthSchema, true},
 	}
 }
 
@@ -84,13 +88,13 @@ type sqliteStore struct {
 // -------- Lifecycle --------
 
 // Migrate runs every pending migration in order. The flow is:
-//   1. Apply migrations 1..4 once (they are all idempotent — CREATE TABLE IF
-//      NOT EXISTS or ALTER TABLE ADD COLUMN with duplicate-column tolerance).
-//   2. Apply migration 5 (schema_versioning). This one creates the
-//      `schema_migrations` ledger as its first statement and back-fills
-//      v1..v4 rows when their corresponding schema artifacts already exist.
-//   3. After every migration that has a row count of 0 in the ledger,
-//      insert its row into schema_migrations so subsequent runs can skip.
+//  1. Apply migrations 1..4 once (they are all idempotent — CREATE TABLE IF
+//     NOT EXISTS or ALTER TABLE ADD COLUMN with duplicate-column tolerance).
+//  2. Apply migration 5 (schema_versioning). This one creates the
+//     `schema_migrations` ledger as its first statement and back-fills
+//     v1..v4 rows when their corresponding schema artifacts already exist.
+//  3. After every migration that has a row count of 0 in the ledger,
+//     insert its row into schema_migrations so subsequent runs can skip.
 //
 // The extra belt-and-braces logic (guard around duplicate column /
 // table already exists) exists because 003/004 were shipped before we
@@ -1382,4 +1386,128 @@ func (s *sqliteStore) SelfHealPublishStatus(ctx context.Context, domainID string
 			domainID, date.Format("2006-01-02"), err)
 	}
 	return res.RowsAffected()
+}
+
+// -------- SourceHealth (v1.0.1 Phase 1.3) --------
+
+// UpsertSourceHealth records one ingest result for a given source.
+//   - success=true  → last_success_at := NOW, consecutive_failures := 0
+//   - success=false → last_error_at   := NOW, consecutive_failures += 1
+//
+// 读旧行为增量 consecutive_failures (SQLite 原生没 "UPDATE ... + 1" on
+// conflict 的 UPSERT 直接语法, 简单清晰起见分两步: SELECT 老 row + INSERT
+// OR REPLACE). 失败时保留 last_success_at (仅更新错误字段).
+func (s *sqliteStore) UpsertSourceHealth(ctx context.Context, sourceID int64, success bool, errorText string, itemCount int) error {
+	// Step 1: 读老行 (consecutive_failures 增量需要).
+	var (
+		prevConsecFails  int
+		prevSuccessAt    sql.NullTime
+		prevErrorAt      sql.NullTime
+		prevErrorText    sql.NullString
+		prevAutoDisabled int
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT consecutive_failures, last_success_at, last_error_at, last_error_text, auto_disabled
+		 FROM source_health WHERE source_id = ?`,
+		sourceID,
+	).Scan(&prevConsecFails, &prevSuccessAt, &prevErrorAt, &prevErrorText, &prevAutoDisabled)
+	isNew := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !isNew {
+		return fmt.Errorf("source_health query (source=%d): %w", sourceID, err)
+	}
+
+	now := time.Now().UTC()
+	var (
+		lastSuccessAt sql.NullTime
+		lastErrorAt   sql.NullTime
+		lastErrorTxt  sql.NullString
+		consecFails   int
+	)
+
+	if success {
+		lastSuccessAt = sql.NullTime{Time: now, Valid: true}
+		// 保留老的 error 字段以便 debug, 只是 consecutive 归零.
+		lastErrorAt = prevErrorAt
+		lastErrorTxt = prevErrorText
+		consecFails = 0
+	} else {
+		// 失败: 保留老的 last_success_at, 推进 error 字段.
+		lastSuccessAt = prevSuccessAt
+		lastErrorAt = sql.NullTime{Time: now, Valid: true}
+		lastErrorTxt = sql.NullString{String: errorText, Valid: errorText != ""}
+		consecFails = prevConsecFails + 1
+	}
+
+	// Step 2: upsert (REPLACE 在 SQLite 走 INSERT OR REPLACE semantics).
+	const up = `
+		INSERT INTO source_health (
+		    source_id, last_success_at, last_error_at,
+		    consecutive_failures, last_error_text, last_item_count,
+		    auto_disabled, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source_id) DO UPDATE SET
+		    last_success_at      = excluded.last_success_at,
+		    last_error_at        = excluded.last_error_at,
+		    consecutive_failures = excluded.consecutive_failures,
+		    last_error_text      = excluded.last_error_text,
+		    last_item_count      = excluded.last_item_count,
+		    updated_at           = excluded.updated_at
+		    -- auto_disabled 不在此处 upsert, 留给未来告警策略单独 toggle
+	`
+	_, err = s.db.ExecContext(ctx, up,
+		sourceID,
+		lastSuccessAt, lastErrorAt,
+		consecFails, lastErrorTxt, itemCount,
+		prevAutoDisabled, now,
+	)
+	if err != nil {
+		return fmt.Errorf("source_health upsert (source=%d): %w", sourceID, err)
+	}
+	_ = isNew // reserved for future metrics
+	return nil
+}
+
+// ListSourceHealth returns every source_health row, ordered by
+// consecutive_failures DESC (sickest sources on top) then source_id.
+func (s *sqliteStore) ListSourceHealth(ctx context.Context) ([]*SourceHealth, error) {
+	const q = `
+		SELECT source_id, last_success_at, last_error_at,
+		       consecutive_failures, COALESCE(last_error_text, ''),
+		       last_item_count, auto_disabled, updated_at
+		FROM source_health
+		ORDER BY consecutive_failures DESC, source_id ASC
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list source_health: %w", err)
+	}
+	defer rows.Close()
+
+	out := []*SourceHealth{}
+	for rows.Next() {
+		var sh SourceHealth
+		var (
+			successAt sql.NullTime
+			errorAt   sql.NullTime
+			disabled  int
+		)
+		if err := rows.Scan(
+			&sh.SourceID, &successAt, &errorAt,
+			&sh.ConsecutiveFailures, &sh.LastErrorText,
+			&sh.LastItemCount, &disabled, &sh.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan source_health: %w", err)
+		}
+		if successAt.Valid {
+			t := successAt.Time
+			sh.LastSuccessAt = &t
+		}
+		if errorAt.Valid {
+			t := errorAt.Time
+			sh.LastErrorAt = &t
+		}
+		sh.AutoDisabled = disabled != 0
+		out = append(out, &sh)
+	}
+	return out, rows.Err()
 }

@@ -18,12 +18,19 @@ import (
 // "google_news". All fields map 1:1 onto the RSS search query string used
 // by news.google.com, so Chinese-language briefings can bypass the GFW by
 // reading Google News's RSS endpoint directly.
+//
+// v1.0.1 Phase 1.2: Queries adds fallback query terms — Fetch tries each
+// in order and returns the first non-empty result. Guards against Google
+// News returning empty for a specific keyword on any given day
+// (实测 "大语言模型" 今日返回 0). Backward compat: if Queries is empty,
+// the adapter falls back to the single Query field (existing config).
 type gnewsConfig struct {
-	Query string `json:"query"`
-	HL    string `json:"hl"`
-	GL    string `json:"gl"`
-	CEID  string `json:"ceid"`
-	When  string `json:"when"`
+	Query   string   `json:"query"`
+	Queries []string `json:"queries,omitempty"`
+	HL      string   `json:"hl"`
+	GL      string   `json:"gl"`
+	CEID    string   `json:"ceid"`
+	When    string   `json:"when"`
 }
 
 // gnewsSource queries Google News RSS search. It wraps gofeed in the same
@@ -43,8 +50,25 @@ func newGoogleNewsSource(row *store.Source) (Source, error) {
 	if err := json.Unmarshal([]byte(row.ConfigJSON), &cfg); err != nil {
 		return nil, fmt.Errorf("google_news: parse ConfigJSON: %w", err)
 	}
-	if strings.TrimSpace(cfg.Query) == "" {
-		return nil, fmt.Errorf("google_news: ConfigJSON.query is required for source %d", row.ID)
+	// v1.0.1 Phase 1.2: 归一化 Queries — 保留 Query 作为 backward compat
+	// 单 query 形式, 如果 Queries 为空则用 [Query], 否则用 Queries.
+	if len(cfg.Queries) == 0 && strings.TrimSpace(cfg.Query) != "" {
+		cfg.Queries = []string{cfg.Query}
+	}
+	// 去掉空字符串 query (YAML 不小心留的空项)
+	cleaned := cfg.Queries[:0]
+	for _, q := range cfg.Queries {
+		if strings.TrimSpace(q) != "" {
+			cleaned = append(cleaned, q)
+		}
+	}
+	cfg.Queries = cleaned
+	if len(cfg.Queries) == 0 {
+		return nil, fmt.Errorf("google_news: ConfigJSON.query or .queries is required for source %d", row.ID)
+	}
+	// cfg.Query 保留, 向后兼容 (下游如日志 / MetadataJSON 可能用)
+	if cfg.Query == "" {
+		cfg.Query = cfg.Queries[0]
 	}
 	if cfg.HL == "" {
 		cfg.HL = "en-US"
@@ -75,11 +99,11 @@ func (s *gnewsSource) ID() int64    { return s.row.ID }
 func (s *gnewsSource) Type() string { return s.row.Type }
 func (s *gnewsSource) Name() string { return s.row.Name }
 
-// buildQueryURL assembles the fully escaped Google News RSS search URL.
-// Chinese queries MUST be percent-encoded; passing them raw results in
-// garbled/empty feeds.
-func (s *gnewsSource) buildQueryURL() string {
-	q := url.QueryEscape(s.cfg.Query)
+// buildQueryURL assembles the fully escaped Google News RSS search URL
+// for the given query term. Chinese queries MUST be percent-encoded;
+// passing them raw results in garbled/empty feeds.
+func (s *gnewsSource) buildQueryURL(query string) string {
+	q := url.QueryEscape(query)
 	if s.cfg.When != "" {
 		q += "+when:" + url.QueryEscape(s.cfg.When)
 	}
@@ -92,16 +116,49 @@ func (s *gnewsSource) buildQueryURL() string {
 	)
 }
 
-func (s *gnewsSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
-	feedURL := s.buildQueryURL()
+// v1.0.1 Phase 1.2: fetchOneQuery tries exactly one query term and returns
+// parsed items (可能为空). 不抛 err 给空 feed (空是合法结果).
+func (s *gnewsSource) fetchOneQuery(ctx context.Context, query string) ([]*gofeed.Item, string, error) {
+	feedURL := s.buildQueryURL(query)
 	feed, err := s.parser.ParseURLWithContext(feedURL, ctx)
 	if err != nil {
-		return nil, fmt.Errorf("google_news: parse %s: %w", feedURL, err)
+		return nil, feedURL, fmt.Errorf("google_news: parse %s: %w", feedURL, err)
+	}
+	return feed.Items, feedURL, nil
+}
+
+func (s *gnewsSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
+	// v1.0.1 Phase 1.2: 按 Queries 顺序逐个尝试, 第一个非空的 query 结果就用.
+	// 空 feed (0 items 但无 transport err) 视为 "该 query 今天无热门",
+	// 尝试 fallback. 所有 query 都空才返回 "empty feed".
+	var rawItems []*gofeed.Item
+	var usedQuery string
+	var feedURL string
+	var lastErr error
+	for _, q := range s.cfg.Queries {
+		items, builtURL, err := s.fetchOneQuery(ctx, q)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(items) > 0 {
+			rawItems = items
+			usedQuery = q
+			feedURL = builtURL
+			break
+		}
+		// 空 feed, 下一个 query
+	}
+	if len(rawItems) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("google_news: all fallback queries returned empty (tried %v)", s.cfg.Queries)
 	}
 
 	now := time.Now().UTC()
-	items := make([]*store.RawItem, 0, len(feed.Items))
-	for _, fi := range feed.Items {
+	items := make([]*store.RawItem, 0, len(rawItems))
+	for _, fi := range rawItems {
 		if fi == nil {
 			continue
 		}
@@ -139,13 +196,15 @@ func (s *gnewsSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
 		}
 
 		metaJSON, _ := json.Marshal(map[string]any{
-			"query":     s.cfg.Query,
-			"hl":        s.cfg.HL,
-			"gl":        s.cfg.GL,
-			"ceid":      s.cfg.CEID,
-			"when":      s.cfg.When,
-			"feed_url":  feedURL,
-			"source_pub": firstNonEmptyString(feedItemSourceName(fi), ""),
+			"query":       s.cfg.Query,
+			"used_query":  usedQuery, // v1.0.1: 实际命中的 fallback query
+			"all_queries": s.cfg.Queries,
+			"hl":          s.cfg.HL,
+			"gl":          s.cfg.GL,
+			"ceid":        s.cfg.CEID,
+			"when":        s.cfg.When,
+			"feed_url":    feedURL,
+			"source_pub":  firstNonEmptyString(feedItemSourceName(fi), ""),
 		})
 
 		items = append(items, &store.RawItem{

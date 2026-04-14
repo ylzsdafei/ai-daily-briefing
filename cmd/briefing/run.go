@@ -490,133 +490,133 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	if gf.noImages {
 		stage("infocard: --no-images → skipping LLM card generation")
 	} else {
-	stage("infocard: generating editorial info-card JSON via LLM")
-	icGen, icErr := infocard.New(infocard.Config{
-		BaseURL:    cfg.LLM.BaseURL,
-		APIKey:     cfg.LLM.APIKey,
-		Model:      cfg.LLM.Model,
-		MaxRetries: 3,
-		Timeout:    cfg.LLM.LLMTimeout(),
-	})
-	if icErr != nil {
-		fmt.Printf("[WARN] infocard new: %v — falling back to mediaextract images only\n", icErr)
-	} else {
-		// compose.Seq restarts per section (1..N), so multiple items across
-		// different sections can share Seq=1,2,3… Passing those to the LLM
-		// would collapse all cards with the same seq onto the same PNG
-		// filename. Build a UID-remapped shadow slice where every item has
-		// a globally-unique Seq (1..totalItems), pass the shadows to the
-		// infocard LLM, then match the returned cards back via UID.
-		// v1.0.1 L1: only pass top 12 items to infocard LLM to reduce
-		// prompt size and avoid 6-minute timeouts. Items are already
-		// rank-ordered, so the first 12 are the highest quality.
-		infocardSrc := issueItems
-		if len(infocardSrc) > 12 {
-			infocardSrc = infocardSrc[:12]
-		}
-		shadowItems := make([]*store.IssueItem, 0, len(infocardSrc))
-		uidToItem := make(map[int]*store.IssueItem, len(infocardSrc))
-		for i, it := range infocardSrc {
-			if it == nil {
-				continue
+		stage("infocard: generating editorial info-card JSON via LLM")
+		icGen, icErr := infocard.New(infocard.Config{
+			BaseURL:    cfg.LLM.BaseURL,
+			APIKey:     cfg.LLM.APIKey,
+			Model:      cfg.LLM.Model,
+			MaxRetries: 3,
+			Timeout:    cfg.LLM.LLMTimeout(),
+		})
+		if icErr != nil {
+			fmt.Printf("[WARN] infocard new: %v — falling back to mediaextract images only\n", icErr)
+		} else {
+			// compose.Seq restarts per section (1..N), so multiple items across
+			// different sections can share Seq=1,2,3… Passing those to the LLM
+			// would collapse all cards with the same seq onto the same PNG
+			// filename. Build a UID-remapped shadow slice where every item has
+			// a globally-unique Seq (1..totalItems), pass the shadows to the
+			// infocard LLM, then match the returned cards back via UID.
+			// v1.0.1 L1: only pass top 12 items to infocard LLM to reduce
+			// prompt size and avoid 6-minute timeouts. Items are already
+			// rank-ordered, so the first 12 are the highest quality.
+			infocardSrc := issueItems
+			if len(infocardSrc) > 12 {
+				infocardSrc = infocardSrc[:12]
 			}
-			shadow := *it
-			shadow.Seq = i + 1
-			shadowItems = append(shadowItems, &shadow)
-			uidToItem[shadow.Seq] = it
-		}
+			shadowItems := make([]*store.IssueItem, 0, len(infocardSrc))
+			uidToItem := make(map[int]*store.IssueItem, len(infocardSrc))
+			for i, it := range infocardSrc {
+				if it == nil {
+					continue
+				}
+				shadow := *it
+				shadow.Seq = i + 1
+				shadowItems = append(shadowItems, &shadow)
+				uidToItem[shadow.Seq] = it
+			}
 
-		header, cards, err := icGen.Generate(ctx, shadowItems, summary)
-		if err == nil && header != nil {
-			// LLM 成功. 但 LLM prompt 还是旧 schema (6 stories / 3 numbers /
-			// 单行 sub_headline), 跟新 PIL newspaper layout (11 stories / 6
-			// numbers / multi-line L2+L3) 不匹配, MORE STORIES / KEY NUMBERS
-			// 后排会空着. 用 buildFallbackHeaderCard 的字段补齐缺失部分,
-			// LLM 的字段优先, fallback 只补 LLM 没生成的.
-			enrichLLMHeader(header, issueItems, summary, issue.IssueNumber, date.Format("2006-01-02"))
-		}
-		if err != nil {
-			fmt.Printf("[WARN] infocard generate: %v — using local fallback header\n", err)
-			// v1.0.0 fail-soft: LLM 上游一直 6 分钟超时, 不能因此让大字报
-			// 永远是旧图. 用本地构造器从 issueItems + summary 直接拼出
-			// HeaderCard, 喂给同一个 PIL 渲染脚本, 保证大字报永远是当天的.
-			fallbackHeader := buildFallbackHeaderCard(issueItems, summary, issue.IssueNumber, date.Format("2006-01-02"))
-			cardDir := filepath.Join("data", "images", "cards", date.Format("2006-01-02"))
-			if mkErr := os.MkdirAll(cardDir, 0o755); mkErr != nil {
-				fmt.Printf("[WARN] infocard fallback mkdir: %v\n", mkErr)
+			header, cards, err := icGen.Generate(ctx, shadowItems, summary)
+			if err == nil && header != nil {
+				// LLM 成功. 但 LLM prompt 还是旧 schema (6 stories / 3 numbers /
+				// 单行 sub_headline), 跟新 PIL newspaper layout (11 stories / 6
+				// numbers / multi-line L2+L3) 不匹配, MORE STORIES / KEY NUMBERS
+				// 后排会空着. 用 buildFallbackHeaderCard 的字段补齐缺失部分,
+				// LLM 的字段优先, fallback 只补 LLM 没生成的.
+				enrichLLMHeader(header, issueItems, summary, issue.IssueNumber, date.Format("2006-01-02"))
+			}
+			if err != nil {
+				fmt.Printf("[WARN] infocard generate: %v — using local fallback header\n", err)
+				// v1.0.0 fail-soft: LLM 上游一直 6 分钟超时, 不能因此让大字报
+				// 永远是旧图. 用本地构造器从 issueItems + summary 直接拼出
+				// HeaderCard, 喂给同一个 PIL 渲染脚本, 保证大字报永远是当天的.
+				fallbackHeader := buildFallbackHeaderCard(issueItems, summary, issue.IssueNumber, date.Format("2006-01-02"))
+				cardDir := filepath.Join("data", "images", "cards", date.Format("2006-01-02"))
+				if mkErr := os.MkdirAll(cardDir, 0o755); mkErr != nil {
+					fmt.Printf("[WARN] infocard fallback mkdir: %v\n", mkErr)
+				} else {
+					headerPath := filepath.Join(cardDir, "header.png")
+					if rdErr := renderInfoCardPNG(ctx, "header", fallbackHeader, headerPath); rdErr != nil {
+						fmt.Printf("[WARN] infocard fallback render: %v\n", rdErr)
+					} else {
+						headerCardPNGRel = fmt.Sprintf("../data/images/cards/%s/header.png", date.Format("2006-01-02"))
+						stage(fmt.Sprintf("infocard: fallback header PNG written to %s", headerPath))
+					}
+				}
 			} else {
+				stage(fmt.Sprintf("infocard: got header + %d cards, rendering PNGs", len(cards)))
+				header.IssueDate = date.Format("2006-01-02")
+				cardDir := filepath.Join("data", "images", "cards", date.Format("2006-01-02"))
+
+				// Render header PNG (whole-issue 大字报). A failure here is
+				// non-fatal — we continue to render item cards.
 				headerPath := filepath.Join(cardDir, "header.png")
-				if rdErr := renderInfoCardPNG(ctx, "header", fallbackHeader, headerPath); rdErr != nil {
-					fmt.Printf("[WARN] infocard fallback render: %v\n", rdErr)
+				if err := renderInfoCardPNG(ctx, "header", header, headerPath); err != nil {
+					fmt.Printf("[WARN] infocard header render: %v\n", err)
 				} else {
 					headerCardPNGRel = fmt.Sprintf("../data/images/cards/%s/header.png", date.Format("2006-01-02"))
-					stage(fmt.Sprintf("infocard: fallback header PNG written to %s", headerPath))
+					stage(fmt.Sprintf("infocard: header PNG written to %s", headerPath))
 				}
-			}
-		} else {
-			stage(fmt.Sprintf("infocard: got header + %d cards, rendering PNGs", len(cards)))
-			header.IssueDate = date.Format("2006-01-02")
-			cardDir := filepath.Join("data", "images", "cards", date.Format("2006-01-02"))
 
-			// Render header PNG (whole-issue 大字报). A failure here is
-			// non-fatal — we continue to render item cards.
-			headerPath := filepath.Join(cardDir, "header.png")
-			if err := renderInfoCardPNG(ctx, "header", header, headerPath); err != nil {
-				fmt.Printf("[WARN] infocard header render: %v\n", err)
-			} else {
-				headerCardPNGRel = fmt.Sprintf("../data/images/cards/%s/header.png", date.Format("2006-01-02"))
-				stage(fmt.Sprintf("infocard: header PNG written to %s", headerPath))
-			}
-
-			// Render per-item cards and inject markdown image at top.
-			// Every individual card failure is isolated with recover() +
-			// continue so one broken item can never take down the run.
-			renderedCount := 0
-			for _, c := range cards {
-				if c == nil {
-					continue
-				}
-				it := uidToItem[c.ItemSeq]
-				if it == nil {
-					fmt.Printf("[WARN] infocard: card uid=%d has no matching item, skip\n", c.ItemSeq)
-					continue
-				}
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							fmt.Printf("[WARN] infocard uid=%d panic: %v\n", c.ItemSeq, r)
+				// Render per-item cards and inject markdown image at top.
+				// Every individual card failure is isolated with recover() +
+				// continue so one broken item can never take down the run.
+				renderedCount := 0
+				for _, c := range cards {
+					if c == nil {
+						continue
+					}
+					it := uidToItem[c.ItemSeq]
+					if it == nil {
+						fmt.Printf("[WARN] infocard: card uid=%d has no matching item, skip\n", c.ItemSeq)
+						continue
+					}
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								fmt.Printf("[WARN] infocard uid=%d panic: %v\n", c.ItemSeq, r)
+							}
+						}()
+						outPath := filepath.Join(cardDir, fmt.Sprintf("item-%d.png", c.ItemSeq))
+						if err := renderInfoCardPNG(ctx, "item", c, outPath); err != nil {
+							fmt.Printf("[WARN] infocard item uid=%d render: %v\n", c.ItemSeq, err)
+							return
 						}
+						renderedCount++
+						relPath := fmt.Sprintf("../data/images/cards/%s/item-%d.png", date.Format("2006-01-02"), c.ItemSeq)
+						alt := strings.TrimSpace(c.MainTitle)
+						if alt == "" {
+							alt = strings.TrimSpace(it.Title)
+						}
+						for _, ch := range []string{"[", "]", "(", ")"} {
+							alt = strings.ReplaceAll(alt, ch, " ")
+						}
+						alt = strings.TrimSpace(alt)
+						imgLine := fmt.Sprintf("![%s](%s)\n\n", alt, relPath)
+						it.BodyMD = imgLine + strings.TrimLeft(it.BodyMD, "\n")
 					}()
-					outPath := filepath.Join(cardDir, fmt.Sprintf("item-%d.png", c.ItemSeq))
-					if err := renderInfoCardPNG(ctx, "item", c, outPath); err != nil {
-						fmt.Printf("[WARN] infocard item uid=%d render: %v\n", c.ItemSeq, err)
-						return
-					}
-					renderedCount++
-					relPath := fmt.Sprintf("../data/images/cards/%s/item-%d.png", date.Format("2006-01-02"), c.ItemSeq)
-					alt := strings.TrimSpace(c.MainTitle)
-					if alt == "" {
-						alt = strings.TrimSpace(it.Title)
-					}
-					for _, ch := range []string{"[", "]", "(", ")"} {
-						alt = strings.ReplaceAll(alt, ch, " ")
-					}
-					alt = strings.TrimSpace(alt)
-					imgLine := fmt.Sprintf("![%s](%s)\n\n", alt, relPath)
-					it.BodyMD = imgLine + strings.TrimLeft(it.BodyMD, "\n")
-				}()
-			}
-			stage(fmt.Sprintf("infocard: rendered %d/%d item PNGs", renderedCount, len(cards)))
+				}
+				stage(fmt.Sprintf("infocard: rendered %d/%d item PNGs", renderedCount, len(cards)))
 
-			// Persist the mutated items (now with image markdown at top).
-			// v1.0.1: per-section 语义 (同上).
-			// A store failure here is non-fatal — HTML is re-rendered from
-			// the in-memory slice below anyway.
-			if err := s.ReplaceIssueItemsBySections(ctx, issueID, issueItems); err != nil {
-				fmt.Printf("[WARN] replace issue items after infocard: %v\n", err)
+				// Persist the mutated items (now with image markdown at top).
+				// v1.0.1: per-section 语义 (同上).
+				// A store failure here is non-fatal — HTML is re-rendered from
+				// the in-memory slice below anyway.
+				if err := s.ReplaceIssueItemsBySections(ctx, issueID, issueItems); err != nil {
+					fmt.Printf("[WARN] replace issue items after infocard: %v\n", err)
+				}
 			}
 		}
-	}
 	} // end of: if gf.noImages { ... } else { ... }
 
 	// --- 10c. Defensive scrub of any media markdown from BodyMD ---------
@@ -999,6 +999,7 @@ func ingestAll(ctx context.Context, s store.Store, domainID string, perSourceTim
 	}
 
 	type result struct {
+		sourceID   int64 // v1.0.1 Phase 1.3: for source_health recording
 		sourceName string
 		items      []*store.RawItem
 		err        error
@@ -1022,7 +1023,7 @@ func ingestAll(ctx context.Context, s store.Store, domainID string, perSourceTim
 			adapter, err := ingest.Build(row)
 			if err != nil {
 				mu.Lock()
-				results = append(results, result{sourceName: row.Name, err: fmt.Errorf("build: %w", err)})
+				results = append(results, result{sourceID: row.ID, sourceName: row.Name, err: fmt.Errorf("build: %w", err)})
 				mu.Unlock()
 				return
 			}
@@ -1032,7 +1033,7 @@ func ingestAll(ctx context.Context, s store.Store, domainID string, perSourceTim
 
 			items, err := adapter.Fetch(subCtx)
 			mu.Lock()
-			results = append(results, result{sourceName: row.Name, items: items, err: err})
+			results = append(results, result{sourceID: row.ID, sourceName: row.Name, items: items, err: err})
 			mu.Unlock()
 		}(src)
 	}
@@ -1043,11 +1044,19 @@ func ingestAll(ctx context.Context, s store.Store, domainID string, perSourceTim
 		if r.err != nil {
 			stats.failed++
 			fmt.Printf("[WARN] ingest %s: %v\n", r.sourceName, r.err)
+			// v1.0.1 Phase 1.3: record failure (best-effort, don't block).
+			if err := s.UpsertSourceHealth(ctx, r.sourceID, false, r.err.Error(), 0); err != nil {
+				fmt.Printf("[WARN] source_health upsert %s: %v\n", r.sourceName, err)
+			}
 			continue
 		}
 		stats.ok++
 		fmt.Printf("[ingest] %s → %d items\n", r.sourceName, len(r.items))
 		allItems = append(allItems, r.items...)
+		// v1.0.1 Phase 1.3: record success.
+		if err := s.UpsertSourceHealth(ctx, r.sourceID, true, "", len(r.items)); err != nil {
+			fmt.Printf("[WARN] source_health upsert %s: %v\n", r.sourceName, err)
+		}
 	}
 
 	return allItems, stats, nil

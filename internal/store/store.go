@@ -112,4 +112,16 @@ type Store interface {
 	// Delivery
 	InsertDelivery(ctx context.Context, delivery *Delivery) error
 	ListDeliveries(ctx context.Context, issueID int64) ([]*Delivery, error)
+
+	// SourceHealth — per-source ingest outcome tracking (v1.0.1 Phase 1.3).
+	//
+	// UpsertSourceHealth records one ingest result. When success=true,
+	// last_success_at is set to NOW, consecutive_failures reset to 0.
+	// When success=false, last_error_at set, consecutive_failures += 1
+	// (the helper reads the old row and increments in-Go to avoid SQL
+	// counter acrobatics).
+	UpsertSourceHealth(ctx context.Context, sourceID int64, success bool, errorText string, itemCount int) error
+	// ListSourceHealth returns all health rows joined to sources table.
+	// Intended for `briefing status --sources` operator view.
+	ListSourceHealth(ctx context.Context) ([]*SourceHealth, error)
 }
