@@ -90,7 +90,10 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 		Model:       cfg.LLM.Model,
 		Temperature: 0.4,
 		Timeout:     180 * time.Second,
-		MaxRetries:  3,
+		// v1.0.1 Phase 4.5 (W4): 对齐日报 LLM retry 策略. MaxRetries 从 3 涨到
+		// 5, RetryBackoffSeconds 从 ai.yaml llm.retry_backoff_seconds 读取.
+		MaxRetries:          5,
+		RetryBackoffSeconds: cfg.LLM.RetryBackoffSeconds,
 	}
 	result, err := generate.GenerateWeekly(ctx, weeklyCfg, startDate, endDate, bundles)
 	if err != nil {

@@ -21,6 +21,10 @@ type WeeklyConfig struct {
 	Temperature float64
 	Timeout     time.Duration
 	MaxRetries  int
+	// v1.0.1 Phase 4.5 (W4): 对齐日报 openai.go 的 retry 策略 —— 分钟级
+	// 指数退避, 从 ai.yaml llm.retry_backoff_seconds 读取. 长度决定有效
+	// attempts, 空则 fallback 到 [10,30,90,180,300].
+	RetryBackoffSeconds []int
 }
 
 func (c *WeeklyConfig) fillDefaults() {
@@ -31,7 +35,10 @@ func (c *WeeklyConfig) fillDefaults() {
 		c.Timeout = 180 * time.Second
 	}
 	if c.MaxRetries <= 0 {
-		c.MaxRetries = 3
+		c.MaxRetries = 5
+	}
+	if len(c.RetryBackoffSeconds) == 0 {
+		c.RetryBackoffSeconds = []int{10, 30, 90, 180, 300}
 	}
 }
 
@@ -96,15 +103,40 @@ func GenerateWeekly(ctx context.Context, cfg WeeklyConfig, startDate, endDate ti
 		BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: cfg.Model,
 		Temperature: cfg.Temperature, MaxTokens: 16384, Timeout: cfg.Timeout,
 	}
+	// v1.0.1 Phase 4.5 (W4): LLM retry 分钟级退避, 对齐日报 openai.go 行为.
+	// 网络/API transport error 等 backoff 后重试; JSON parse error 不等, 直
+	// 接下一次 (LLM 能回但格式错, 下次可能就对了).
+	backoffs := cfg.RetryBackoffSeconds
+	if len(backoffs) == 0 {
+		backoffs = []int{10, 30, 90, 180, 300}
+	}
+	maxAttempts := cfg.MaxRetries
+	if maxAttempts > len(backoffs) {
+		maxAttempts = len(backoffs)
+	}
+	if maxAttempts == 0 {
+		maxAttempts = len(backoffs)
+	}
+
 	var lastErr error
-	for attempt := 1; attempt <= cfg.MaxRetries; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		raw, err := llm.ChatComplete(ctx, hc, llmCfg, weeklySystemPrompt, userPrompt)
 		if err != nil {
+			// transport error → backoff 等待后重试
 			lastErr = err
+			if attempt < maxAttempts {
+				backoff := time.Duration(backoffs[attempt-1]) * time.Second
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(backoff):
+				}
+			}
 			continue
 		}
 		result, perr := parseWeeklyJSON(raw)
 		if perr != nil {
+			// parse error 不 backoff (LLM 能回, 下一次 temperature jitter 可能就对)
 			lastErr = perr
 			continue
 		}
