@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"briefing-v3/internal/config"
+	"briefing-v3/internal/gate"
 	"briefing-v3/internal/generate"
 	"briefing-v3/internal/infocard"
 	"briefing-v3/internal/render"
@@ -127,6 +128,41 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 		return fmt.Errorf("upsert weekly: %w", err)
 	}
 	stage(fmt.Sprintf("weekly: persisted to DB (id=%d)", weeklyID))
+
+	// --- gate 质量检查 (v1.0.1 Phase 4.5 W6+W3) ---
+	// 三态判断, 跟日报 run.go:866-892 完全对齐:
+	//   Pass → 正常推 test+prod (BRIEFING_MODE=debug 时只推 test, W5 守卫)
+	//   Warn → 推 test+prod 但加"质量待审"前缀 alert
+	//   Fail → 不推 prod, 仅 alert 到 test, return contentFail 让外层退出
+	report := gate.CheckWeekly(weekly, len(dailyIssues), nil)
+	stage(fmt.Sprintf("weekly gate: pass=%v warn=%v focus=%d trends=%d takeaway=%d dailyIssues=%d banned=%d",
+		report.Pass, report.Warn,
+		report.FocusChars, report.TrendsChars, report.TakeawayChars,
+		report.DailyIssueCount, len(report.BannedHits)))
+
+	if !report.Pass {
+		if report.Warn {
+			for _, w := range report.Warnings {
+				fmt.Printf("[WEEKLY GATE WARN] %s\n", w)
+			}
+			stage("weekly gate: warn state — 继续推送但发 alert 标记质量待审")
+			if !gf.dryRun {
+				alertMsg := buildWeeklyGateAlert(weekly, report)
+				alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
+				_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
+			}
+		} else {
+			for _, reason := range report.Reasons {
+				fmt.Printf("[WEEKLY GATE FAIL] %s\n", reason)
+			}
+			if !gf.dryRun {
+				alertMsg := buildWeeklyGateAlert(weekly, report)
+				alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
+				_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
+			}
+			return fmt.Errorf("weekly gate hard fail: %s", gate.WeeklyFailureDetail(report))
+		}
+	}
 
 	// --- dry-run: print and exit ---
 	if gf.dryRun {
@@ -578,4 +614,35 @@ func hugoBuildf(ctx context.Context, hugoBin, siteDir string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// buildWeeklyGateAlert formats a Slack plain-text alert for the test channel
+// when weekly gate state != Pass. 复用日报 buildGateFailAlert (run.go:2037) 的
+// 风格: 表情区分 warn vs hard-fail, 简短说明量化指标和原因.
+func buildWeeklyGateAlert(w *store.WeeklyIssue, r *gate.WeeklyReport) string {
+	var b strings.Builder
+	weekLabel := fmt.Sprintf("%d-W%02d", w.Year, w.Week)
+	if r.Warn {
+		fmt.Fprintf(&b, "⚠️ briefing-v3 周报 %s 质量待审, 已同步正式频道\n", weekLabel)
+	} else {
+		fmt.Fprintf(&b, "🚨 briefing-v3 周报 %s 质量不达标, 正式频道已跳过\n", weekLabel)
+	}
+	fmt.Fprintf(&b, "• 本周日报 %d 份 | Focus %d 字 | Trends %d 字 | Takeaway %d 字\n",
+		r.DailyIssueCount, r.FocusChars, r.TrendsChars, r.TakeawayChars)
+	if len(r.BannedHits) > 0 {
+		fmt.Fprintf(&b, "• 命中 banned pattern: %s\n", strings.Join(r.BannedHits, ", "))
+	}
+	if len(r.Reasons) > 0 {
+		b.WriteString("硬 fail 原因:\n")
+		for _, x := range r.Reasons {
+			fmt.Fprintf(&b, "  - %s\n", x)
+		}
+	}
+	if len(r.Warnings) > 0 {
+		b.WriteString("软 warn 原因:\n")
+		for _, x := range r.Warnings {
+			fmt.Fprintf(&b, "  - %s\n", x)
+		}
+	}
+	return b.String()
 }
