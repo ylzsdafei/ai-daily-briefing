@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -248,6 +249,16 @@ func (g *openaiGenerator) GenerateInsight(ctx context.Context, in *Input) (*stor
 			attempts, strings.Join(lastReasons, "; "))
 	}
 
+	// v1.0.1 Phase 4.5 (N1): 保证 mermaid 关系图必出. LLM 偷懒不输出 mermaid 时用
+	// 规则化 graph LR 兜底, 让"行业洞察上方的关系图"永远有图. validator 只把
+	// missing mermaid 降为 warn 不 fail, 所以 LLM 能通过 validation 却不输出图;
+	// 这里在写入 DB 前补一个规则化 block 到 industryMD 开头, render.markdown 的
+	// mermaid extractor 会把它搬到"行业洞察"上方渲染.
+	if !mermaidBlockRegex.MatchString(industryMD + "\n" + ourMD) {
+		fallbackMermaid := ruleBasedMermaidDiagram(in)
+		industryMD = fallbackMermaid + "\n\n" + industryMD
+	}
+
 	return &store.IssueInsight{
 		IssueID:     in.Issue.ID,
 		IndustryMD:  industryMD,
@@ -257,6 +268,92 @@ func (g *openaiGenerator) GenerateInsight(ctx context.Context, in *Input) (*stor
 		RetryCount:  attempts,
 		GeneratedAt: time.Now(),
 	}, nil
+}
+
+// ruleBasedMermaidDiagram 用 summary 3 行 (或 items top titles 兜底) 拼一个简单的
+// graph LR mermaid 图. 节点文字取前 6-8 字保证不溢出画布, 主线 3 节点 + classDef
+// 蓝色着色, 符合 prompts.go:60-66 里对 mermaid 的格式要求.
+//
+// 不依赖 LLM, 100% 能产出, 是 N1 的兜底实现.
+func ruleBasedMermaidDiagram(in *Input) string {
+	labels := extractMermaidLabels(in)
+	return "```mermaid\n" +
+		"graph LR\n" +
+		fmt.Sprintf("A[%s] -->|带动| B[%s]\n", labels[0], labels[1]) +
+		fmt.Sprintf("B -->|延伸| C[%s]\n", labels[2]) +
+		"classDef blue fill:#dbeafe,stroke:#3b82f6,color:#111827\n" +
+		"class A,B,C blue\n" +
+		"```"
+}
+
+// extractMermaidLabels 提取 3 个节点 label (6-8 字) 给 mermaid 图用.
+// 策略: 优先用 Issue.Summary 的前 3 非空行每行截 6-8 字;
+// summary 不足时用 items 的前几个 title 兜底;
+// 都缺就 fallback 到静态默认 (保证永远返回 3 个非空 label).
+func extractMermaidLabels(in *Input) [3]string {
+	var labels [3]string
+	cur := 0
+
+	if in != nil && in.Issue != nil {
+		for _, line := range strings.Split(in.Issue.Summary, "\n") {
+			if cur >= 3 {
+				break
+			}
+			clean := mermaidLabelFrom(line)
+			if clean != "" {
+				labels[cur] = clean
+				cur++
+			}
+		}
+	}
+	if cur < 3 && in != nil {
+		for _, it := range in.Items {
+			if cur >= 3 || it == nil {
+				break
+			}
+			clean := mermaidLabelFrom(it.Title)
+			if clean != "" {
+				labels[cur] = clean
+				cur++
+			}
+		}
+	}
+	// 最后兜底: 静态词.
+	defaults := [3]string{"AI 新动态", "行业关联", "值得关注"}
+	for i := cur; i < 3; i++ {
+		labels[i] = defaults[i]
+	}
+	return labels
+}
+
+// mermaidLabelSeparatorRe 按标点切到第一个意义完整的短语. 不切空格
+// (中文/英文混写或 "OpenAI 扩展" 这种名词短语要保留).
+var mermaidLabelSeparatorRe = regexp.MustCompile(`[，,。；;、]`)
+
+// mermaidLabelFrom 从一句话中提炼 4-8 字节点 label. 去除 markdown 符号/引号,
+// 切到第一个分隔符, 截断过长.
+func mermaidLabelFrom(line string) string {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return ""
+	}
+	// 去 markdown 粗体/序号前缀.
+	s = strings.TrimLeft(s, "0123456789. -*#`_")
+	s = strings.ReplaceAll(s, "**", "")
+	s = strings.Trim(s, "*_ `'\"")
+	if s == "" {
+		return ""
+	}
+	// 切到第一个分隔符.
+	if idx := mermaidLabelSeparatorRe.FindStringIndex(s); idx != nil && idx[0] > 0 {
+		s = s[:idx[0]]
+	}
+	// 截 8 rune (CJK 显示合适).
+	rs := []rune(s)
+	if len(rs) > 8 {
+		rs = rs[:8]
+	}
+	return string(rs)
 }
 
 // promptForAttempt returns the (system, user, maxTokens) to use at the given
