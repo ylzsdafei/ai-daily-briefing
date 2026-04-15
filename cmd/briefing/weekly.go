@@ -172,7 +172,14 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 	}
 
 	// --- Slack publish ---
-	targetWantsProd := gf.target == "auto" || gf.target == "prod"
+	// v1.0.1 Phase 4.5 (W5): 跟日报 run.go:935-940 对齐, BRIEFING_MODE=debug
+	// 一律不推 prod 频道. 防止周报调试阶段误推正式频道 (用户原则"只 test 频道").
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("BRIEFING_MODE")))
+	wantsProdTarget := gf.target == "auto" || gf.target == "prod"
+	targetWantsProd := wantsProdTarget && mode == "prod"
+	if wantsProdTarget && mode != "prod" {
+		stage("weekly publish: BRIEFING_MODE=" + mode + ", skipping prod channel (仅 prod 模式推正式频道)")
+	}
 	// Build weekly page URL from BRIEFING_REPORT_URL_BASE.
 	weeklyPageURL := ""
 	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
