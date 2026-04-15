@@ -3,11 +3,128 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"briefing-v3/internal/gate"
 	"briefing-v3/internal/publish"
 	"briefing-v3/internal/store"
 )
+
+// TestExtractDateFromURL 验证 T18: filter 多角度时效性 — URL 路径日期解析
+// 覆盖 4 种主流格式 (TechCrunch/Substack/Simon Willison/arxiv).
+func TestExtractDateFromURL(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want time.Time
+		ok   bool
+	}{
+		{
+			name: "techcrunch_slash_format",
+			url:  "https://techcrunch.com/2026/04/13/openai-bought-hiro/",
+			want: time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC),
+			ok:   true,
+		},
+		{
+			name: "simonw_month_abbr",
+			url:  "https://simonwillison.net/2026/Apr/14/cybersecurity/",
+			want: time.Date(2026, 4, 14, 0, 0, 0, 0, time.UTC),
+			ok:   true,
+		},
+		{
+			name: "substack_dash",
+			url:  "https://example.substack.com/p/2026-04-15-claude-update/",
+			want: time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC),
+			ok:   true,
+		},
+		{
+			name: "arxiv_yymm",
+			url:  "https://arxiv.org/abs/2604.11465",
+			want: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+			ok:   true,
+		},
+		{
+			name: "arxiv_old_yymm",
+			url:  "https://arxiv.org/abs/2401.99999",
+			want: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+			ok:   true,
+		},
+		{
+			name: "no_date_in_url",
+			url:  "https://github.com/google/magika",
+			want: time.Time{},
+			ok:   false,
+		},
+		{
+			name: "invalid_month",
+			url:  "https://x.com/2026/13/05/post/",
+			want: time.Time{},
+			ok:   false,
+		},
+		{
+			name: "empty_url",
+			url:  "",
+			want: time.Time{},
+			ok:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := extractDateFromURL(tc.url)
+			if ok != tc.ok {
+				t.Fatalf("ok=%v want=%v (url %q)", ok, tc.ok, tc.url)
+			}
+			if ok && !got.Equal(tc.want) {
+				t.Errorf("got=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFilterByWindow_StrictPublishedAt 验证 T1: 零 PublishedAt 直接 drop,
+// 不再用 FetchedAt 兜底.
+func TestFilterByWindow_StrictPublishedAt(t *testing.T) {
+	cutoff := time.Date(2026, 4, 14, 0, 0, 0, 0, time.UTC)
+	items := []*store.RawItem{
+		{ID: 1, Title: "fresh", URL: "https://x.com/fresh", PublishedAt: cutoff.Add(2 * time.Hour), FetchedAt: cutoff.Add(2 * time.Hour)},
+		{ID: 2, Title: "stale", URL: "https://x.com/stale", PublishedAt: cutoff.Add(-25 * time.Hour), FetchedAt: cutoff.Add(2 * time.Hour)},
+		{ID: 3, Title: "unknown_pub_with_fetch", URL: "https://x.com/unknown", PublishedAt: time.Time{}, FetchedAt: cutoff.Add(2 * time.Hour)},
+	}
+	out := filterByWindow(items, cutoff)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 item passes (only 'fresh'), got %d: %v", len(out), out)
+	}
+	if out[0].Title != "fresh" {
+		t.Errorf("expected 'fresh', got %q", out[0].Title)
+	}
+}
+
+// TestFilterByWindow_URLDateSanityCheck 验证 T18: PublishedAt 看似新但 URL
+// 路径日期老于 cutoff → drop (catches RSS 重发旧文).
+func TestFilterByWindow_URLDateSanityCheck(t *testing.T) {
+	cutoff := time.Date(2026, 4, 14, 0, 0, 0, 0, time.UTC)
+	items := []*store.RawItem{
+		{
+			ID: 1, Title: "republished old article",
+			URL:         "https://techcrunch.com/2024/12/05/old-news/",
+			PublishedAt: cutoff.Add(2 * time.Hour),
+			FetchedAt:   cutoff.Add(2 * time.Hour),
+		},
+		{
+			ID: 2, Title: "real fresh article",
+			URL:         "https://techcrunch.com/2026/04/14/new-news/",
+			PublishedAt: cutoff.Add(2 * time.Hour),
+			FetchedAt:   cutoff.Add(2 * time.Hour),
+		},
+	}
+	out := filterByWindow(items, cutoff)
+	if len(out) != 1 {
+		t.Fatalf("URL date sanity should drop the 2024 article; got %d items: %v", len(out), out)
+	}
+	if out[0].Title != "real fresh article" {
+		t.Errorf("expected 'real fresh article' to survive, got %q", out[0].Title)
+	}
+}
 
 func TestGateFailureBlocksRun(t *testing.T) {
 	t.Parallel()

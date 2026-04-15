@@ -149,8 +149,8 @@ func RenderMarkdown(issue *store.Issue, items []*store.IssueItem, insight *store
 	if mermaidBlock := mermaidBlockRe.FindString(combined); mermaidBlock != "" {
 		b.WriteString(mermaidBlock)
 		b.WriteString("\n\n")
-		industryMD = strings.TrimSpace(mermaidBlockRe.ReplaceAllString(industryMD, ""))
-		ourMD = strings.TrimSpace(mermaidBlockRe.ReplaceAllString(ourMD, ""))
+		industryMD = strings.TrimSpace(StripMermaidBlocks(industryMD))
+		ourMD = strings.TrimSpace(StripMermaidBlocks(ourMD))
 	}
 
 	if industryMD != "" {

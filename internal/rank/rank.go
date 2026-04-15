@@ -70,18 +70,26 @@ func (c *Config) fillDefaults() {
 
 // RankedItem carries the original RawItem plus the LLM's verdict.
 //
-// v1.0.1 Phase 4.1: WeightedScore = Score × sourcePriorityWeight, used as
-// the actual sort key. Score (raw LLM 0-10) is preserved for debugging /
-// display. sourcePriorityWeight = 0.5 + priority/10.0 (priority 0-10):
+// v1.0.1 Phase 4.1: WeightedScore = Score × sourcePriorityWeight.
+// v1.0.1 Phase 4.2: WeightedScore also multiplied by signalBoost, where
+// signalBoost = 1 + 0.2*(signalStrength-1), capped at 2.0 (ss >= 6).
 //
-//	priority=10 → weight 1.5 (权威源上浮)
-//	priority=5  → weight 1.0 (中性)
-//	priority=0  → weight 0.5 (未设默认降权)
+// Full formula (used as sort key):
+//
+//	WeightedScore = Score × priorityWeight × signalBoost
+//
+// With:
+//
+//	priorityWeight = 0.5 + priority/10.0   (priority 0-10)
+//	signalBoost    = min(1 + 0.2*(ss-1), 2.0)   (ss = distinct sources)
+//
+// Score (raw LLM 0-10) and SignalStrength are preserved for debug logging.
 type RankedItem struct {
-	Item          *store.RawItem
-	Score         float64 // raw LLM 0-10
-	WeightedScore float64 // Score × priorityWeight (used for sort)
-	Reason        string
+	Item           *store.RawItem
+	Score          float64 // raw LLM 0-10
+	WeightedScore  float64 // Score × priorityWeight × signalBoost (used for sort)
+	SignalStrength int     // v1.0.1 Phase 4.2: distinct source hosts on same story
+	Reason         string
 }
 
 // Ranker is the public interface: score a batch of RawItems and return a
@@ -256,14 +264,16 @@ func (r *llmRanker) Rank(
 		if v.Score < r.cfg.MinScore {
 			continue
 		}
-		// v1.0.1 Phase 4.1: 计算 priority-weighted score
+		// v1.0.1 Phase 4.1: priority weight; Phase 4.2: signal-strength boost.
 		item := byID[id]
-		weight := priorityWeight(sourcePriorities, item.SourceID)
+		pw := priorityWeight(sourcePriorities, item.SourceID)
+		sb := signalBoost(item.SignalStrength)
 		ranked = append(ranked, &RankedItem{
-			Item:          item,
-			Score:         v.Score,
-			WeightedScore: v.Score * weight,
-			Reason:        strings.TrimSpace(v.Reason),
+			Item:           item,
+			Score:          v.Score,
+			WeightedScore:  v.Score * pw * sb,
+			SignalStrength: item.SignalStrength,
+			Reason:         strings.TrimSpace(v.Reason),
 		})
 	}
 
@@ -322,6 +332,31 @@ func priorityWeight(sourcePriorities map[int64]int, sourceID int64) float64 {
 		p = 10
 	}
 	return 0.5 + float64(p)/10.0
+}
+
+// signalBoost maps signal_strength (distinct source hosts on same story) to
+// a multiplier. v1.0.1 Phase 4.2.
+//
+// Formula: boost = min(1 + 0.2*(ss-1), 2.0)
+//
+//	ss = 0 or 1 → 1.0 (no boost, 单源)
+//	ss = 2      → 1.2 (两个源共振)
+//	ss = 3      → 1.4
+//	ss = 5      → 1.8
+//	ss ≥ 6      → 2.0 (cap, 防止被少数热点吞掉长尾位置)
+//
+// cap=2.0 的原因: 单纯多源报道不足以让一条 7 分的内容压过另一条 10 分权威
+// 内容 (7 × 1.5 × 2.0 = 21.0 vs 10 × 1.5 × 1.0 = 15.0 — 即使这样热点还是
+// 赢, 但不是无限赢). 如果发现共振信号还不够强, 再上调系数.
+func signalBoost(signalStrength int) float64 {
+	if signalStrength <= 1 {
+		return 1.0
+	}
+	b := 1.0 + 0.2*float64(signalStrength-1)
+	if b > 2.0 {
+		b = 2.0
+	}
+	return b
 }
 
 // applyPerCategoryQuota walks a score-sorted ranked slice, groups items

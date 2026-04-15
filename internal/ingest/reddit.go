@@ -16,9 +16,15 @@ import (
 // "reddit_json". url is any subreddit listing endpoint, e.g.
 // https://www.reddit.com/r/MachineLearning/hot.json. limit bounds how many
 // of the returned children are converted to RawItem.
+//
+// v1.0.1 Phase 4.4: MinScore 过滤低质量 reddit 帖子. Reddit 的 "score" 是
+// upvote-downvote 净值, r/MachineLearning / r/LocalLLaMA 的正经内容通常
+// >=50, 偶尔新帖低分不代表必然水文 (默认 0 = 不过滤); 对信噪比高的订阅
+// 源建议设置 50 起.
 type redditConfig struct {
-	URL   string `json:"url"`
-	Limit int    `json:"limit"`
+	URL      string `json:"url"`
+	Limit    int    `json:"limit"`
+	MinScore int    `json:"min_score"`
 }
 
 // redditListing partially models the /r/XXX/hot.json response.
@@ -128,6 +134,10 @@ func (s *redditSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
 		// Skip pinned subreddit announcements and NSFW threads — neither
 		// contribute meaningful AI news signal.
 		if d.Stickied || d.Over18 {
+			continue
+		}
+		// v1.0.1 Phase 4.4: 过滤低分帖, 提升 social section 信噪比.
+		if s.cfg.MinScore > 0 && d.Score < s.cfg.MinScore {
 			continue
 		}
 		title := strings.TrimSpace(d.Title)

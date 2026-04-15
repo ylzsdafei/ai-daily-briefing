@@ -15,8 +15,14 @@ import (
 
 // ossinsightConfig is the JSON shape stored in Source.ConfigJSON for type
 // "ossinsight". It defaults to the public trends/repos endpoint.
+//
+// v1.0.1 Phase 4.5 (T3): Period 控制 trending 时间窗口, 直接使用 ossinsight
+// 服务端的 ?period= 参数, 让"近期热门/涨星最快"语义由 API 端保证.
+// 取值: past_24_hours | past_week | past_month. 默认 past_week.
+// 用户原则: opensource section 看人气和影响力, 不限 repo 创建时间.
 type ossinsightConfig struct {
-	URL string `json:"url"`
+	URL    string `json:"url"`
+	Period string `json:"period"`
 }
 
 // ossinsightResponse models the shape returned by
@@ -63,6 +69,9 @@ func newOssInsightSource(row *store.Source) (Source, error) {
 	if cfg.URL == "" {
 		cfg.URL = "https://api.ossinsight.io/v1/trends/repos"
 	}
+	if cfg.Period == "" {
+		cfg.Period = "past_week"
+	}
 	return &ossinsightSource{
 		row: row,
 		cfg: cfg,
@@ -75,7 +84,16 @@ func (s *ossinsightSource) Type() string { return s.row.Type }
 func (s *ossinsightSource) Name() string { return s.row.Name }
 
 func (s *ossinsightSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.URL, nil)
+	// v1.0.1 Phase 4.5 (T3): 用 ossinsight 服务端 period 参数控制时间窗口.
+	url := s.cfg.URL
+	if s.cfg.Period != "" {
+		sep := "?"
+		if strings.Contains(url, "?") {
+			sep = "&"
+		}
+		url += sep + "period=" + s.cfg.Period
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("ossinsight: new request: %w", err)
 	}

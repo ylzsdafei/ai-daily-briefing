@@ -233,6 +233,13 @@ func countSlackNumberedItems(text string) int {
 
 var mermaidBlockRe = regexp.MustCompile("(?s)```mermaid\\s*\n(.+?)```")
 
+// insightMapHeadingRe 清除 LLM 按 prompt 输出的 "🗺️ 今日关系图" 小标题.
+// LLM prompt 要求把 mermaid 放在 insight 尾部, render 会把 mermaid 块移到
+// 洞察上方作为导读 — 但 heading 留在原处就成了"空标题孤儿"(markdown 和
+// Slack 都会显示一行"🗺️ 今日关系图"后面什么都没有). 这里把 heading 连
+// 同前后空行一起吃掉.
+var insightMapHeadingRe = regexp.MustCompile(`(?m)^[ \t]*#{0,6}[ \t]*🗺️[^\n]*关系图[^\n]*\n?`)
+
 // ExtractMermaidCode finds the first mermaid code block in text and returns
 // the raw mermaid source (without fences). Returns "" if none found.
 func ExtractMermaidCode(text string) string {
@@ -255,9 +262,14 @@ func MermaidInkURL(code string) string {
 
 // StripMermaidBlocks removes all ```mermaid ... ``` blocks from text,
 // used to clean insight text before sending to Slack (where raw mermaid
-// code would display as gibberish).
+// code would display as gibberish). Also strips the "🗺️ 今日关系图"
+// heading line that the LLM prompt asks for — render moves the mermaid
+// diagram itself to the top as a visual intro, and leaving the heading
+// behind produces an empty "关系图" section in both markdown and Slack.
 func StripMermaidBlocks(text string) string {
-	return mermaidBlockRe.ReplaceAllString(text, "")
+	text = mermaidBlockRe.ReplaceAllString(text, "")
+	text = insightMapHeadingRe.ReplaceAllString(text, "")
+	return text
 }
 
 // TruncateAtSentence cuts text to fit within maxRunes, always ending at

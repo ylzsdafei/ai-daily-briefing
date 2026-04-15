@@ -188,6 +188,24 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		}
 	}
 
+	// --- 4c. Signal strength (v1.0.1 Phase 4.2) ------------------------
+	// 标题相似度聚合 → 每个 item 标记 "有多少个不同源在报道这件事".
+	// 为后续 rank 阶段加权做准备 (多源共振的新闻上浮).
+	ssDist := ingest.CalculateSignalStrength(filtered)
+	if len(ssDist) > 0 {
+		multi := 0
+		maxSS := 1
+		for ss, cnt := range ssDist {
+			if ss > 1 {
+				multi += cnt
+			}
+			if ss > maxSS {
+				maxSS = ss
+			}
+		}
+		stage(fmt.Sprintf("signal_strength: %d items signal>1 (max=%d, distribution=%v)", multi, maxSS, ssDist))
+	}
+
 	// --- 5a. Build sourceID → category map for rank + classify ---------
 	// v1.0.0 INTERFACE CHANGE (T2/C-stage): rank + classify now take a
 	// sourceCategories map so they can apply per-category quota and
@@ -319,6 +337,9 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		if len(filtered2) > len(filtered) {
 			stage(fmt.Sprintf("extended filter: %d items in %dh (vs %d in %dh)",
 				len(filtered2), cfg.Window.ExtendedHours, len(filtered), cfg.Window.LookbackHours))
+			// v1.0.1 Phase 4.2: extended path 也要算 signal_strength, 否则
+			// filtered2 里 item.SignalStrength 还是 0 (拿不到共振加权).
+			_ = ingest.CalculateSignalStrength(filtered2)
 			if ranked2, rerr := ranker.Rank(ctx, filtered2, sourceCategories, sourcePriorities); rerr != nil {
 				stage(fmt.Sprintf("extended rank: failed (%v) — keeping original classify result", rerr))
 			} else {
@@ -850,7 +871,8 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			stage("gate: warn state — continuing to publish with quality marker")
 			// 发一条 alert 到 test 频道, 标注这条早报是 "质量待审".
 			// 不阻塞发送 (warn 状态下文字产物仍齐全, 只是数量/多样性偏低).
-			if shouldPostGateAlert(report) {
+			// v1.0.1 Phase 4.5 (T6): dry-run 不发告警, 防开发期污染 test 频道.
+			if !gf.dryRun && shouldPostGateAlert(report) {
 				alertMsg := buildGateFailAlert(issue, report)
 				alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
 				_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
@@ -863,9 +885,12 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			// Batch 2.19: 主动 POST 到 test webhook, 不依赖 systemd OnFailure
 			// (2026-04-14 故障证明 OnFailure 不可靠 — 因为 Bug B 让 exit=0).
 			// orchestrator.sh 看到 exit 3 也会兜底再发一条, 这是双保险.
-			alertMsg := buildGateFailAlert(issue, report)
-			alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
-			_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
+			// v1.0.1 Phase 4.5 (T6): dry-run 不发告警, 防开发期污染 test 频道.
+			if !gf.dryRun {
+				alertMsg := buildGateFailAlert(issue, report)
+				alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
+				_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
+			}
 			// 返回 contentFail (exit 3), 让 orchestrator 去走下一次 Attempt.
 			return contentFail(fmt.Errorf("gate hard fail (文字产物缺失): %s", gateFailureDetail(report)))
 		}
@@ -1064,6 +1089,83 @@ func ingestAll(ctx context.Context, s store.Store, domainID string, perSourceTim
 	return allItems, stats, nil
 }
 
+// urlDateReSlash matches /YYYY/MM/DD/ in URL paths (TechCrunch / Substack /
+// Wired / NYT 多数 news 站都是这种结构). Matches /2026/04/14/.
+var urlDateReSlash = regexp.MustCompile(`/(\d{4})/(\d{1,2})/(\d{1,2})/`)
+
+// urlDateReSlashEN matches /YYYY/Mon/DD/ where Mon is 3-letter month
+// abbreviation (Simon Willison's site uses this: /2026/Apr/14/).
+var urlDateReSlashEN = regexp.MustCompile(`/(\d{4})/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*/(\d{1,2})/`)
+
+// urlDateReDash matches /YYYY-MM-DD- in URL paths (some Substack/blog slugs).
+var urlDateReDash = regexp.MustCompile(`[/-](\d{4})-(\d{1,2})-(\d{1,2})[/-]`)
+
+// urlDateReArxiv matches arxiv-style YYMM.NNNNN (year encoded in first 2
+// digits of YY, month in next 2). E.g. 2604.11465 = 2026-04 paper.
+var urlDateReArxiv = regexp.MustCompile(`/abs/(\d{2})(\d{2})\.\d{3,6}`)
+
+var urlDateMonthMap = map[string]int{
+	"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+	"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+// extractDateFromURL inspects a URL path for embedded publication dates.
+// Returns (date, true) on success, (zero, false) on failure. The date is set
+// to 00:00 UTC of the matched day.
+//
+// v1.0.1 Phase 4.5 (T18): 时效性校验 Layer 2 — URL 路径里的日期通常是真实
+// 发布日期, 比 RSS pubDate 更难造假 (RSS 重发可能改 pubDate 但 URL 不会改).
+// 用作 filter sanity check, 避免 RSS 重发的旧文混入 24h 窗口.
+func extractDateFromURL(rawURL string) (time.Time, bool) {
+	if rawURL == "" {
+		return time.Time{}, false
+	}
+	now := time.Now().UTC()
+	validYear := func(y int) bool { return y >= 2000 && y <= now.Year()+1 }
+	validMonth := func(m int) bool { return m >= 1 && m <= 12 }
+	validDay := func(d int) bool { return d >= 1 && d <= 31 }
+
+	// Strategy 1: /YYYY/MM/DD/
+	if m := urlDateReSlash.FindStringSubmatch(rawURL); len(m) == 4 {
+		year, _ := strconv.Atoi(m[1])
+		mn, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		if validYear(year) && validMonth(mn) && validDay(day) {
+			return time.Date(year, time.Month(mn), day, 0, 0, 0, 0, time.UTC), true
+		}
+	}
+	// Strategy 2: /YYYY/Mon/DD/
+	if m := urlDateReSlashEN.FindStringSubmatch(strings.ToLower(rawURL)); len(m) == 4 {
+		year, _ := strconv.Atoi(m[1])
+		mn := urlDateMonthMap[m[2][:3]]
+		day, _ := strconv.Atoi(m[3])
+		if validYear(year) && validMonth(mn) && validDay(day) {
+			return time.Date(year, time.Month(mn), day, 0, 0, 0, 0, time.UTC), true
+		}
+	}
+	// Strategy 3: /YYYY-MM-DD-
+	if m := urlDateReDash.FindStringSubmatch(rawURL); len(m) == 4 {
+		year, _ := strconv.Atoi(m[1])
+		mn, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		if validYear(year) && validMonth(mn) && validDay(day) {
+			return time.Date(year, time.Month(mn), day, 0, 0, 0, 0, time.UTC), true
+		}
+	}
+	// Strategy 4: arxiv YYMM.NNNNN (e.g. 2604.11465 = 2026-04)
+	if m := urlDateReArxiv.FindStringSubmatch(rawURL); len(m) == 3 {
+		yy, _ := strconv.Atoi(m[1])
+		mn, _ := strconv.Atoi(m[2])
+		// arxiv YY is 2-digit (00-99 → 2000-2099 reasonable).
+		year := 2000 + yy
+		if validYear(year) && validMonth(mn) {
+			// Day defaults to 1st of the month — arxiv id doesn't encode day.
+			return time.Date(year, time.Month(mn), 1, 0, 0, 0, 0, time.UTC), true
+		}
+	}
+	return time.Time{}, false
+}
+
 // Regexes used by extractDateFromText to recover a real publication date
 // from adapter output when the upstream source embedded the date in the
 // title or body instead of a machine-readable field.
@@ -1164,15 +1266,22 @@ func filterByWindow(items []*store.RawItem, cutoff time.Time) []*store.RawItem {
 			}
 		}
 
-		ts := it.PublishedAt
-		if ts.IsZero() {
-			ts = it.FetchedAt
-		}
-		if ts.IsZero() {
+		// v1.0.1 Phase 4.5 (2026-04-15): 严格 24h 关口.
+		// 之前用 FetchedAt 兜底 — 会把 adapter 没填 pubDate 的老文章当成
+		// "刚抓到所以肯定新" 放行. 用户明确要求 "严格执行 24h 内的时效性
+		// 关口", 所以 PublishedAt 必须由 adapter 显式给出, 否则 drop.
+		if it.PublishedAt.IsZero() {
 			droppedUnknown++
 			continue
 		}
-		if ts.Before(cutoff) {
+		if it.PublishedAt.Before(cutoff) {
+			droppedStale++
+			continue
+		}
+		// v1.0.1 Phase 4.5 (T18): URL 路径日期 sanity check.
+		// RSS pubDate 可能被重发覆盖 (TechCrunch 重发 2024 旧文却标 2026),
+		// URL 路径里的日期是首发时刻, 更可信. 任一不在 24h 内 → drop.
+		if urlDate, ok := extractDateFromURL(it.URL); ok && urlDate.Before(cutoff) {
 			droppedStale++
 			continue
 		}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,13 +114,18 @@ func (s *anthropicSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
 			title = humanizeSlug(slug)
 		}
 
+		// v1.0.1 Phase 4.5 (T4): 解析卡片附近的 <time class="...date..."> 元素
+		// 拿真实发布日期 (例如 "Apr 14, 2026"). 之前用 now 兜底, 让老 news
+		// 当 24h 内. 解析失败 → IsZero 让 filter drop, 不抛错不阻塞 pipeline.
+		published := extractAnthropicDate(a)
+
 		items = append(items, &store.RawItem{
 			DomainID:    s.row.DomainID,
 			SourceID:    s.row.ID,
 			ExternalID:  slug,
 			URL:         "https://www.anthropic.com/news/" + slug,
 			Title:       title,
-			PublishedAt: now, // detail-page crawl in v1.1 will set real dates
+			PublishedAt: published,
 			FetchedAt:   now,
 			Content:     "", // v1.1: follow link and scrape body/summary
 		})
@@ -128,6 +135,71 @@ func (s *anthropicSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
 		return nil, fmt.Errorf("anthropic_news: no /news/ links found at %s", s.cfg.URL)
 	}
 	return items, nil
+}
+
+// anthropicDateRe matches anthropic listing's date format like "Apr 14, 2026".
+// They use 3-letter month + day + year on every news card.
+var anthropicDateRe = regexp.MustCompile(`(?i)(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2}),?\s+(\d{4})`)
+
+var anthropicMonthMap = map[string]time.Month{
+	"jan": time.January, "feb": time.February, "mar": time.March,
+	"apr": time.April, "may": time.May, "jun": time.June,
+	"jul": time.July, "aug": time.August, "sep": time.September,
+	"oct": time.October, "nov": time.November, "dec": time.December,
+}
+
+// extractAnthropicDate finds the publication date for a news card by walking
+// up the DOM from the <a> element looking for a <time> element with a class
+// containing "date". Returns IsZero on failure (caller's filter will drop).
+//
+// Strategy: search up to 4 ancestor levels for a sibling/descendant <time>,
+// extract the date text ("Apr 14, 2026"), parse via regex.
+func extractAnthropicDate(a *goquery.Selection) time.Time {
+	scope := a
+	for i := 0; i < 4; i++ {
+		var found string
+		scope.Find("time").EachWithBreak(func(_ int, t *goquery.Selection) bool {
+			cls, _ := t.Attr("class")
+			if !strings.Contains(strings.ToLower(cls), "date") {
+				return true
+			}
+			txt := strings.TrimSpace(t.Text())
+			if txt != "" {
+				found = txt
+				return false
+			}
+			return true
+		})
+		if found != "" {
+			if t, ok := parseAnthropicDateText(found); ok {
+				return t
+			}
+		}
+		parent := scope.Parent()
+		if parent.Length() == 0 {
+			break
+		}
+		scope = parent
+	}
+	return time.Time{}
+}
+
+// parseAnthropicDateText parses "Apr 14, 2026" → time.Time at 00:00 UTC.
+func parseAnthropicDateText(s string) (time.Time, bool) {
+	m := anthropicDateRe.FindStringSubmatch(s)
+	if len(m) != 4 {
+		return time.Time{}, false
+	}
+	mon, ok := anthropicMonthMap[strings.ToLower(m[1])[:3]]
+	if !ok {
+		return time.Time{}, false
+	}
+	day, _ := strconv.Atoi(m[2])
+	year, _ := strconv.Atoi(m[3])
+	if year < 2000 || year > 2100 || day < 1 || day > 31 {
+		return time.Time{}, false
+	}
+	return time.Date(year, mon, day, 0, 0, 0, 0, time.UTC), true
 }
 
 // extractAnthropicSlug returns the trailing segment of /news/{slug}, or

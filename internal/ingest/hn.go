@@ -18,9 +18,14 @@ import (
 //
 // URL defaults to the HackerNews firebase topstories endpoint. TopN bounds
 // how many IDs are hydrated to full items (each is one extra HTTP call).
+//
+// v1.0.1 Phase 4.4: MinPoints 过滤低分 HN 帖子. Front-page 一般 >=100, 偶
+// 有爆款 200+ / 500+; 设 100 能有效剔除刚进 top30 但社区投票不足的试探帖.
+// 0 = 不过滤 (默认, 保留 v1.0.0 行为).
 type hnConfig struct {
-	URL  string `json:"url"`
-	TopN int    `json:"top_n"`
+	URL       string `json:"url"`
+	TopN      int    `json:"top_n"`
+	MinPoints int    `json:"min_points"`
 }
 
 // hnItem is a subset of the HackerNews firebase item schema. Only fields we
@@ -94,6 +99,10 @@ func (s *hnSource) Fetch(ctx context.Context) ([]*store.RawItem, error) {
 		}
 		// Only keep front-page "story" items.
 		if it.Type != "" && it.Type != "story" {
+			continue
+		}
+		// v1.0.1 Phase 4.4: 过滤低分 HN 帖子.
+		if s.cfg.MinPoints > 0 && it.Score < s.cfg.MinPoints {
 			continue
 		}
 		title := strings.TrimSpace(it.Title)

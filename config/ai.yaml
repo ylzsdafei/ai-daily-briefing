@@ -289,6 +289,10 @@ sources:
     category: project
     name: "GitHub Trending (via ossinsight)"
     url: "https://api.ossinsight.io/v1/trends/repos"
+    # v1.0.1 Phase 4.5 (T3): period 控制时间窗口 — 用户原则 "看人气和影响力,
+    # 不只看创建时间". past_week 收 7 天涨星最快, 让 Seedance 2.0 这种"老项
+    # 目+大版本→trending"自然出现. 选项: past_24_hours / past_week / past_month.
+    period: past_week
     enabled: true
     priority: 10
 
@@ -397,6 +401,10 @@ sources:
     name: "HackerNews Top Stories"
     url: "https://hacker-news.firebaseio.com/v0/topstories.json"
     top_n: 30
+    # v1.0.1 Phase 4.4: 过滤低分 HN 帖子. 100 分是经验阈值 (front-page 常见
+    # 200+, 刚冒头的试探帖 <=50), 0 = 不过滤. 打开后能剔掉 social section
+    # 里那种"HN 榜单位置靠前但其实没几个 upvote 的凑数帖".
+    min_points: 100
     enabled: true
     priority: 8
 
@@ -407,6 +415,8 @@ sources:
     name: "r/MachineLearning"
     url: "https://www.reddit.com/r/MachineLearning/hot.json"
     limit: 25
+    # v1.0.1 Phase 4.4: r/MachineLearning 正经内容常 100+, 设 50 保守一些.
+    min_score: 50
     enabled: true
     priority: 7
   - id: reddit-localllama
@@ -415,5 +425,6 @@ sources:
     name: "r/LocalLLaMA"
     url: "https://www.reddit.com/r/LocalLLaMA/hot.json"
     limit: 25
+    min_score: 50
     enabled: true
     priority: 7

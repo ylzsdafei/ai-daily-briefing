@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -220,7 +221,236 @@ func (g *llmGenerator) Generate(ctx context.Context, items []*store.IssueItem, s
 	if lastErr == nil {
 		lastErr = errors.New("infocard: failed with no specific error")
 	}
-	return nil, nil, lastErr
+	// v1.0.1 Phase 4.5 (T15): LLM 全部 retry 失败 → 用 rule-based fallback 拼
+	// HeaderCard + Cards JSON, 让 PIL 渲染照常出 PNG. 用户原则: 大字报必出.
+	// 朴素但版式完整, 优于"infocard 失败 → 整个 image 阶段失败 → gate 怒火".
+	log.Printf("[WARN] infocard: LLM 全部 retry 失败 (%v), 启用 rule-based fallback 保大字报", lastErr)
+	header := ruleBasedHeader(items, summary)
+	cards := ruleBasedCards(items)
+	return header, cards, nil
+}
+
+// ruleBasedHeader 用 issue items + summary 规则化拼 HeaderCard, 不调 LLM.
+// 字段都填非空 default, 让 gen_info_card.py 渲染时不出现"空字段大留白".
+func ruleBasedHeader(items []*store.IssueItem, summary string) *HeaderCard {
+	summaryLines := splitNonBlankLines(summary)
+	mainHeadline := truncateRunes(firstOr(summaryLines, "今日 AI 早报"), 28)
+	subHeadline := ""
+	if len(summaryLines) >= 2 {
+		subHeadline = truncateRunes(summaryLines[1], 30)
+		if len(summaryLines) >= 3 {
+			subHeadline = subHeadline + "\n" + truncateRunes(summaryLines[2], 30)
+		}
+	}
+
+	// 导语段 100-160 字: 取前 5 个 item title 用句号连接.
+	var leadParts []string
+	for i, it := range items {
+		if i >= 5 || it == nil {
+			break
+		}
+		leadParts = append(leadParts, strings.TrimSpace(it.Title))
+	}
+	leadParagraph := truncateRunes(strings.Join(leadParts, "; "), 160)
+	if leadParagraph == "" {
+		leadParagraph = "今日 AI 行业动态汇总, 详见正文."
+	}
+
+	// section 统计.
+	sectionSet := make(map[string]bool)
+	for _, it := range items {
+		if it != nil {
+			sectionSet[it.Section] = true
+		}
+	}
+
+	// top_stories: 取前 14 条 (或不足时全部), 用 section 中文名做 tag.
+	stories := make([]TopStory, 0, 14)
+	for _, it := range items {
+		if len(stories) >= 14 || it == nil {
+			break
+		}
+		stories = append(stories, TopStory{
+			Title: truncateRunes(strings.TrimSpace(it.Title), 30),
+			Tag:   sectionToTagZH(it.Section),
+		})
+	}
+
+	return &HeaderCard{
+		Edition:       "briefing-v3 · 每日 AI 早报",
+		MainHeadline:  mainHeadline,
+		SubHeadline:   subHeadline,
+		LeadParagraph: leadParagraph,
+		KeyNumbers: []KeyNum{
+			{Value: fmt.Sprintf("%d 条", len(items)), Label: "今日精选条目"},
+			{Value: fmt.Sprintf("%d 个", len(sectionSet)), Label: "覆盖板块"},
+			{Value: "全网", Label: "深度聚合"},
+		},
+		TopStories:   stories,
+		FooterSlogan: "briefing-v3 · 每日 AI 早读",
+	}
+}
+
+// ruleBasedCards 用 issue items 规则化拼 12 张 Card, 不调 LLM.
+func ruleBasedCards(items []*store.IssueItem) []*Card {
+	cards := make([]*Card, 0, len(items))
+	for i, it := range items {
+		if it == nil {
+			continue
+		}
+		body := stripMarkdownNoise(it.BodyMD)
+		runes := []rune(body)
+		subtitle := ""
+		intro := ""
+		footer := ""
+		if len(runes) > 0 {
+			end := 30
+			if end > len(runes) {
+				end = len(runes)
+			}
+			subtitle = string(runes[:end])
+		}
+		if len(runes) > 30 {
+			end := 100
+			if end > len(runes) {
+				end = len(runes)
+			}
+			intro = string(runes[30:end])
+		}
+		if len(runes) > 100 {
+			end := 160
+			if end > len(runes) {
+				end = len(runes)
+			}
+			footer = string(runes[100:end])
+		}
+		hero, heroLabel := extractHeroNumber(body)
+		brand := sectionToTagZH(it.Section)
+		category := sectionToTagEN(it.Section)
+		cards = append(cards, &Card{
+			ItemSeq:       it.Seq,
+			MainTitle:     truncateRunes(strings.TrimSpace(it.Title), 18),
+			Subtitle:      truncateRunes(subtitle, 25),
+			Intro:         truncateRunes(intro, 80),
+			HeroNumber:    hero,
+			HeroLabel:     heroLabel,
+			StatNumbers:   nil,
+			KeyPoints:     buildPoints(body),
+			FooterSummary: truncateRunes(footer, 30),
+			BrandTag:      brand,
+			CategoryTag:   category,
+		})
+		if i+1 >= 12 {
+			break
+		}
+	}
+	return cards
+}
+
+// 辅助函数 ----------------------------------------------------------------
+
+var ruleHeroNumRe = regexp.MustCompile(`(\d{1,6}(?:\.\d+)?[万亿%]?|\$\d+(?:\.\d+)?[BMK]?|\d{1,6}\s*(?:倍|条|个|分|秒|min|小时|天))`)
+
+func extractHeroNumber(body string) (string, string) {
+	if m := ruleHeroNumRe.FindString(body); m != "" {
+		return truncateRunes(m, 8), "关键数据"
+	}
+	return "重磅", "今日要闻"
+}
+
+var rulePointSplitRe = regexp.MustCompile(`[。；;\n]`)
+
+func buildPoints(body string) []Point {
+	parts := rulePointSplitRe.Split(body, -1)
+	points := make([]Point, 0, 3)
+	for _, p := range parts {
+		t := strings.TrimSpace(p)
+		if t == "" {
+			continue
+		}
+		runes := []rune(t)
+		titleEnd := 8
+		if titleEnd > len(runes) {
+			titleEnd = len(runes)
+		}
+		points = append(points, Point{
+			Title: string(runes[:titleEnd]),
+			Desc:  truncateRunes(t, 30),
+		})
+		if len(points) >= 3 {
+			break
+		}
+	}
+	if len(points) == 0 {
+		points = append(points, Point{Title: "今日要闻", Desc: "详见正文"})
+	}
+	return points
+}
+
+var ruleNoiseRe = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)|\[[^\]]*\]\([^)]*\)|[*_` + "`" + `>#]+`)
+
+func stripMarkdownNoise(s string) string {
+	s = ruleNoiseRe.ReplaceAllString(s, " ")
+	s = regexp.MustCompile(`\s+`).ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
+
+func splitNonBlankLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(l)
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func firstOr(lines []string, dflt string) string {
+	if len(lines) == 0 {
+		return dflt
+	}
+	return lines[0]
+}
+
+func truncateRunes(s string, n int) string {
+	rs := []rune(s)
+	if len(rs) <= n {
+		return s
+	}
+	return string(rs[:n])
+}
+
+func sectionToTagZH(secID string) string {
+	switch secID {
+	case "product_update":
+		return "产品"
+	case "research":
+		return "研究"
+	case "industry":
+		return "行业"
+	case "opensource":
+		return "开源"
+	case "social":
+		return "社媒"
+	}
+	return "新闻"
+}
+
+func sectionToTagEN(secID string) string {
+	switch secID {
+	case "product_update":
+		return "PRODUCT"
+	case "research":
+		return "RESEARCH"
+	case "industry":
+		return "INDUSTRY"
+	case "opensource":
+		return "OPENSOURCE"
+	case "social":
+		return "SOCIAL"
+	}
+	return "AI"
 }
 
 // buildInfoCardUserPrompt serializes the items for the LLM user turn.

@@ -51,6 +51,11 @@ type RawItem struct {
 	FetchedAt    time.Time
 	Content      string // extracted body; may be empty on Day 1
 	MetadataJSON string // arbitrary extra metadata
+	// SignalStrength (v1.0.1 Phase 4.2) is the number of distinct source
+	// hosts reporting the same story (fuzzy title match). 1 = single source,
+	// ≥2 = cross-source corroboration ("hot story"). In-memory only — never
+	// persisted, computed in-pipeline between filter/dedup and rank.
+	SignalStrength int
 }
 
 // Issue represents a single daily briefing (one per domain per date).

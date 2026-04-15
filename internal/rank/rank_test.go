@@ -85,6 +85,78 @@ func TestRankedItemSortOrder(t *testing.T) {
 	}
 }
 
+// v1.0.1 Phase 4.2: signalBoost tests.
+func TestSignalBoost(t *testing.T) {
+	tests := []struct {
+		name string
+		ss   int
+		want float64
+	}{
+		{"ss=0 → 1.0 (no data)", 0, 1.0},
+		{"ss=1 → 1.0 (single source)", 1, 1.0},
+		{"ss=2 → 1.2", 2, 1.2},
+		{"ss=3 → 1.4", 3, 1.4},
+		{"ss=5 → 1.8", 5, 1.8},
+		{"ss=6 → 2.0 (cap)", 6, 2.0},
+		{"ss=10 → 2.0 (cap held)", 10, 2.0},
+		{"ss=-1 → 1.0 (guard)", -1, 1.0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := signalBoost(tc.ss)
+			if !floatClose(got, tc.want, 1e-9) {
+				t.Errorf("signalBoost(%d) = %v, want %v", tc.ss, got, tc.want)
+			}
+		})
+	}
+}
+
+// v1.0.1 Phase 4.2: combined formula — priority × signal.
+// 场景: 一条 7 分 / 高优先级 / 单源 vs 一条 7 分 / 中优先级 / 三源共振.
+// 期望: 三源共振的略胜, 但被单源权威源压制不太多 (两者可比).
+func TestRankedItemSortOrder_WithSignalBoost(t *testing.T) {
+	items := []*RankedItem{
+		// id 1: authoritative single-source, priority 10, ss=1
+		// weighted = 7 × 1.5 × 1.0 = 10.5
+		{Item: &store.RawItem{ID: 1, SourceID: 100, Title: "solo authoritative"}, Score: 7, SignalStrength: 1, WeightedScore: 7 * 1.5 * 1.0},
+		// id 2: mid priority, 3-source signal
+		// weighted = 7 × 1.0 × 1.4 = 9.8
+		{Item: &store.RawItem{ID: 2, SourceID: 200, Title: "three-source signal"}, Score: 7, SignalStrength: 3, WeightedScore: 7 * 1.0 * 1.4},
+		// id 3: low priority, 5-source explosion
+		// weighted = 7 × 0.6 × 1.8 = 7.56
+		{Item: &store.RawItem{ID: 3, SourceID: 300, Title: "low-priority hot"}, Score: 7, SignalStrength: 5, WeightedScore: 7 * 0.6 * 1.8},
+		// id 4: top score, mid priority, single source
+		// weighted = 9 × 1.0 × 1.0 = 9.0
+		{Item: &store.RawItem{ID: 4, SourceID: 200, Title: "top score solo"}, Score: 9, SignalStrength: 1, WeightedScore: 9 * 1.0 * 1.0},
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].WeightedScore != items[j].WeightedScore {
+			return items[i].WeightedScore > items[j].WeightedScore
+		}
+		if items[i].Score != items[j].Score {
+			return items[i].Score > items[j].Score
+		}
+		return items[i].Item.ID < items[j].Item.ID
+	})
+	// Expected order by WeightedScore:
+	//   id 1 (10.5) > id 2 (9.8) > id 4 (9.0) > id 3 (7.56)
+	expected := []int64{1, 2, 4, 3}
+	for i, want := range expected {
+		if items[i].Item.ID != want {
+			t.Errorf("pos %d: got id %d (weighted %.2f), want id %d",
+				i, items[i].Item.ID, items[i].WeightedScore, want)
+		}
+	}
+}
+
+func floatClose(a, b, eps float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d < eps
+}
+
 func TestRankedItem_TieBreaker(t *testing.T) {
 	// 相同 WeightedScore → 按 Score desc → 按 ID asc
 	items := []*RankedItem{
