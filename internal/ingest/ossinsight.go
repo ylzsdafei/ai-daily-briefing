@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -123,7 +124,12 @@ func (s *ossinsightSource) Fetch(ctx context.Context) ([]*store.RawItem, error) 
 	}
 
 	now := time.Now().UTC()
+	// v1.0.1 Phase 4.6: 加载 GitHub star 缓存, 给每个 repo 追加 stars_total
+	// (总 star 数, 区别于 ossinsight 的 period 内增量). 缓存 24h TTL, 避免
+	// 对同一 repo 反复查 GitHub API (anonymous 60/h).
+	cache := loadGitHubStarsCache()
 	items := make([]*store.RawItem, 0, len(parsed.Data.Rows))
+	anonBudget := 50 // anonymous API 60/h, 留 10 给其他 (保守)
 	for i := range parsed.Data.Rows {
 		row := parsed.Data.Rows[i]
 		full := strings.TrimSpace(row.RepoName)
@@ -139,9 +145,23 @@ func (s *ossinsightSource) Fetch(ctx context.Context) ([]*store.RawItem, error) 
 		pushes, _ := strconv.Atoi(strings.TrimSpace(row.Pushes))
 		totalScore, _ := strconv.ParseFloat(strings.TrimSpace(row.TotalScore), 64)
 
+		// v1.0.1 Phase 4.6: 查/补 total stars. 优先走 cache; miss 时调 GitHub
+		// API (预算内). 拿不到就 0, 不影响主流程.
+		starsTotal := 0
+		if cached, ok := cache[full]; ok && time.Since(cached.At) < 24*time.Hour {
+			starsTotal = cached.Stars
+		} else if anonBudget > 0 {
+			if n, err := fetchGitHubStars(ctx, s.hc, full); err == nil {
+				starsTotal = n
+				cache[full] = githubRepoCacheEntry{Stars: n, At: now}
+				anonBudget--
+			}
+		}
+
 		metaJSON, _ := json.Marshal(map[string]any{
 			"language":    row.PrimaryLanguage,
-			"stars":       stars,
+			"stars":       stars, // period 内增量 (stars+)
+			"stars_total": starsTotal,
 			"forks":       forks,
 			"pushes":      pushes,
 			"total_score": totalScore,
@@ -161,7 +181,62 @@ func (s *ossinsightSource) Fetch(ctx context.Context) ([]*store.RawItem, error) 
 			MetadataJSON: string(metaJSON),
 		})
 	}
+	saveGitHubStarsCache(cache)
 	return items, nil
+}
+
+// ----- GitHub stars cache (v1.0.1 Phase 4.6) -----
+
+type githubRepoCacheEntry struct {
+	Stars int       `json:"stars"`
+	At    time.Time `json:"at"`
+}
+
+const githubStarsCachePath = "data/github_stars_cache.json"
+
+func loadGitHubStarsCache() map[string]githubRepoCacheEntry {
+	data, err := os.ReadFile(githubStarsCachePath)
+	if err != nil {
+		return make(map[string]githubRepoCacheEntry)
+	}
+	var m map[string]githubRepoCacheEntry
+	if err := json.Unmarshal(data, &m); err != nil {
+		return make(map[string]githubRepoCacheEntry)
+	}
+	return m
+}
+
+func saveGitHubStarsCache(m map[string]githubRepoCacheEntry) {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(githubStarsCachePath, data, 0o644)
+}
+
+func fetchGitHubStars(ctx context.Context, hc *http.Client, slug string) (int, error) {
+	url := "https://api.github.com/repos/" + slug
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "briefing-v3/1.0")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("github api status %d", resp.StatusCode)
+	}
+	var data struct {
+		StargazersCount int `json:"stargazers_count"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, err
+	}
+	return data.StargazersCount, nil
 }
 
 func init() {

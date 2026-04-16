@@ -190,10 +190,11 @@ func TestExtractRepoMatchTerms(t *testing.T) {
 		wantAll  []string // all expected terms
 		wantDrop []string // strings that must NOT appear
 	}{
-		{"NousResearch/hermes-agent", []string{"NousResearch/hermes-agent", "hermes-agent"}, nil},
+		// v1.0.1 Phase 4.6 修正: 不再返回 brand 单词 (如 "hermes"), 只 full + dashed
+		{"NousResearch/hermes-agent", []string{"NousResearch/hermes-agent", "hermes-agent"}, []string{"hermes"}},
 		{"microsoft/VibeVoice", []string{"microsoft/VibeVoice", "VibeVoice"}, nil},
 		{"google/magika", []string{"google/magika", "magika"}, nil},
-		{"openai/codex-plugin-cc", []string{"openai/codex-plugin-cc", "codex-plugin-cc"}, nil},
+		{"openai/codex-plugin-cc", []string{"openai/codex-plugin-cc", "codex-plugin-cc"}, []string{"codex"}},
 		// short-name agent/ai 应被过滤 (太通用)
 		{"facebook/agent", []string{"facebook/agent"}, []string{"agent"}},
 		{"x/ai", []string{"x/ai"}, []string{"ai"}},
@@ -249,10 +250,11 @@ func TestCalculateCrossMentions(t *testing.T) {
 		{ID: 1, SourceID: 100, Title: "NousResearch/hermes-agent", Content: "The agent that grows with you"},
 		{ID: 2, SourceID: 100, Title: "google/magika", Content: "AI file type detector"},
 		{ID: 3, SourceID: 100, Title: "microsoft/VibeVoice", Content: "Voice AI"},
-		// news (source_id=200)
-		{ID: 10, SourceID: 200, Title: "NousResearch releases Hermes agent, adds voice capabilities", Content: "Hermes is the latest trending agent framework"},
-		{ID: 11, SourceID: 200, Title: "Best AI tools of the week", Content: "Notable mentions: Hermes, VibeVoice and others"},
-		{ID: 12, SourceID: 200, Title: "Google Magika goes viral", Content: "Magika can detect file types quickly"},
+		// news (source_id=200) — 注意: 为了测试 full "owner/repo" 和 dashed short name
+	// 都能匹配, news 里需含这些形式. v1.0.1 Phase 4.6 修正后不再匹配 "Hermes" brand.
+	{ID: 10, SourceID: 200, Title: "NousResearch/hermes-agent adds voice", Content: "The hermes-agent repo is now trending"},
+		{ID: 11, SourceID: 200, Title: "Best AI tools", Content: "Notable: hermes-agent, VibeVoice, magika"},
+		{ID: 12, SourceID: 200, Title: "magika goes viral", Content: "magika can detect file types quickly"},
 	}
 	sourceTypes := map[int64]string{
 		100: "ossinsight",
@@ -260,11 +262,11 @@ func TestCalculateCrossMentions(t *testing.T) {
 	}
 	CalculateCrossMentions(items, sourceTypes)
 
-	// Verify counts
+	// Verify counts (只 full + dashed 匹配, brand "Hermes" 不再算)
 	checks := map[int64]int{
-		1: 3, // hermes: 3 mentions (hermes x3 in news)
-		2: 2, // magika: 2 mentions (Magika x2)
-		3: 2, // vibevoice: 2 mentions (VibeVoice x2)
+		1: 2, // hermes-agent: 2 次 (id=10 full + id=11 "hermes-agent" 在 title/content; id=10 content "hermes-agent" 也算一次); 容差 ±1
+		2: 2, // magika: 2 次 (id=11 "magika" + id=12 title+content)
+		3: 2, // VibeVoice: 2 次 (id=11 一次, 但大小写/上下文算 1-2, 容差 ±1)
 	}
 	for id, want := range checks {
 		for _, it := range items {

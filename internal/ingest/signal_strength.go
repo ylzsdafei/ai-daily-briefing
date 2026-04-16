@@ -227,28 +227,17 @@ func extractRepoMatchTerms(title string) []string {
 	if t == "" {
 		return nil
 	}
-	out := []string{t} // full "owner/repo"
+	out := []string{t} // full "owner/repo" (最精确, 几乎无 FP)
 	short := ""
 	if idx := strings.Index(t, "/"); idx > 0 && idx < len(t)-1 {
 		short = strings.TrimSpace(t[idx+1:])
 	}
-	if short != "" {
-		// Dashed short name (e.g. "hermes-agent")
-		if len(short) >= 5 && !commonRepoWords[strings.ToLower(short)] {
-			out = append(out, short)
-		}
-		// Core brand token (first segment before dash/underscore).
-		// Covers news sources writing "Hermes" instead of "hermes-agent".
-		firstToken := short
-		for i := 0; i < len(short); i++ {
-			if short[i] == '-' || short[i] == '_' {
-				firstToken = short[:i]
-				break
-			}
-		}
-		if firstToken != short && len(firstToken) >= 5 && !commonRepoWords[strings.ToLower(firstToken)] {
-			out = append(out, firstToken)
-		}
+	// 只加 dashed short name (e.g. "hermes-agent"), 不再加 brand 单词
+	// (v1.0.1 Phase 4.6 修正: 之前加"hermes"作 brand 会让 hermes-webui
+	// 等同名小项目借用原 Hermes 的讨论热度, 造成"同名项目蹭热度"假信号.
+	// 短名精确度足够区分, brand 单词风险高于收益).
+	if short != "" && len(short) >= 5 && !commonRepoWords[strings.ToLower(short)] {
+		out = append(out, short)
 	}
 	return out
 }
