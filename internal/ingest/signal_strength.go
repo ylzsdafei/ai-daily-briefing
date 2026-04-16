@@ -192,3 +192,149 @@ func CalculateSignalStrength(items []*store.RawItem) map[int]int {
 
 	return dist
 }
+
+// ---- Cross-mention count (v1.0.1 Phase 4.6) --------------------------
+
+// ossinsightSourceType is the adapter type that represents GitHub trending
+// repos. Items from this source get a CrossMentionCount computed below.
+const ossinsightSourceType = "ossinsight"
+
+// commonRepoWords are repo name tokens too generic to match on — matching
+// them in other sources' content would produce too many false positives.
+// Skip a repo's short-name pass if the short name equals any of these.
+var commonRepoWords = map[string]bool{
+	"agent": true, "agents": true, "ai": true, "ml": true,
+	"bench": true, "benchmark": true, "demo": true, "sample": true,
+	"example": true, "tool": true, "tools": true, "lib": true,
+	"library": true, "code": true, "codes": true, "api": true,
+	"docs": true, "doc": true, "test": true, "tests": true,
+	"app": true, "cli": true, "ui": true, "core": true,
+}
+
+// repoShortNameRe extracts alphanumeric (with dashes/underscores) tokens
+// from a full repo name like "NousResearch/hermes-agent" → "hermes-agent".
+var repoShortNameRe = regexp.MustCompile(`[A-Za-z][A-Za-z0-9\-_]{3,}`)
+
+// extractRepoMatchTerms returns a list of strings to search for when
+// counting cross-source mentions of this repo.
+//
+// Strategy:
+//   - Always include the full "owner/repo" (most specific, lowest FP rate)
+//   - Include the repo short-name if: length >= 5, and not in commonRepoWords
+//   - Drop terms shorter than 5 chars or too common
+func extractRepoMatchTerms(title string) []string {
+	t := strings.TrimSpace(title)
+	if t == "" {
+		return nil
+	}
+	out := []string{t} // full "owner/repo"
+	short := ""
+	if idx := strings.Index(t, "/"); idx > 0 && idx < len(t)-1 {
+		short = strings.TrimSpace(t[idx+1:])
+	}
+	if short != "" {
+		// Dashed short name (e.g. "hermes-agent")
+		if len(short) >= 5 && !commonRepoWords[strings.ToLower(short)] {
+			out = append(out, short)
+		}
+		// Core brand token (first segment before dash/underscore).
+		// Covers news sources writing "Hermes" instead of "hermes-agent".
+		firstToken := short
+		for i := 0; i < len(short); i++ {
+			if short[i] == '-' || short[i] == '_' {
+				firstToken = short[:i]
+				break
+			}
+		}
+		if firstToken != short && len(firstToken) >= 5 && !commonRepoWords[strings.ToLower(firstToken)] {
+			out = append(out, firstToken)
+		}
+	}
+	return out
+}
+
+// CalculateCrossMentions 给每个 ossinsight (GitHub trending) item 计算
+// CrossMentionCount: 这个 repo 名在非 ossinsight 源的 title+content 中被
+// 提到的次数 (大小写不敏感, word-boundary).
+//
+// 用意: 让 rank 阶段能综合 (a) star 增长 (b) 圈内讨论热度 两个信号.
+// Hermes / VibeVoice 这类"GitHub 新星 + 科技媒体热议"的 repo 分数上浮.
+//
+// 性能: 合并 non-ossinsight items 文本成一个大 haystack, 每个 repo 只
+// 搜索一次 → 100 次 Contains, 毫秒级.
+//
+// In-memory only, 直接写回 items[i].CrossMentionCount.
+func CalculateCrossMentions(items []*store.RawItem, sourceTypes map[int64]string) {
+	if len(items) == 0 || len(sourceTypes) == 0 {
+		return
+	}
+	// Build one big haystack from all non-ossinsight items.
+	var haystack strings.Builder
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if sourceTypes[it.SourceID] == ossinsightSourceType {
+			continue // skip ossinsight's own items
+		}
+		haystack.WriteString(strings.ToLower(it.Title))
+		haystack.WriteByte('\n')
+		haystack.WriteString(strings.ToLower(it.Content))
+		haystack.WriteByte('\n')
+	}
+	hay := haystack.String()
+	if hay == "" {
+		return
+	}
+
+	// For each ossinsight item, count matches.
+	for _, it := range items {
+		if it == nil || sourceTypes[it.SourceID] != ossinsightSourceType {
+			continue
+		}
+		terms := extractRepoMatchTerms(it.Title)
+		if len(terms) == 0 {
+			continue
+		}
+		maxCount := 0
+		for _, term := range terms {
+			n := countMentions(hay, strings.ToLower(term))
+			if n > maxCount {
+				maxCount = n
+			}
+		}
+		it.CrossMentionCount = maxCount
+	}
+}
+
+// countMentions returns the number of substring occurrences of needle in
+// haystack. needle must already be lowercased. Uses word-boundary-ish
+// logic: surrounding chars must not be letters/digits (so "agent" won't
+// match inside "agents" and "codex" won't match inside "codexing").
+func countMentions(haystack, needle string) int {
+	if needle == "" || len(needle) > len(haystack) {
+		return 0
+	}
+	n := 0
+	start := 0
+	for {
+		idx := strings.Index(haystack[start:], needle)
+		if idx < 0 {
+			break
+		}
+		abs := start + idx
+		// Check boundaries.
+		leftOK := abs == 0 || !isWordChar(haystack[abs-1])
+		rightIdx := abs + len(needle)
+		rightOK := rightIdx == len(haystack) || !isWordChar(haystack[rightIdx])
+		if leftOK && rightOK {
+			n++
+		}
+		start = abs + 1
+	}
+	return n
+}
+
+func isWordChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}

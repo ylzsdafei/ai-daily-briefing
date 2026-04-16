@@ -219,12 +219,34 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	}
 	sourceCategories := make(map[int64]string, len(sourceRows))
 	sourcePriorities := make(map[int64]int, len(sourceRows)) // v1.0.1 Phase 4.1
+	sourceTypes := make(map[int64]string, len(sourceRows))   // v1.0.1 Phase 4.6 (for CrossMentions)
 	for _, sr := range sourceRows {
 		if sr == nil {
 			continue
 		}
 		sourceCategories[sr.ID] = sr.Category
 		sourcePriorities[sr.ID] = sr.Priority
+		sourceTypes[sr.ID] = sr.Type
+	}
+
+	// v1.0.1 Phase 4.6: opensource/ossinsight repo 的"圈内讨论热度" —
+	// 扫非 ossinsight 源 title+content 里 repo 名被提到的次数, 写回
+	// item.CrossMentionCount, 在 rank prompt 里作为硬信号让 LLM 综合 star
+	// 热度 + 跨源讨论度 + 描述业务价值做评分. 修正之前 "Hermes trending#1
+	// 却因描述平淡被挤出 opensource top 6" 的问题.
+	ingest.CalculateCrossMentions(filtered, sourceTypes)
+	xmCount := 0
+	xmMax := 0
+	for _, it := range filtered {
+		if it != nil && it.CrossMentionCount > 0 {
+			xmCount++
+			if it.CrossMentionCount > xmMax {
+				xmMax = it.CrossMentionCount
+			}
+		}
+	}
+	if xmCount > 0 {
+		stage(fmt.Sprintf("cross_mentions: %d ossinsight repos have cross-source discussion (max=%d)", xmCount, xmMax))
 	}
 
 	// --- 5. Rank (LLM quality scoring) ----------------------------------
@@ -340,6 +362,8 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			// v1.0.1 Phase 4.2: extended path 也要算 signal_strength, 否则
 			// filtered2 里 item.SignalStrength 还是 0 (拿不到共振加权).
 			_ = ingest.CalculateSignalStrength(filtered2)
+			// v1.0.1 Phase 4.6: extended path 也要算 cross_mentions.
+			ingest.CalculateCrossMentions(filtered2, sourceTypes)
 			if ranked2, rerr := ranker.Rank(ctx, filtered2, sourceCategories, sourcePriorities); rerr != nil {
 				stage(fmt.Sprintf("extended rank: failed (%v) — keeping original classify result", rerr))
 			} else {

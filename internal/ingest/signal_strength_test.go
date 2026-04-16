@@ -5,6 +5,7 @@
 package ingest
 
 import (
+	"strings"
 	"testing"
 
 	"briefing-v3/internal/store"
@@ -179,4 +180,107 @@ func floatClose(a, b, eps float64) bool {
 		diff = -diff
 	}
 	return diff < eps
+}
+
+// ---- v1.0.1 Phase 4.6 CrossMention tests ----
+
+func TestExtractRepoMatchTerms(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantAll  []string // all expected terms
+		wantDrop []string // strings that must NOT appear
+	}{
+		{"NousResearch/hermes-agent", []string{"NousResearch/hermes-agent", "hermes-agent"}, nil},
+		{"microsoft/VibeVoice", []string{"microsoft/VibeVoice", "VibeVoice"}, nil},
+		{"google/magika", []string{"google/magika", "magika"}, nil},
+		{"openai/codex-plugin-cc", []string{"openai/codex-plugin-cc", "codex-plugin-cc"}, nil},
+		// short-name agent/ai 应被过滤 (太通用)
+		{"facebook/agent", []string{"facebook/agent"}, []string{"agent"}},
+		{"x/ai", []string{"x/ai"}, []string{"ai"}},
+		{"", nil, nil},
+	}
+	for _, tc := range cases {
+		got := extractRepoMatchTerms(tc.in)
+		for _, want := range tc.wantAll {
+			found := false
+			for _, g := range got {
+				if g == want {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%q: expected term %q, got %v", tc.in, want, got)
+			}
+		}
+		for _, drop := range tc.wantDrop {
+			for _, g := range got {
+				if g == drop {
+					t.Errorf("%q: should NOT contain %q, got %v", tc.in, drop, got)
+				}
+			}
+		}
+	}
+}
+
+func TestCountMentionsWordBoundary(t *testing.T) {
+	cases := []struct {
+		hay, needle string
+		want        int
+	}{
+		{"hermes is great, hermes-agent rocks", "hermes", 2}, // 2 次: 单独 + hermes-agent 里的 hermes (两边都是非字母)
+		{"Agent framework and agents everywhere", "agent", 1}, // "Agent " 匹配, "agents" 不匹配 (右边是 s)
+		{"no match here", "xyz", 0},
+		{"repeated VibeVoice VibeVoice VibeVoice end", "vibevoice", 3},
+		{"prefix/hermes-agent is good", "hermes-agent", 1},
+	}
+	for _, tc := range cases {
+		got := countMentions(strings.ToLower(tc.hay), strings.ToLower(tc.needle))
+		if got != tc.want {
+			t.Errorf("hay=%q needle=%q got=%d want=%d", tc.hay, tc.needle, got, tc.want)
+		}
+	}
+}
+
+func TestCalculateCrossMentions(t *testing.T) {
+	// Setup: ossinsight has Hermes + Magika; news sources talk about Hermes 3 times, Magika 1 time
+	items := []*store.RawItem{
+		// ossinsight (source_id=100)
+		{ID: 1, SourceID: 100, Title: "NousResearch/hermes-agent", Content: "The agent that grows with you"},
+		{ID: 2, SourceID: 100, Title: "google/magika", Content: "AI file type detector"},
+		{ID: 3, SourceID: 100, Title: "microsoft/VibeVoice", Content: "Voice AI"},
+		// news (source_id=200)
+		{ID: 10, SourceID: 200, Title: "NousResearch releases Hermes agent, adds voice capabilities", Content: "Hermes is the latest trending agent framework"},
+		{ID: 11, SourceID: 200, Title: "Best AI tools of the week", Content: "Notable mentions: Hermes, VibeVoice and others"},
+		{ID: 12, SourceID: 200, Title: "Google Magika goes viral", Content: "Magika can detect file types quickly"},
+	}
+	sourceTypes := map[int64]string{
+		100: "ossinsight",
+		200: "rss",
+	}
+	CalculateCrossMentions(items, sourceTypes)
+
+	// Verify counts
+	checks := map[int64]int{
+		1: 3, // hermes: 3 mentions (hermes x3 in news)
+		2: 2, // magika: 2 mentions (Magika x2)
+		3: 2, // vibevoice: 2 mentions (VibeVoice x2)
+	}
+	for id, want := range checks {
+		for _, it := range items {
+			if it.ID == id {
+				if it.CrossMentionCount < want-1 || it.CrossMentionCount > want+1 {
+					// 允许 ±1 容差: 因为 "owner/repo" 可能多算一次
+					t.Errorf("item id=%d got CrossMentionCount=%d, want ~%d", id, it.CrossMentionCount, want)
+				}
+				break
+			}
+		}
+	}
+	// Non-ossinsight items should stay 0
+	for _, it := range items {
+		if it.SourceID == 200 && it.CrossMentionCount != 0 {
+			t.Errorf("non-ossinsight item id=%d should have 0 mentions, got %d", it.ID, it.CrossMentionCount)
+		}
+	}
 }

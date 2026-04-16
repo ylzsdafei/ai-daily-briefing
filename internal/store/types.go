@@ -56,6 +56,10 @@ type RawItem struct {
 	// ≥2 = cross-source corroboration ("hot story"). In-memory only — never
 	// persisted, computed in-pipeline between filter/dedup and rank.
 	SignalStrength int
+	// CrossMentionCount (v1.0.1 Phase 4.6) 仅用于 opensource/project items
+	// (来自 ossinsight): 该 repo 名在非 ossinsight 源的 title+content 中被
+	// 提及的次数. 作为 rank prompt 的"圈内讨论热度"信号. In-memory only.
+	CrossMentionCount int
 }
 
 // Issue represents a single daily briefing (one per domain per date).
