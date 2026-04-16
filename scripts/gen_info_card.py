@@ -80,11 +80,33 @@ RULE = (55, 55, 55)          # horizontal rule colour
 
 # ----- Font loading -------------------------------------------------------
 
+def _find_sc_index(path):
+    """Find the Simplified Chinese (SC) face index in a TTC collection.
+    Returns 0 if not a TTC or SC face not found."""
+    if not path.lower().endswith('.ttc'):
+        return 0
+    for i in range(20):
+        try:
+            f = ImageFont.truetype(path, size=20, index=i)
+            name = f.getname()[0]
+            if 'SC' in name:
+                return i
+        except Exception:
+            break
+    return 0
+
+# Cache SC index per path to avoid repeated probing.
+_sc_index_cache = {}
+
 def load_font(path, size):
-    """Load a TrueType font, returning the default font on failure
-    so the script never crashes on a missing font."""
+    """Load a TrueType font. For TTC collections, automatically selects
+    the Simplified Chinese (SC) face instead of the default JP face.
+    Returns PIL default font on failure so the script never crashes."""
     try:
-        return ImageFont.truetype(path, size=size)
+        if path not in _sc_index_cache:
+            _sc_index_cache[path] = _find_sc_index(path)
+        idx = _sc_index_cache[path]
+        return ImageFont.truetype(path, size=size, index=idx)
     except Exception:
         return ImageFont.load_default()
 
@@ -507,7 +529,7 @@ def render_header_card(data, output_path, width, height,
             draw, (right_x, right_y), sub_lines[i], font, color,
             right_w, line_spacing=1.18, max_lines=ml,
         )
-        right_y += int(28 * scale)
+        right_y += int(36 * scale)  # 28→36 副标题两段间距加宽
 
     # 主区底部对齐 (取较深的列)
     y = max(left_y, right_y) + int(24 * scale)
@@ -557,11 +579,11 @@ def render_header_card(data, output_path, width, height,
     if grid_nums:
         num_col_gap = int(20 * scale)
         num_cell_w = (right_w - num_col_gap) // 2
-        num_row_h = int(128 * scale)  # 150 → 128 让 3 行 fit
+        num_row_h = int(142 * scale)  # 128 → 142 中文数字比英文宽, 垂直多留点
         # value 字号自适应: LLM 生成的 value 可能是长字符串 (e.g. "100 亿美元",
         # "27B@Q4"), 固定 78px 会撑出 cell 宽度跟旁边重叠. 测量实际宽度,
         # 太宽就降级到更小字号.
-        value_size_steps = [78, 62, 50, 42, 34]
+        value_size_steps = [48, 40, 34, 28, 24]  # 再降: 中文数字 3-4 字宽, 48 起步够醒目
         value_fonts = [load_font(font_bold_path, int(s * scale)) for s in value_size_steps]
         max_value_w = num_cell_w - int(8 * scale)
         for i, kn in enumerate(grid_nums):
@@ -599,37 +621,53 @@ def render_header_card(data, output_path, width, height,
     # 独占整行不再分栏.
     left_y = bot_zone_top
     draw.text((pad_x, left_y), "MORE STORIES", font=f_section_label, fill=ACCENT_RED)
-    left_y += int(32 * scale)
+    left_y += int(36 * scale)
 
-    # 1 col × 8 rows, 每行 1488px width. title 后面拼接了 body 摘要,
-    # 单行长内容能填满整个 width, 没有 right 空白.
+    # MORE STORIES: 2 列 × 4 行 (左右各 4 条) 填满底部, 不留空白.
+    # 自适应行距: footer 前剩余空间 / 行数, 均匀撑满.
+    f_more_story_lg = load_font(font_bold_path, int(28 * scale))
     more_stories = stories[6:14]
-    for st in more_stories[:8]:
+    footer_y = int(1480 * scale)
+    n_per_col = 4
+    n_stories = min(8, len(more_stories))
+    avail_h = footer_y - left_y - int(16 * scale)
+    row_h = max(int(44 * scale), avail_h // n_per_col) if n_per_col > 0 else int(50 * scale)
+
+    ms_col_gap = int(36 * scale)
+    ms_col_w = (content_w - ms_col_gap) // 2
+
+    def _draw_more_story(st, cx, cy, col_w):
         tag = (st.get("tag") or "").strip()
         title = (st.get("title") or "").strip()
         if tag:
             tag_text = tag + " · "
-            tag_bbox = draw.textbbox((0, 0), tag_text, font=f_more_story)
+            tag_bbox = draw.textbbox((0, 0), tag_text, font=f_more_story_lg)
             tag_w = tag_bbox[2] - tag_bbox[0]
-            draw.text((pad_x, left_y), tag_text, font=f_more_story, fill=ACCENT_RED)
-            title_x = pad_x + tag_w
-            avail_w = content_w - tag_w
+            draw.text((cx, cy), tag_text, font=f_more_story_lg, fill=ACCENT_RED)
+            title_x = cx + tag_w
+            avail_w = col_w - tag_w
         else:
-            title_x = pad_x
-            avail_w = content_w
-        # title 单行硬截断 (按 pixel), 拼接了 body 摘要的长 title 能填满
+            title_x = cx
+            avail_w = col_w
         title_runes = list(title)
         fit_title = title
         for cut in range(len(title_runes), 0, -1):
             tt = "".join(title_runes[:cut])
             if cut < len(title_runes):
                 tt += "…"
-            tbbox = draw.textbbox((0, 0), tt, font=f_more_story)
+            tbbox = draw.textbbox((0, 0), tt, font=f_more_story_lg)
             if tbbox[2] - tbbox[0] <= avail_w:
                 fit_title = tt
                 break
-        draw.text((title_x, left_y), fit_title, font=f_more_story, fill=INK_MAIN)
-        left_y += int(40 * scale)
+        draw.text((title_x, cy), fit_title, font=f_more_story_lg, fill=INK_MAIN)
+
+    # 左列: stories 0-3, 右列: stories 4-7
+    for i, st in enumerate(more_stories[:n_stories]):
+        col = i // n_per_col  # 0=左, 1=右
+        row = i % n_per_col
+        cx = pad_x + col * (ms_col_w + ms_col_gap)
+        cy = left_y + row * row_h
+        _draw_more_story(st, cx, cy, ms_col_w)
 
     # RIGHT 板块速览已删 — MORE STORIES 占满整个 bot zone, 视觉上不再
     # 出现 "row-by-row 对齐误解" 的问题. 各板块条目数信息可以用 BY THE
