@@ -229,6 +229,10 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		sourceTypes[sr.ID] = sr.Type
 	}
 
+	// 诊断日志 (2026-04-16 research=0 追踪): filter+dedup 后各 category 计数,
+	// 用于定位 paper 在哪一步被 drop. 无逻辑副作用, 保留作长期观测点.
+	stage("filter by-category: " + formatByCategoryCounts(filtered, sourceCategories))
+
 	// v1.0.1 Phase 4.6: opensource/ossinsight repo 的"圈内讨论热度" —
 	// 扫非 ossinsight 源 title+content 里 repo 名被提到的次数, 写回
 	// item.CrossMentionCount, 在 rank prompt 里作为硬信号让 LLM 综合 star
@@ -277,6 +281,10 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			rankedRaws = append(rankedRaws, r.Item)
 		}
 	}
+
+	// 诊断日志 (2026-04-16 research=0 追踪): rank 后各 category 计数, 对比
+	// filter 后的计数看 rank 到底把 paper 砍到几条. 无逻辑副作用.
+	stage("rank by-category: " + formatByCategoryCounts(rankedRaws, sourceCategories))
 
 	// --- 6. Classify (rule pre-classify + LLM binary disambiguation) ----
 	stage("classify: rule pre-classify + LLM news binary")
@@ -1179,17 +1187,13 @@ func extractDateFromURL(rawURL string) (time.Time, bool) {
 			return time.Date(year, time.Month(mn), day, 0, 0, 0, 0, time.UTC), true
 		}
 	}
-	// Strategy 4: arxiv YYMM.NNNNN (e.g. 2604.11465 = 2026-04)
-	if m := urlDateReArxiv.FindStringSubmatch(rawURL); len(m) == 3 {
-		yy, _ := strconv.Atoi(m[1])
-		mn, _ := strconv.Atoi(m[2])
-		// arxiv YY is 2-digit (00-99 → 2000-2099 reasonable).
-		year := 2000 + yy
-		if validYear(year) && validMonth(mn) {
-			// Day defaults to 1st of the month — arxiv id doesn't encode day.
-			return time.Date(year, time.Month(mn), 1, 0, 0, 0, 0, time.UTC), true
-		}
-	}
+	// Strategy 4 (arxiv YYMM.NNNNN): 故意跳过 — arxiv ID 只编码年月, 日号
+	// 是 1 号默认值, 是伪日期. 之前会让 filter 的 urlDate.Before(cutoff)
+	// 分支把当月 15 号之后发表的所有 arxiv 论文误判为旧文 drop 掉
+	// (2026-04-16 research=0 根因). arxiv 的 RSS pubDate 本身就是可靠的发布
+	// 日期, URL sanity check 对 arxiv 不适用. urlDateReArxiv 仍保留, 只是
+	// extractDateFromURL 不再对它返回 true.
+	_ = urlDateReArxiv
 	return time.Time{}, false
 }
 
@@ -1270,6 +1274,42 @@ func extractDateFromText(s string) (time.Time, bool) {
 // title/content) are DROPPED rather than kept. The prior "keep on
 // unknown" policy produced false positives; the user explicitly asked
 // for quality over recall.
+// formatByCategoryCounts 把 items 按 sourceCategories[source_id] 分桶计数,
+// 输出 "paper=N blog=M news=K ..." 字符串供 stage 日志用. category 空串的
+// 归到 "_unknown" 桶. 稳定按字母序输出, 方便跨 run 对比.
+func formatByCategoryCounts(items []*store.RawItem, sourceCategories map[int64]string) string {
+	counts := map[string]int{}
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		cat := ""
+		if sourceCategories != nil {
+			cat = strings.ToLower(strings.TrimSpace(sourceCategories[it.SourceID]))
+		}
+		if cat == "" {
+			cat = "_unknown"
+		}
+		counts[cat]++
+	}
+	if len(counts) == 0 {
+		return "(empty)"
+	}
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%s=%d", k, counts[k])
+	}
+	return b.String()
+}
+
 func filterByWindow(items []*store.RawItem, cutoff time.Time) []*store.RawItem {
 	out := make([]*store.RawItem, 0, len(items))
 	var fallbackHits, droppedStale, droppedUnknown int

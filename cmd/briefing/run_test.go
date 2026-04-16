@@ -38,16 +38,19 @@ func TestExtractDateFromURL(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name: "arxiv_yymm",
+			// 2026-04-16 修复: arxiv ID 不编码日号, 不再返回伪日期 (day=1
+			// 会让 filter 误判当月中下旬论文为 "旧文" drop 掉). arxiv 的
+			// RSS pubDate 本身可靠, 不走 URL sanity check.
+			name: "arxiv_yymm_skipped",
 			url:  "https://arxiv.org/abs/2604.11465",
-			want: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
-			ok:   true,
+			want: time.Time{},
+			ok:   false,
 		},
 		{
-			name: "arxiv_old_yymm",
+			name: "arxiv_old_yymm_skipped",
 			url:  "https://arxiv.org/abs/2401.99999",
-			want: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
-			ok:   true,
+			want: time.Time{},
+			ok:   false,
 		},
 		{
 			name: "no_date_in_url",
