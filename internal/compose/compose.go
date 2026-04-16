@@ -227,19 +227,62 @@ func (c *composer) Compose(
 			if sec.MaxItems > 0 && len(items) > sec.MaxItems {
 				items = items[:sec.MaxItems]
 			}
-			md := composeFallbackFromRawItems(items)
+			// T14 fallback 两层: (1) 简化 LLM 调用 — 只给 title+URL, prompt
+			// 小, 比 compose 正常 prompt 更容易过 LLM 502. 目的是拿到中文
+			// 产出. (2) 如 LLM 也挂, 用 raw items 原样拼 (可能含英文 title).
+			md := ""
+			simpleItems := buildSimplifiedItems(items)
+			if simpleMd, simpleErr := summarizer.Summarize(ctx, sec.Title, simpleItems); simpleErr == nil {
+				simpleMd = strings.TrimSpace(simpleMd)
+				if simpleMd != "" {
+					md = simpleMd
+					log.Printf("[INFO] compose fallback: section %q used simplified-LLM fallback (%d items)", secID, len(items))
+				}
+			} else {
+				log.Printf("[WARN] compose fallback: section %q simplified-LLM also failed (%v), using raw-items", secID, simpleErr)
+			}
+			if md == "" {
+				md = composeFallbackFromRawItems(items)
+				log.Printf("[INFO] compose fallback: section %q used raw-items fallback (%d items, 原文可能含英文)", secID, len(items))
+			}
 			if strings.TrimSpace(md) == "" {
 				stillFailedAfterFallback = append(stillFailedAfterFallback, secID)
 				continue
 			}
 			issueItems := splitMarkdownIntoIssueItems(md, secID, issueID, items)
 			out = append(out, issueItems...)
-			log.Printf("[INFO] compose fallback: section %q used raw-items fallback (%d items)", secID, len(issueItems))
 		}
 		failedSections = stillFailedAfterFallback
 	}
 
 	return out, failedSections, nil
+}
+
+// buildSimplifiedItems 构建"极简版 RawItem 列表"给 T14 fallback 的简化 LLM
+// 调用用 — 只保留 Title 和 URL, 把 Content 清空. Prompt 小很多, 触发 LLM 502
+// 概率也低; 成功的话 LLM 仍会按系统 prompt 要求输出中文, 解决 fallback 时
+// 研究论文 title 全是英文的问题.
+func buildSimplifiedItems(items []*store.RawItem) []*store.RawItem {
+	out := make([]*store.RawItem, 0, len(items))
+	for _, it := range items {
+		if it == nil || strings.TrimSpace(it.Title) == "" {
+			continue
+		}
+		out = append(out, &store.RawItem{
+			ID:           it.ID,
+			DomainID:     it.DomainID,
+			SourceID:     it.SourceID,
+			ExternalID:   it.ExternalID,
+			URL:          it.URL,
+			Title:        it.Title,
+			Author:       it.Author,
+			PublishedAt:  it.PublishedAt,
+			FetchedAt:    it.FetchedAt,
+			Content:      "", // 清空, 让 prompt 变小
+			MetadataJSON: "",
+		})
+	}
+	return out
 }
 
 // composeFallbackFromRawItems 用 raw items 直接拼简版 markdown, 不调 LLM.

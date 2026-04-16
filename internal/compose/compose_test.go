@@ -142,8 +142,9 @@ func TestCompose_RetryFailsSecondPass_FallbackUsesRawItems(t *testing.T) {
 	if len(failed) != 0 {
 		t.Errorf("T14 fallback expected, got failedSections=%v", failed)
 	}
-	if fs.calls["SectionB"] != 2 {
-		t.Errorf("expected SectionB 2 calls (1 original + 1 retry), got %d", fs.calls["SectionB"])
+	// 1 original compose + 1 retry + 1 simplified-LLM fallback = 3
+	if fs.calls["SectionB"] != 3 {
+		t.Errorf("expected SectionB 3 calls (1 original + 1 retry + 1 simplified-LLM fallback), got %d", fs.calls["SectionB"])
 	}
 	// 验证 fallback 产物在 out 里, 标题里能看到 raw item 的 fallback 标记.
 	foundFallback := false
