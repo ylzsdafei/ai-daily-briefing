@@ -969,6 +969,9 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			return fmt.Errorf("slack prod publish failed: %s", prodDelivery.ResponseJSON)
 		}
 		stage("publish: slack prod OK")
+
+		// v1.0.1 Phase 4.5: 飞书推送 (跟 Slack prod 同条件, fail-soft).
+		publishDailyToFeishu(ctx, insight, issue.Summary, render.FormatDateZH(issue), reportURL)
 	} else {
 		stage("publish: target=test, skipping prod channel")
 	}
