@@ -1880,6 +1880,7 @@ func generateDailySummary(ctx context.Context, llmCfg config.LLMConfig, items []
 - 可以用"重磅"、"震撼"、"突袭"、"颠覆"、"炸裂"、"屠榜"等带情绪的词增加趣味性，但要**克制**：每行最多一个这类词
 - 关键是靠事实本身制造冲击力（具体数字、具体动作、具体对比），形容词只是锦上添花
 - 每行内部可以用逗号把两三个事件拼在一起，制造信息密度
+- **涉及非大众熟知的产品/公司（如 HoloTab / Skyscanner / Cadence 这类文职同事可能不认识的名字）, 必须用一个极简中文注释, 格式 "XX（简短说明）"**. 例: "HoloTab（AI 浏览器助手）" / "Cadence（芯片设计工具巨头）". 注释 4-10 字即可, 不要长. 大众名 (OpenAI / Google / Claude) 不用注释.
 - 直接输出这 3 行，不加任何解释或前后缀
 
 好的示例：
