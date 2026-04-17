@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -35,6 +36,11 @@ type Config struct {
 	TopN       int           // return at most TopN items, default 30
 	MaxRetries int           // per-batch retries, default 3
 	Timeout    time.Duration // per-request timeout, default 120s
+	// RetryBackoffSeconds is the backoff sequence for per-batch retries.
+	// Each element is the number of seconds to sleep before the next attempt.
+	// The length of this slice determines MaxRetries (overrides MaxRetries
+	// when non-empty). Default: [10, 30, 90].
+	RetryBackoffSeconds []int
 	// PerCategoryQuota caps how many top-scoring items the ranker will
 	// return from each source category (news / blog / paper / project /
 	// community). When set, rank does two passes:
@@ -65,6 +71,9 @@ func (c *Config) fillDefaults() {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = 120 * time.Second
+	}
+	if len(c.RetryBackoffSeconds) == 0 {
+		c.RetryBackoffSeconds = []int{10, 30, 90}
 	}
 }
 
@@ -210,6 +219,27 @@ type chatResponse struct {
 	} `json:"error"`
 }
 
+// httpStatusError wraps an HTTP status code so callers can distinguish
+// permanent errors (401/403) from transient ones (429/502/503).
+type httpStatusError struct {
+	Code int
+	Err  error
+}
+
+func (e *httpStatusError) Error() string { return e.Err.Error() }
+func (e *httpStatusError) Unwrap() error { return e.Err }
+
+// isPermanentHTTPError returns true for HTTP status codes that indicate
+// the request will never succeed (bad credentials, forbidden), so retrying
+// is pointless.
+func isPermanentHTTPError(err error) bool {
+	var he *httpStatusError
+	if errors.As(err, &he) {
+		return he.Code == 401 || he.Code == 403
+	}
+	return false
+}
+
 // rankVerdict matches one element of the LLM-emitted JSON array.
 type rankVerdict struct {
 	ID     int64   `json:"id"`
@@ -243,25 +273,31 @@ func (r *llmRanker) Rank(
 
 	// Batch items to stay under token limits.
 	var allVerdicts []rankVerdict
+	totalBatches := (len(items) + r.cfg.BatchSize - 1) / r.cfg.BatchSize
+	successCount := 0
+	var batchErrors []string
 	for start := 0; start < len(items); start += r.cfg.BatchSize {
 		end := start + r.cfg.BatchSize
 		if end > len(items) {
 			end = len(items)
 		}
 		batch := items[start:end]
+		batchNum := start/r.cfg.BatchSize + 1
 
 		verdicts, err := r.rankBatchWithRetry(ctx, batch)
 		if err != nil {
-			// A single batch failing should not torpedo the whole run.
-			// Skip this batch and keep going; downstream will still have
-			// verdicts from other batches to work with.
+			log.Printf("[WARN] rank: batch %d/%d failed: %v", batchNum, totalBatches, err)
+			batchErrors = append(batchErrors, fmt.Sprintf("batch %d: %v", batchNum, err))
 			continue
 		}
+		successCount++
 		allVerdicts = append(allVerdicts, verdicts...)
 	}
 
+	log.Printf("[rank] %d/%d batches succeeded", successCount, totalBatches)
+
 	if len(allVerdicts) == 0 {
-		return nil, errors.New("rank: no verdicts produced for any batch")
+		return nil, fmt.Errorf("rank: all %d batches failed: %s", totalBatches, strings.Join(batchErrors, "; "))
 	}
 
 	// Merge verdicts with RawItems. If multiple verdicts reference the
@@ -429,21 +465,44 @@ func applyPerCategoryQuota(
 	return out
 }
 
-// rankBatchWithRetry attempts up to MaxRetries LLM calls for a single
-// batch, returning the first successfully-parsed verdict slice.
+// rankBatchWithRetry attempts LLM calls for a single batch with
+// exponential backoff driven by Config.RetryBackoffSeconds.
+//
+// Error handling:
+//   - Permanent HTTP errors (401/403) -> return immediately, no retry.
+//   - Transient errors (429/502/503/timeout/parse) -> backoff and retry.
+//   - Context cancellation -> return ctx.Err() immediately.
 func (r *llmRanker) rankBatchWithRetry(ctx context.Context, batch []*store.RawItem) ([]rankVerdict, error) {
 	userPrompt := fmt.Sprintf(rankUserPromptTemplate, formatItemsForRank(batch))
 
+	backoffs := r.cfg.RetryBackoffSeconds
+	maxAttempts := len(backoffs) + 1 // first attempt + len(backoffs) retries
+
 	var lastErr error
-	for attempt := 1; attempt <= r.cfg.MaxRetries; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		raw, err := r.chatComplete(ctx, rankSystemPrompt, userPrompt)
 		if err != nil {
 			lastErr = err
+			// Permanent errors: don't retry.
+			if isPermanentHTTPError(err) {
+				return nil, fmt.Errorf("rank: permanent error (not retrying): %w", err)
+			}
+			// Context cancelled: bail out.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// Transient error: backoff and retry if attempts remain.
+			if err := sleepBackoff(ctx, attempt, maxAttempts, backoffs, "failed", err); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		verdicts, perr := parseRankJSON(raw)
 		if perr != nil {
 			lastErr = perr
+			if err := sleepBackoff(ctx, attempt, maxAttempts, backoffs, "parse failed", perr); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		return verdicts, nil
@@ -452,6 +511,24 @@ func (r *llmRanker) rankBatchWithRetry(ctx context.Context, batch []*store.RawIt
 		lastErr = errors.New("rank: batch failed with no specific error")
 	}
 	return nil, lastErr
+}
+
+// sleepBackoff handles the common retry-wait pattern: if attempts remain,
+// log a warning and sleep for the configured backoff duration (respecting
+// context cancellation). Returns nil to continue the retry loop, or a
+// non-nil error to abort (context cancelled).
+func sleepBackoff(ctx context.Context, attempt, maxAttempts int, backoffs []int, label string, cause error) error {
+	if attempt >= maxAttempts {
+		return nil // no more retries, let caller handle lastErr
+	}
+	backoff := time.Duration(backoffs[attempt-1]) * time.Second
+	log.Printf("[rank] attempt %d/%d %s: %v; retrying in %v", attempt, maxAttempts, label, cause, backoff)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(backoff):
+		return nil
+	}
 }
 
 // formatItemsForRank renders a batch into the bullet-list that the
@@ -649,7 +726,10 @@ func (r *llmRanker) chatComplete(parent context.Context, system, user string) (s
 		if len(snippet) > 500 {
 			snippet = snippet[:500] + "..."
 		}
-		return "", fmt.Errorf("rank openai http %d: %s", resp.StatusCode, snippet)
+		return "", &httpStatusError{
+			Code: resp.StatusCode,
+			Err:  fmt.Errorf("rank openai http %d: %s", resp.StatusCode, snippet),
+		}
 	}
 
 	var cr chatResponse

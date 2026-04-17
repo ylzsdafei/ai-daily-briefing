@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"briefing-v3/internal/config"
+	"briefing-v3/internal/render"
 	"briefing-v3/internal/store"
 )
 
@@ -204,14 +205,20 @@ func main() {
 	case "seed":
 		err = seedCommand(ctx, cfg)
 	case "run":
-		err = runCommand(ctx, cfg, date, gf)
+		// #9: 全局 pipeline 超时 30 分钟, 防止 LLM hang / 网络卡死导致
+		// pipeline 无限等待. 只对 run 子命令生效.
+		runCtx, runCancel := context.WithTimeout(ctx, 30*time.Minute)
+		err = runCommand(runCtx, cfg, date, gf)
+		runCancel()
 	case "repair":
 		// v1.0.1 Batch 2.18: orchestrator Attempt 4 调 briefing repair
 		// --section X,Y 只补缺失 section. 当前最小实现: 别名给 run (Team C
 		// orchestrator 已经 graceful fallback 到完整 run 所以等价).
 		// 真正的 per-section 重跑 (跳过 rank+classify, 只 compose 指定
 		// section) 是 P1 refinement, 等后续细化.
-		err = runCommand(ctx, cfg, date, gf)
+		repairCtx, repairCancel := context.WithTimeout(ctx, 30*time.Minute)
+		err = runCommand(repairCtx, cfg, date, gf)
+		repairCancel()
 	case "weekly":
 		err = weeklyCommand(ctx, cfg, date, gf)
 	case "regen":
@@ -433,6 +440,20 @@ func promoteCommand(ctx context.Context, cfg *config.Config, date time.Time, gf 
 		return fmt.Errorf("slack prod publish failed: %s", delivery.ResponseJSON)
 	}
 	fmt.Printf("[%s] promote: slack prod OK\n", time.Now().Format("15:04:05"))
+
+	// #4: promote 加飞书推送 — 跟 run.go 的 prod publish 对齐.
+	// fail-soft: 飞书失败只 warn 不阻断 promote.
+	if issue != nil {
+		insight, ierr := s.GetIssueInsight(ctx, issue.ID)
+		if ierr != nil {
+			fmt.Printf("[WARN] promote: get insight for feishu: %v\n", ierr)
+		}
+		reportURL := buildReportURL(date)
+		publishDailyToFeishu(ctx, insight, issue.Summary, render.FormatDateZH(issue), reportURL)
+	} else {
+		fmt.Println("[WARN] promote: no issue row, skipping feishu push")
+	}
+
 	return nil
 }
 

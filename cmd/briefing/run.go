@@ -825,13 +825,7 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// Hextra-style path /YYYY-MM/YYYY-MM-DD/ instead of the legacy
 	// docs/YYYY-MM-DD.html path. Both placeholders are replaced; unknown
 	// tokens pass through unchanged.
-	reportURL := fmt.Sprintf("file:///root/briefing-v3/docs/%s.html", date.Format("2006-01-02"))
-	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
-		reportURL = strings.ReplaceAll(base, "{{DATE}}", date.Format("2006-01-02"))
-		reportURL = strings.ReplaceAll(reportURL, "{{YEARMONTH}}", date.Format("2006-01"))
-		// v1.0.0: 三级 sidebar tree 需要 /YYYY/YYYY-MM/YYYY-MM-DD/ URL
-		reportURL = strings.ReplaceAll(reportURL, "{{YEAR}}", date.Format("2006"))
-	}
+	reportURL := buildReportURL(date)
 
 	// --- 14. Hard quality gate -----------------------------------------
 	// INTERFACE CHANGE (T2/C4): gate.Check() now takes failedSections
@@ -1017,21 +1011,27 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// 把这次推送的所有 source URL 加入 sent set, 下次 run 不再选这些条目.
 	// 用户原话: "我希望每一次都是新的信息". fail-soft: 写入失败 log 警告
 	// 但不返回 error (推送已经成功, dedup 优化失败不影响本次结果).
-	if newSent := collectIssueItemSourceURLs(issueItems); len(newSent) > 0 {
-		appendSentURLs(newSent)
-		stage(fmt.Sprintf("dedup: persisted %d new URLs to sent set", len(newSent)))
-	}
-
-	// v1.0.1: persist sent titles for title-based dedup.
-	var newTitles []string
-	for _, it := range issueItems {
-		if it != nil && strings.TrimSpace(it.Title) != "" {
-			newTitles = append(newTitles, it.Title)
+	// #6: target=test 不污染 dedup — test smoke 不应影响下次正式推送的去重集.
+	// loadSentURLs/loadSentTitles (读取) 仍在 test 执行, 保证 test 能看到去重效果.
+	if gf.target != "test" {
+		if newSent := collectIssueItemSourceURLs(issueItems); len(newSent) > 0 {
+			appendSentURLs(newSent)
+			stage(fmt.Sprintf("dedup: persisted %d new URLs to sent set", len(newSent)))
 		}
-	}
-	if len(newTitles) > 0 {
-		appendSentTitles(newTitles)
-		stage(fmt.Sprintf("title-dedup: persisted %d new titles", len(newTitles)))
+
+		// v1.0.1: persist sent titles for title-based dedup.
+		var newTitles []string
+		for _, it := range issueItems {
+			if it != nil && strings.TrimSpace(it.Title) != "" {
+				newTitles = append(newTitles, it.Title)
+			}
+		}
+		if len(newTitles) > 0 {
+			appendSentTitles(newTitles)
+			stage(fmt.Sprintf("title-dedup: persisted %d new titles", len(newTitles)))
+		}
+	} else {
+		stage("dedup: target=test, skipping persist to avoid polluting sent set")
 	}
 
 	stage("pipeline complete: issue published")
@@ -2168,9 +2168,25 @@ func prodPublishIssues(ctx context.Context, rendered *publish.RenderedIssue) []s
 		issues = append(issues, "缺少完整今日摘要")
 	}
 	if msg := checkPublicReportURL(ctx, rendered.ReportURL); msg != "" {
-		issues = append(issues, msg)
+		// #2: 降级为 warn-only — 完整版链接不可达不应阻断 prod 推送
+		// (CDN 延迟 / DNS 缓存 等都可能导致短暂不可达).
+		fmt.Printf("[WARN] prod readiness: %s (non-blocking)\n", msg)
 	}
 	return issues
+}
+
+// buildReportURL constructs the public report URL for the given date.
+// Uses BRIEFING_REPORT_URL_BASE env var with {{DATE}}, {{YEARMONTH}}, {{YEAR}}
+// placeholders. Falls back to a local file:// URI when env var is unset.
+// Shared by run.go, regen.go, and main.go (promote).
+func buildReportURL(date time.Time) string {
+	reportURL := fmt.Sprintf("file:///root/briefing-v3/docs/%s.html", date.Format("2006-01-02"))
+	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
+		reportURL = strings.ReplaceAll(base, "{{DATE}}", date.Format("2006-01-02"))
+		reportURL = strings.ReplaceAll(reportURL, "{{YEARMONTH}}", date.Format("2006-01"))
+		reportURL = strings.ReplaceAll(reportURL, "{{YEAR}}", date.Format("2006"))
+	}
+	return reportURL
 }
 
 func checkPublicReportURL(ctx context.Context, rawURL string) string {

@@ -333,15 +333,7 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 	}
 
 	// --- 4. Build & publish ------------------------------------------
-	reportURL := fmt.Sprintf("file:///root/briefing-v3/docs/%s.html", date.Format("2006-01-02"))
-	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
-		// v1.0.0: support {{DATE}} / {{YEARMONTH}} / {{YEAR}} placeholders
-		// to align with run.go and the three-level Hextra URL structure
-		// /YYYY/YYYY-MM/YYYY-MM-DD/.
-		reportURL = strings.ReplaceAll(base, "{{DATE}}", date.Format("2006-01-02"))
-		reportURL = strings.ReplaceAll(reportURL, "{{YEARMONTH}}", date.Format("2006-01"))
-		reportURL = strings.ReplaceAll(reportURL, "{{YEAR}}", date.Format("2006"))
-	}
+	reportURL := buildReportURL(date)
 	// Slack image_url only accepts JPG/PNG/GIF. If the hero override is
 	// AVIF/WEBP (modern formats many sites use now) Slack returns
 	// invalid_blocks. Detect the extension and, for Slack, fall back
@@ -431,6 +423,15 @@ func regenCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *g
 			return fmt.Errorf("slack prod publish failed: %s", prodDelivery.ResponseJSON)
 		}
 		stage("publish: slack prod OK")
+
+		// #5: 飞书推送 (跟 Slack prod 同条件, fail-soft, 对齐 run.go).
+		publishDailyToFeishu(ctx, insight, summary, render.FormatDateZH(issue), reportURL)
+
+		// #8: 标记 issue status=published, 使 post-run.sh 触发 git push.
+		if err := s.MarkIssuePublished(ctx, issue.ID); err != nil {
+			return fmt.Errorf("mark published: %w", err)
+		}
+		stage("publish: marked issue published")
 	} else if wantsProdTarget && !report.Pass {
 		stage("publish: gate failed, skipping prod")
 	} else {
