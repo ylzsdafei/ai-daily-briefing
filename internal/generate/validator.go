@@ -70,6 +70,7 @@ var trailingHeaderRegex = regexp.MustCompile(`\s*#{1,6}\s*$`)
 
 // numberedItemRegex counts "1.", "2." style lines. Mirrors JS countNumberedItems.
 var numberedItemRegex = regexp.MustCompile(`(?m)^\d+\.`)
+var numberedItemCaptureRegex = regexp.MustCompile(`(?m)^(\d+)\.`)
 
 // mermaidBlockRegex matches a fenced ```mermaid ... ``` block anywhere in raw.
 // Used by the structural contract check in ValidateInsight — mermaid is a
@@ -116,6 +117,24 @@ func countNumberedItems(text string) int {
 	return len(numberedItemRegex.FindAllString(text, -1))
 }
 
+func hasSequentialNumbering(text string) bool {
+	matches := numberedItemCaptureRegex.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return false
+	}
+	expected := 1
+	for _, m := range matches {
+		if len(m) < 2 {
+			return false
+		}
+		if itoa(expected) != m[1] {
+			return false
+		}
+		expected++
+	}
+	return true
+}
+
 // ValidateInsight checks that the LLM output contains both sections, that
 // each section has the expected bullet count, and that no banned pattern
 // appears. Mirrors validateInsightOutput() in slack-notify.js (rows 104-132).
@@ -124,8 +143,8 @@ func countNumberedItems(text string) int {
 //   - annotation coverage (jargon without nearby 括号注释) → Warnings
 //   - mermaid block presence → Warnings
 //
-// Both new checks are intentionally soft (they never contribute to Reasons)
-// so they can be logged without tripping the retry loop in GenerateInsight.
+// 注释覆盖保持软要求：它很重要，但不能因为个别名词漏注释就让整期日报
+// 直接失败，避免“好内容因局部表述问题整期报废”。
 func ValidateInsight(raw string) ValidationResult {
 	industryRaw, ourRaw := ParseInsightSections(raw)
 
@@ -145,6 +164,15 @@ func ValidateInsight(raw string) ValidationResult {
 	if ourCount < 2 || ourCount > 3 {
 		reasons = append(reasons,
 			"对我们的启发条数异常（当前 "+itoa(ourCount)+" 条）")
+	}
+	if !hasSequentialNumbering(industryRaw) {
+		reasons = append(reasons, "行业洞察编号不连续或未从 1 开始")
+	}
+	if !hasSequentialNumbering(ourRaw) {
+		reasons = append(reasons, "对我们的启发编号不连续或未从 1 开始")
+	}
+	if industryCount > 0 && strings.Count(industryRaw, "【洞察】") < industryCount {
+		reasons = append(reasons, "行业洞察缺少对应的【洞察】判断行")
 	}
 
 	for _, bp := range bannedPatterns {
