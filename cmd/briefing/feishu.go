@@ -152,6 +152,10 @@ func buildFeishuDailyCard(insight *store.IssueInsight, summary, dateZH, reportUR
 	}
 }
 
+func buildDailyFeishuCardSnapshot(insight *store.IssueInsight, summary, dateZH, reportURL string) map[string]any {
+	return buildFeishuDailyCard(insight, summary, dateZH, reportURL)
+}
+
 // buildFeishuWeeklyCard 构建周报飞书卡片.
 func buildFeishuWeeklyCard(weekly *store.WeeklyIssue, weeklyPageURL string) map[string]any {
 	focusMD := strings.TrimSpace(weekly.FocusMD)
@@ -199,6 +203,10 @@ func buildFeishuWeeklyCard(weekly *store.WeeklyIssue, weeklyPageURL string) map[
 		},
 		"elements": elements,
 	}
+}
+
+func buildWeeklyFeishuCardSnapshot(weekly *store.WeeklyIssue, weeklyPageURL string) map[string]any {
+	return buildFeishuWeeklyCard(weekly, weeklyPageURL)
 }
 
 // publishDailyToFeishu 是 run.go publish 阶段调用的入口. fail-soft: 失败只
