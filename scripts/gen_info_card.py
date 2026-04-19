@@ -98,6 +98,59 @@ def _find_sc_index(path):
 # Cache SC index per path to avoid repeated probing.
 _sc_index_cache = {}
 
+LINUX_BOLD_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/SourceHanSansSC-Bold.otf",
+]
+
+LINUX_REGULAR_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/SourceHanSansSC-Regular.otf",
+]
+
+MAC_BOLD_FONT_CANDIDATES = [
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+]
+
+MAC_REGULAR_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+]
+
+
+def resolve_font_path(requested_path, role):
+    """Return the first usable font path for this machine.
+
+    Order:
+    1. explicitly requested path
+    2. role-specific macOS candidates
+    3. role-specific Linux candidates
+    """
+    candidates = []
+    if requested_path:
+        candidates.append(requested_path)
+    if role == "bold":
+        candidates.extend(LINUX_BOLD_FONT_CANDIDATES)
+        candidates.extend(MAC_BOLD_FONT_CANDIDATES)
+    else:
+        candidates.extend(LINUX_REGULAR_FONT_CANDIDATES)
+        candidates.extend(MAC_REGULAR_FONT_CANDIDATES)
+
+    seen = set()
+    for raw in candidates:
+        path = str(raw).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.exists(path):
+            return path
+    return requested_path
+
 def load_font(path, size):
     """Load a TrueType font. For TTC collections, automatically selects
     the Simplified Chinese (SC) face instead of the default JP face.
@@ -177,7 +230,18 @@ def wrap_by_width(draw, text, font, max_width):
     return out
 
 
-def draw_wrapped(draw, xy, text, font, fill, max_width, line_spacing=1.25, max_lines=None):
+def draw_wrapped(
+    draw,
+    xy,
+    text,
+    font,
+    fill,
+    max_width,
+    line_spacing=1.25,
+    max_lines=None,
+    stroke_width=0,
+    stroke_fill=None,
+):
     """Draw wrapped text. Returns the y-coordinate just below the
     last drawn line."""
     lines = wrap_by_width(draw, text, font, max_width)
@@ -190,7 +254,14 @@ def draw_wrapped(draw, xy, text, font, fill, max_width, line_spacing=1.25, max_l
     bbox = draw.textbbox((0, 0), "好", font=font)
     lh = int((bbox[3] - bbox[1]) * line_spacing)
     for line in lines:
-        draw.text((x, y), line, font=font, fill=fill)
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill or fill,
+        )
         y += lh
     return y
 
@@ -502,6 +573,8 @@ def render_header_card(data, output_path, width, height,
     left_y = draw_wrapped(
         draw, (pad_x, left_y), headline, f_l1, INK_MAIN,
         left_w, line_spacing=1.08, max_lines=3,
+        stroke_width=max(1, int(2 * scale)),
+        stroke_fill=INK_MAIN,
     )
     left_y += int(18 * scale)
     lead = data.get("lead_paragraph", "").strip()
@@ -711,14 +784,18 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     if args.mode == "item":
+        font_bold = resolve_font_path(args.font_bold, "bold")
+        font_regular = resolve_font_path(args.font_regular, "regular")
         render_item_card(
             data, args.output, args.width, args.height,
-            args.font_bold, args.font_regular,
+            font_bold, font_regular,
         )
     else:
+        font_bold = resolve_font_path(args.font_bold, "bold")
+        font_regular = resolve_font_path(args.font_regular, "regular")
         render_header_card(
             data, args.output, args.width, args.height,
-            args.font_bold, args.font_regular,
+            font_bold, font_regular,
         )
 
     print(f"OK: {args.output}", file=sys.stdout)
