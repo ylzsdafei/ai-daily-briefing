@@ -79,6 +79,15 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		stage(fmt.Sprintf("recover: marked %d stale 'running' stages as 'failed'", recovered))
 	}
 
+	// Same-day rerun detection: if an issue row for this exact date/domain
+	// already exists, we should NOT let sent_urls / sent_titles poison the
+	// replacement run. Cross-day dedup is still desired; same-day reruns are
+	// usually fixing a bad issue and must be free to re-select the best items.
+	var rerunExistingIssue *store.Issue
+	if ex, err := s.GetIssueByDate(ctx, gf.domain, date); err == nil && ex != nil {
+		rerunExistingIssue = ex
+	}
+
 	// --- 1. Upsert the Issue row for today ------------------------------
 	issue := &store.Issue{
 		DomainID:  gf.domain,
@@ -132,22 +141,10 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	}
 	stage(fmt.Sprintf("store: %d raw items persisted", len(rawItems)))
 
-	// Assign an in-memory sequential ID to every raw item so that the
-	// downstream rank.Rank() can build its byID map without collisions.
-	// The store layer does not back-fill AUTOINCREMENT ids on bulk insert,
-	// so rawItems[].ID would otherwise all stay 0 — we saw this in the
-	// first dry-run where rank collapsed 967 items into 1. The temporary
-	// ID is only used for LLM batching and is not persisted; compose and
-	// render never cross back to raw_items via this id.
-	for i, it := range rawItems {
-		if it != nil {
-			it.ID = int64(i + 1)
-		}
-	}
-
 	// --- 4. Filter by time window ---------------------------------------
 	cutoff := date.Add(-time.Duration(cfg.Window.LookbackHours) * time.Hour)
 	filtered := filterByWindow(rawItems, cutoff)
+	activeFiltered := filtered
 	stage(fmt.Sprintf("filter: %d → %d items within %dh", len(rawItems), len(filtered), cfg.Window.LookbackHours))
 
 	// If not enough in the strict window, relax to extended window.
@@ -167,7 +164,11 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// briefing 中推送过的 URL. 这样即使同一天多次 run, 每次也都是全新内容.
 	// 实现 fail-soft: dedup 是优化项, 任何错误都不阻塞 pipeline.
 	sentURLs := loadSentURLs()
-	if len(sentURLs) > 0 {
+	skipCrossRunDedup := rerunExistingIssue != nil
+	if skipCrossRunDedup {
+		stage("dedup: same-date rerun detected, skipping sent_urls / sent_titles history")
+	}
+	if !skipCrossRunDedup && len(sentURLs) > 0 {
 		beforeDedup := len(filtered)
 		filtered = dedupRawItemsBySent(filtered, sentURLs)
 		stage(fmt.Sprintf("dedup: %d → %d items (skipped %d already pushed in past runs)",
@@ -179,7 +180,7 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 
 	// v1.0.1: title-based dedup (same news from different sources).
 	sentTitles := loadSentTitles()
-	if len(sentTitles) > 0 {
+	if !skipCrossRunDedup && len(sentTitles) > 0 {
 		beforeTitleDedup := len(filtered)
 		filtered = dedupRawItemsByTitle(filtered, sentTitles)
 		if dropped := beforeTitleDedup - len(filtered); dropped > 0 {
@@ -299,39 +300,6 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	}
 	recordStage(store.StageClassify, store.StageStatusSucceeded, "")
 
-	// v1.0.1 Batch 2.9: persist classified items to DB so `briefing repair
-	// --section X` can re-compose without paying classify LLM cost again.
-	// Best-effort — per-item insert with WARN 不用整批 TX (防 1 行 FK 错
-	// 回滚整个 section 数据). RawItemID=0 的项跳过, 避免 FK 约束错误日志.
-	// (FK 偶发问题: 极少数 item 在内存中有非零 ID 但 DB 里没这行 — 可能
-	//  由于 test DB 副本 / ON CONFLICT IGNORE / ingest ID 分配路径中某处.
-	//  详细排查推到明天 P1.)
-	classifiedInserted := 0
-	classifiedSkipped := 0
-	for secID, secItems := range sectioned {
-		for i, item := range secItems {
-			if item == nil || item.ID == 0 {
-				classifiedSkipped++
-				continue
-			}
-			row := []*store.ClassifiedItem{{
-				IssueID:   issueID,
-				Section:   secID,
-				RawItemID: item.ID,
-				RankScore: 0,
-				Seq:       i + 1,
-			}}
-			if cerr := s.InsertClassifiedItems(ctx, row); cerr != nil {
-				classifiedSkipped++
-				continue
-			}
-			classifiedInserted++
-		}
-	}
-	if classifiedInserted > 0 || classifiedSkipped > 0 {
-		stage(fmt.Sprintf("classify persist: %d inserted, %d skipped (FK / zero-id)", classifiedInserted, classifiedSkipped))
-	}
-
 	// --- 6b. Extended window fallback (Batch 2.20) ---------------------
 	// 防"opensource/social 0 信息"场景 (2026-04-14 故障教训): classify 完
 	// 后若某 section items < 配置的 min_items, 自动把 filter 窗口从 24h
@@ -350,15 +318,15 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			strings.Join(shortSections, ","), cfg.Window.ExtendedHours))
 		cutoff2 := date.Add(-time.Duration(cfg.Window.ExtendedHours) * time.Hour)
 		filtered2 := filterByWindow(rawItems, cutoff2)
-		if len(sentURLs) > 0 {
+		if !skipCrossRunDedup && len(sentURLs) > 0 {
 			filtered2 = dedupRawItemsBySent(filtered2, sentURLs)
 		}
-		if len(sentTitles) > 0 {
+		if !skipCrossRunDedup && len(sentTitles) > 0 {
 			filtered2 = dedupRawItemsByTitle(filtered2, sentTitles)
 		}
-		if len(filtered2) > len(filtered) {
-			stage(fmt.Sprintf("extended filter: %d items in %dh (vs %d in %dh)",
-				len(filtered2), cfg.Window.ExtendedHours, len(filtered), cfg.Window.LookbackHours))
+			if len(filtered2) > len(filtered) {
+				stage(fmt.Sprintf("extended filter: %d items in %dh (vs %d in %dh)",
+					len(filtered2), cfg.Window.ExtendedHours, len(filtered), cfg.Window.LookbackHours))
 			// v1.0.1 Phase 4.2: extended path 也要算 signal_strength, 否则
 			// filtered2 里 item.SignalStrength 还是 0 (拿不到共振加权).
 			_ = ingest.CalculateSignalStrength(filtered2)
@@ -373,13 +341,14 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 						rankedRaws2 = append(rankedRaws2, r.Item)
 					}
 				}
-				if sectioned2, cerr := classifier.Classify(ctx, rankedRaws2, sourceCategories); cerr != nil {
-					stage(fmt.Sprintf("extended classify: failed (%v) — keeping original", cerr))
-				} else {
-					// 整体替换, compose+insight 都用新数据
-					sectioned = sectioned2
-					rankedRaws = rankedRaws2
-					stage("extended window: switched to extended result")
+					if sectioned2, cerr := classifier.Classify(ctx, rankedRaws2, sourceCategories); cerr != nil {
+						stage(fmt.Sprintf("extended classify: failed (%v) — keeping original", cerr))
+					} else {
+						// 整体替换, compose+insight 都用新数据
+						sectioned = sectioned2
+						rankedRaws = rankedRaws2
+						activeFiltered = filtered2
+						stage("extended window: switched to extended result")
 					for secID, secItems := range sectioned {
 						stage(fmt.Sprintf("classify(ext): %s → %d items", secID, len(secItems)))
 					}
@@ -388,6 +357,92 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		} else {
 			stage(fmt.Sprintf("extended window: no additional items in %dh (skipping re-run)", cfg.Window.ExtendedHours))
 		}
+	}
+
+	// --- 6c. Research coverage rescue ----------------------------------
+	// 实战 dry-run 发现 rule-first classify 容易把“研究解读型 blog/news”
+	// 全部压到 industry/social, 导致 research 变成 0 条。为了不把一整栏空着,
+	// 在最终 compose 前做一次最小 deterministic rescue: 从 industry/social/
+	// product_update 中回收标题明显带 study/benchmark/architecture/paper 等
+	// 研究信号的条目到 research. 只在 research 不足 min_items 时触发.
+	minResearch := 0
+	for _, sec := range cfg.Sections {
+		if sec.ID == store.SectionResearch {
+			minResearch = sec.MinItems
+			break
+		}
+	}
+	if minResearch > 0 {
+		if moved := rescueResearchCoverage(sectioned, minResearch); moved > 0 {
+			stage(fmt.Sprintf("classify rescue: moved %d research-like items into research", moved))
+			for secID, secItems := range sectioned {
+				stage(fmt.Sprintf("classify(final): %s → %d items", secID, len(secItems)))
+			}
+		}
+	}
+
+	// --- 6d. Product coverage rescue ------------------------------------
+	// 同理, 如果高价值产品/功能更新被 industry/social 吃掉, 会让整期主线
+	// 缺乏“今天到底发了什么新东西”的重心. 只在 product_update 不足 min_items
+	// 时, 从 industry/social 中回收明显是发布/上线/新版本/新功能的条目.
+	minProduct := 0
+	for _, sec := range cfg.Sections {
+		if sec.ID == store.SectionProductUpdate {
+			minProduct = sec.MinItems
+			break
+		}
+	}
+	if minProduct > 0 {
+		if moved := normalizeProductCoverage(sectioned, activeFiltered, minProduct, sourceCategories, sourcePriorities); moved > 0 {
+			stage(fmt.Sprintf("classify normalize: corrected %d product mis-buckets / backfills", moved))
+			for secID, secItems := range sectioned {
+				stage(fmt.Sprintf("classify(final): %s → %d items", secID, len(secItems)))
+			}
+		}
+		if moved := backfillProductCoverageFromPool(sectioned, activeFiltered, minProduct, sourceCategories, sourcePriorities); moved > 0 {
+			stage(fmt.Sprintf("classify rescue: backfilled %d product-like candidates from current window", moved))
+			for secID, secItems := range sectioned {
+				stage(fmt.Sprintf("classify(final): %s → %d items", secID, len(secItems)))
+			}
+		}
+		if moved := rescueProductCoverage(sectioned, minProduct); moved > 0 {
+			stage(fmt.Sprintf("classify rescue: moved %d product-like items into product_update", moved))
+			for secID, secItems := range sectioned {
+				stage(fmt.Sprintf("classify(final): %s → %d items", secID, len(secItems)))
+			}
+		}
+	}
+
+	// --- 6e. Persist FINAL classify result ------------------------------
+	// 必须在 extended window + rescue 之后再落盘, 否则 repair / status 读到的
+	// 会是扩窗前的旧分类结果, 跟最终 compose 输入不一致.
+	classifiedInserted := 0
+	classifiedSkipped := 0
+	classifiedRows := make([]*store.ClassifiedItem, 0, len(rankedRaws))
+	for secID, secItems := range sectioned {
+		for i, item := range secItems {
+			if item == nil || item.ID == 0 {
+				classifiedSkipped++
+				continue
+			}
+			classifiedRows = append(classifiedRows, &store.ClassifiedItem{
+				IssueID:   issueID,
+				Section:   secID,
+				RawItemID: item.ID,
+				RankScore: 0,
+				Seq:       i + 1,
+			})
+		}
+	}
+	if len(classifiedRows) > 0 {
+		if cerr := s.InsertClassifiedItems(ctx, classifiedRows); cerr != nil {
+			classifiedSkipped += len(classifiedRows)
+		} else {
+			classifiedInserted = len(classifiedRows)
+		}
+	}
+	if classifiedInserted > 0 || classifiedSkipped > 0 {
+		stage(fmt.Sprintf("classify persist: %d inserted, %d skipped (FK / zero-id)", classifiedInserted, classifiedSkipped))
 	}
 
 	// --- 7. Compose (LLM Step 1B text generation per section) ----------
@@ -933,6 +988,12 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	if err := savePayloadSnapshot(date, slackPayload); err != nil {
 		fmt.Printf("[WARN] save payload snapshot: %v\n", err)
 	}
+	feishuCard := buildDailyFeishuCardSnapshot(insight, issue.Summary, render.FormatDateZH(issue), reportURL)
+	if cardBytes, err := json.Marshal(feishuCard); err != nil {
+		fmt.Printf("[WARN] marshal feishu snapshot: %v\n", err)
+	} else if err := saveDailyFeishuSnapshot(date, cardBytes); err != nil {
+		fmt.Printf("[WARN] save feishu snapshot: %v\n", err)
+	}
 
 	// Dry-run short-circuit: print the markdown + payload to stdout and stop.
 	if gf.dryRun {
@@ -973,10 +1034,12 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 				alertBody, _ := json.Marshal(map[string]any{"text": alertMsg})
 				_ = postAlert(ctx, cfg.Slack.TestWebhook, alertBody)
 			}
+			if report.Warn {
+				return fmt.Errorf("gate warned, prod channel skipped: %s", gateFailureDetail(report))
+			}
 			if gateFailureBlocksRun(gf.target, report) {
 				return fmt.Errorf("gate failed, prod channel skipped: %s", gateFailureDetail(report))
 			}
-			stage("publish: gate warn → alert sent to test, continuing to prod publish")
 		}
 		if issues := prodPublishIssues(ctx, rendered); len(issues) > 0 {
 			alertMsg := buildProdReadinessAlert(issue, issues)
@@ -1009,9 +1072,13 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	// 把这次推送的所有 source URL 加入 sent set, 下次 run 不再选这些条目.
 	// 用户原话: "我希望每一次都是新的信息". fail-soft: 写入失败 log 警告
 	// 但不返回 error (推送已经成功, dedup 优化失败不影响本次结果).
-	if newSent := collectIssueItemSourceURLs(issueItems); len(newSent) > 0 {
-		appendSentURLs(newSent)
-		stage(fmt.Sprintf("dedup: persisted %d new URLs to sent set", len(newSent)))
+	if !skipCrossRunDedup {
+		if newSent := collectIssueItemSourceURLs(issueItems); len(newSent) > 0 {
+			appendSentURLs(newSent)
+			stage(fmt.Sprintf("dedup: persisted %d new URLs to sent set", len(newSent)))
+		}
+	} else {
+		stage("dedup: same-date rerun, skipping sent_urls persistence")
 	}
 
 	// v1.0.1: persist sent titles for title-based dedup.
@@ -1021,9 +1088,13 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 			newTitles = append(newTitles, it.Title)
 		}
 	}
-	if len(newTitles) > 0 {
-		appendSentTitles(newTitles)
-		stage(fmt.Sprintf("title-dedup: persisted %d new titles", len(newTitles)))
+	if !skipCrossRunDedup {
+		if len(newTitles) > 0 {
+			appendSentTitles(newTitles)
+			stage(fmt.Sprintf("title-dedup: persisted %d new titles", len(newTitles)))
+		}
+	} else {
+		stage("title-dedup: same-date rerun, skipping title persistence")
 	}
 
 	stage("pipeline complete: issue published")
@@ -1859,6 +1930,493 @@ func collectIssueItemSourceURLs(items []*store.IssueItem) []string {
 	return urls
 }
 
+func rescueResearchCoverage(sectioned map[string][]*store.RawItem, minResearch int) int {
+	if minResearch <= 0 {
+		return 0
+	}
+	current := len(sectioned[store.SectionResearch])
+	if current >= minResearch {
+		return 0
+	}
+	needed := minResearch - current
+	moved := 0
+	for _, donor := range []string{store.SectionIndustry, store.SectionSocial, store.SectionProductUpdate} {
+		if needed <= 0 {
+			break
+		}
+		var kept []*store.RawItem
+		for _, it := range sectioned[donor] {
+			if needed > 0 && looksResearchLike(it) {
+				sectioned[store.SectionResearch] = append(sectioned[store.SectionResearch], it)
+				needed--
+				moved++
+				continue
+			}
+			kept = append(kept, it)
+		}
+		sectioned[donor] = kept
+	}
+	return moved
+}
+
+func rescueProductCoverage(sectioned map[string][]*store.RawItem, minProduct int) int {
+	if minProduct <= 0 {
+		return 0
+	}
+	current := len(sectioned[store.SectionProductUpdate])
+	if current >= minProduct {
+		return 0
+	}
+	needed := minProduct - current
+	moved := 0
+	for _, donor := range []string{store.SectionIndustry, store.SectionSocial, store.SectionResearch} {
+		if needed <= 0 {
+			break
+		}
+		var kept []*store.RawItem
+		for _, it := range sectioned[donor] {
+			if needed > 0 && looksProductLike(it) {
+				sectioned[store.SectionProductUpdate] = append(sectioned[store.SectionProductUpdate], it)
+				needed--
+				moved++
+				continue
+			}
+			kept = append(kept, it)
+		}
+		sectioned[donor] = kept
+	}
+	return moved
+}
+
+func normalizeProductCoverage(
+	sectioned map[string][]*store.RawItem,
+	pool []*store.RawItem,
+	minProduct int,
+	sourceCategories map[int64]string,
+	sourcePriorities map[int64]int,
+) int {
+	if minProduct <= 0 {
+		return 0
+	}
+	changed := 0
+	var kept []*store.RawItem
+	for _, it := range sectioned[store.SectionProductUpdate] {
+		switch {
+		case looksResearchLike(it):
+			sectioned[store.SectionResearch] = append(sectioned[store.SectionResearch], it)
+			changed++
+		case looksIndustryLike(it), !looksProductLike(it):
+			sectioned[store.SectionIndustry] = append(sectioned[store.SectionIndustry], it)
+			changed++
+		default:
+			kept = append(kept, it)
+		}
+	}
+	sectioned[store.SectionProductUpdate] = kept
+	rebuilt, rebuildChanged := rebuildProductSectionFromPool(sectioned, pool, minProduct, sourceCategories, sourcePriorities)
+	if rebuildChanged {
+		sectioned[store.SectionProductUpdate] = rebuilt
+		changed++
+	}
+	return changed
+}
+
+func rebuildProductSectionFromPool(
+	sectioned map[string][]*store.RawItem,
+	pool []*store.RawItem,
+	minProduct int,
+	sourceCategories map[int64]string,
+	sourcePriorities map[int64]int,
+) ([]*store.RawItem, bool) {
+	target := minProduct
+	if target < 3 {
+		target = 3
+	}
+	type candidate struct {
+		item     *store.RawItem
+		priority int
+		catRank  int
+		weight   int
+	}
+	var candidates []candidate
+	for _, it := range pool {
+		if it == nil || it.ID == 0 || !looksProductLike(it) || looksResearchLike(it) || looksIndustryLike(it) {
+			continue
+		}
+		cat := ""
+		if sourceCategories != nil {
+			cat = sourceCategories[it.SourceID]
+		}
+		if cat == "project" || cat == "community" {
+			continue
+		}
+		catRank := 2
+		switch cat {
+		case "news":
+			catRank = 0
+		case "blog":
+			catRank = 1
+		}
+		priority := 5
+		if sourcePriorities != nil {
+			if p, ok := sourcePriorities[it.SourceID]; ok {
+				priority = p
+			}
+		}
+		candidates = append(candidates, candidate{
+			item:     it,
+			priority: priority,
+			catRank:  catRank,
+			weight:   productBackfillWeight(it),
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].weight != candidates[j].weight {
+			return candidates[i].weight > candidates[j].weight
+		}
+		if candidates[i].catRank != candidates[j].catRank {
+			return candidates[i].catRank < candidates[j].catRank
+		}
+		if candidates[i].priority != candidates[j].priority {
+			return candidates[i].priority > candidates[j].priority
+		}
+		if !candidates[i].item.PublishedAt.Equal(candidates[j].item.PublishedAt) {
+			return candidates[i].item.PublishedAt.After(candidates[j].item.PublishedAt)
+		}
+		return candidates[i].item.ID < candidates[j].item.ID
+	})
+
+	var selected []*store.RawItem
+	var keptKWs [][]string
+	seenEvents := map[string]bool{}
+	for _, c := range candidates {
+		if len(selected) >= target {
+			break
+		}
+		if key := productEventKey(c.item); key != "" {
+			if seenEvents[key] {
+				continue
+			}
+			seenEvents[key] = true
+		} else {
+			kws := extractTitleKeywords(c.item.Title)
+			dup := false
+			for _, existing := range keptKWs {
+				if titleOverlap(kws, existing) >= 0.6 {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				continue
+			}
+			if len(kws) > 0 {
+				keptKWs = append(keptKWs, kws)
+			}
+		}
+		selected = append(selected, c.item)
+	}
+
+	current := sectioned[store.SectionProductUpdate]
+	if len(current) == len(selected) {
+		same := true
+		for i := range current {
+			if current[i] == nil || selected[i] == nil || current[i].ID != selected[i].ID {
+				same = false
+				break
+			}
+		}
+		if same {
+			return current, false
+		}
+	}
+	selectedIDs := map[int64]bool{}
+	for _, it := range selected {
+		if it != nil {
+			selectedIDs[it.ID] = true
+		}
+	}
+	for secID, secItems := range sectioned {
+		if secID == store.SectionProductUpdate {
+			continue
+		}
+		var filtered []*store.RawItem
+		for _, it := range secItems {
+			if it == nil || !selectedIDs[it.ID] {
+				filtered = append(filtered, it)
+			}
+		}
+		sectioned[secID] = filtered
+	}
+	return selected, true
+}
+
+func backfillProductCoverageFromPool(
+	sectioned map[string][]*store.RawItem,
+	pool []*store.RawItem,
+	minProduct int,
+	sourceCategories map[int64]string,
+	sourcePriorities map[int64]int,
+) int {
+	if minProduct <= 0 {
+		return 0
+	}
+	current := len(sectioned[store.SectionProductUpdate])
+	if current >= minProduct {
+		return 0
+	}
+	selected := map[int64]bool{}
+	for _, secItems := range sectioned {
+		for _, it := range secItems {
+			if it != nil && it.ID != 0 {
+				selected[it.ID] = true
+			}
+		}
+	}
+	type candidate struct {
+		item     *store.RawItem
+		priority int
+		catRank  int
+		weight   int
+	}
+	var candidates []candidate
+	for _, it := range pool {
+		if it == nil || it.ID == 0 || selected[it.ID] {
+			continue
+		}
+		if !looksProductLike(it) {
+			continue
+		}
+		cat := ""
+		if sourceCategories != nil {
+			cat = sourceCategories[it.SourceID]
+		}
+		if cat == "project" || cat == "community" {
+			continue
+		}
+		catRank := 2
+		switch cat {
+		case "news":
+			catRank = 0
+		case "blog":
+			catRank = 1
+		}
+		priority := 5
+		if sourcePriorities != nil {
+			if p, ok := sourcePriorities[it.SourceID]; ok {
+				priority = p
+			}
+		}
+		candidates = append(candidates, candidate{
+			item:     it,
+			priority: priority,
+			catRank:  catRank,
+			weight:   productBackfillWeight(it),
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].weight != candidates[j].weight {
+			return candidates[i].weight > candidates[j].weight
+		}
+		if candidates[i].catRank != candidates[j].catRank {
+			return candidates[i].catRank < candidates[j].catRank
+		}
+		if candidates[i].priority != candidates[j].priority {
+			return candidates[i].priority > candidates[j].priority
+		}
+		if !candidates[i].item.PublishedAt.Equal(candidates[j].item.PublishedAt) {
+			return candidates[i].item.PublishedAt.After(candidates[j].item.PublishedAt)
+		}
+		return candidates[i].item.ID < candidates[j].item.ID
+	})
+	needed := minProduct - current
+	moved := 0
+	for _, c := range candidates {
+		if needed <= 0 {
+			break
+		}
+		sectioned[store.SectionProductUpdate] = append(sectioned[store.SectionProductUpdate], c.item)
+		selected[c.item.ID] = true
+		needed--
+		moved++
+	}
+	return moved
+}
+
+func productBackfillWeight(it *store.RawItem) int {
+	if it == nil {
+		return 0
+	}
+	text := strings.ToLower(strings.TrimSpace(it.Title + " " + it.URL + " " + it.Content))
+	score := 0
+	strongSignals := []string{
+		"claude design",
+		"ai mode",
+		"generative ui",
+		"gemini app",
+		"google photos",
+		"nano banana",
+		"anthropic launches",
+		"introducing claude design",
+		"personalized images",
+		"personal intelligence",
+	}
+	for _, kw := range strongSignals {
+		if strings.Contains(text, kw) {
+			score += 10
+		}
+	}
+	companySignals := []string{
+		"google", "anthropic", "openai", "gemini", "claude", "codex",
+	}
+	for _, kw := range companySignals {
+		if strings.Contains(text, kw) {
+			score += 2
+		}
+	}
+	productSignals := []string{
+		"launch", "launched", "launches", "release", "released", "releases",
+		"rollout", "preview", "beta", "available", "推出", "发布", "上线", "升级", "更新", "新功能", "新模型",
+	}
+	for _, kw := range productSignals {
+		if strings.Contains(text, kw) {
+			score += 3
+		}
+	}
+	penalties := []string{
+		"robotaxi", "tesla", "app store", "ipo", "融资", "估值", "股市", "上市",
+		"github.com", "skill", "skills", "framework", "sdk", "plugin",
+		"记忆系统", "工作流框架", "网关", "统一接口", "toolbox",
+		"satellite", "satellites", "server", "servers", "election", "midterms", "trump",
+	}
+	for _, bad := range penalties {
+		if strings.Contains(text, bad) {
+			score -= 5
+		}
+	}
+	return score
+}
+
+func productEventKey(it *store.RawItem) string {
+	if it == nil {
+		return ""
+	}
+	text := strings.ToLower(strings.TrimSpace(it.Title + " " + it.URL + " " + it.Content))
+	switch {
+	case strings.Contains(text, "claude design"):
+		return "claude-design"
+	case strings.Contains(text, "generative ui"), strings.Contains(text, "a2ui"):
+		return "generative-ui"
+	case strings.Contains(text, "ai mode"):
+		return "ai-mode"
+	case strings.Contains(text, "personalized images"), strings.Contains(text, "nano banana"), strings.Contains(text, "gemini app"):
+		return "gemini-images"
+	case strings.Contains(text, "luma launches ai-powered production studio"):
+		return "luma-production-studio"
+	default:
+		return ""
+	}
+}
+
+func looksResearchLike(it *store.RawItem) bool {
+	if it == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(it.Title + " " + it.URL + " " + it.Content))
+	keywords := []string{
+		"study", "benchmark", "paper", "papers", "research", "researchers",
+		"arxiv", "openreview", "architecture", "architectures", "workflow for understanding",
+		"llm architecture", "model performance", "scientific", "experiment",
+		"evaluation", "evaluates", "understanding llms", "new study",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksIndustryLike(it *store.RawItem) bool {
+	if it == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(it.Title + " " + it.URL + " " + it.Content))
+	keywords := []string{
+		"ipo", "funding", "fundraise", "valuation", "market", "markets",
+		"policy", "regulation", "lawsuit", "government", "election", "midterms",
+		"trump", "relationship", "social media", "influencer", "commentary", "opinion",
+		"analysis", "报告", "观点", "评论", "政策", "监管", "融资", "估值", "上市",
+		"政府", "选举", "舆论", "社交媒体",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksProductLike(it *store.RawItem) bool {
+	if it == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(it.Title + " " + it.URL + " " + it.Content))
+	blockers := []string{
+		"robotaxi", "tesla", "app store", "satellite", "satellites",
+		"ipo", "融资", "估值", "政府", "midterms", "election", "lawsuit", "policy", "regulation",
+		"trump", "college", "teacher", "typewriter", "stock", "stocks",
+	}
+	for _, bad := range blockers {
+		if strings.Contains(text, bad) {
+			return false
+		}
+	}
+	explicitProducts := []string{
+		"claude design",
+		"ai mode",
+		"generative ui",
+		"gemini app",
+		"personalized images",
+		"nano banana",
+		"chrome devtools mcp",
+		"agents python",
+		"openai agents",
+	}
+	for _, kw := range explicitProducts {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	releaseSignals := []string{
+		"launch", "launched", "launches", "release", "released", "releases",
+		"rollout", "ships", "ship", "unveil", "announces", "announce",
+		"introducing", "introduces", "new way", "new ways",
+		"new model", "new version", "new feature", "preview", "beta", "available",
+		"推出", "发布", "上线", "升级", "更新", "新版本", "新模型", "新功能", "开源",
+	}
+	aiSignals := []string{
+		"ai", "agent", "model", "llm", "claude", "gemini", "openai", "anthropic",
+		"google", "chatgpt", "codex", "mcp", "devtools", "chrome",
+	}
+	hasRelease := false
+	for _, kw := range releaseSignals {
+		if strings.Contains(text, kw) {
+			hasRelease = true
+			break
+		}
+	}
+	if !hasRelease {
+		return false
+	}
+	for _, kw := range aiSignals {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildFallbackSummary 在 LLM 上游临时不可用 (502/超时/etc) 时, 用本地
 // item 标题拼一个 3 行的兜底 summary, 让 pipeline 不会因为 transient
 // upstream error 整条退出. 取前 3 个 high-quality item 的标题作为 3 行.
@@ -1985,7 +2543,20 @@ Meta 首个前沿模型 Muse Spark 转闭源，Claude Sonnet 4.6 一天连发编
 	if len(parsed.Choices) == 0 {
 		return "", errors.New("summary: empty choices")
 	}
-	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+	out := strings.TrimSpace(parsed.Choices[0].Message.Content)
+	out = strings.ReplaceAll(out, "```", "")
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) > 3 {
+		lines = lines[:3]
+	}
+	return strings.Join(lines, "\n"), nil
 }
 
 // postSlackPayload sends payload to webhookURL and returns a Delivery
