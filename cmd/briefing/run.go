@@ -933,6 +933,11 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		report.Pass, report.Warn, report.ItemCount, report.SectionCount, report.InsightChars,
 		report.IndustryBullets, report.TakeawayBullets, report.SourceDomainCount,
 		len(report.FailedSections)))
+
+	if shouldSkipBecauseReportAlreadyExists(ctx, reportURL) {
+		stage("publish-skip: public report URL already exists, skipping duplicate push/update")
+		return nil
+	}
 	// v1.0.1 Batch 2.4+2.19: gate tri-state 处理
 	// - Pass=true                 → 正常推（任何 target）
 	// - Pass=false + Warn=true    → 质量偏低但文字齐, 继续推 + 发告警让 team 留意
@@ -2702,6 +2707,14 @@ func prodPublishIssues(ctx context.Context, rendered *publish.RenderedIssue) []s
 		issues = append(issues, msg)
 	}
 	return issues
+}
+
+func shouldSkipBecauseReportAlreadyExists(ctx context.Context, reportURL string) bool {
+	flag := strings.TrimSpace(os.Getenv("BRIEFING_SKIP_IF_REPORT_EXISTS"))
+	if flag == "" || flag == "0" || strings.EqualFold(flag, "false") {
+		return false
+	}
+	return checkPublicReportURL(ctx, reportURL) == ""
 }
 
 func checkPublicReportURL(ctx context.Context, rawURL string) string {
