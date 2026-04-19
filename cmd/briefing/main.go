@@ -100,6 +100,10 @@ Commands:
     regen       Reuse existing SQLite data, rebuild infocard + HTML + push
     serve       Start static file server for docs/ (web viewer)
     promote     Manually promote an existing issue to Slack prod channel
+    promote-weekly  Re-post the saved weekly Slack payload to Slack prod
+    promote-feishu  Re-post the saved daily Feishu card to Feishu chat
+    promote-weekly-feishu
+                Re-post the saved weekly Feishu card to Feishu chat
     status      Show the status of a specific issue (v1.0.1: displays issue
                 metadata + per-section item status + recent deliveries)
     help        Show this help message
@@ -191,7 +195,7 @@ func main() {
 	// v1.0.1 Batch 2.7: 对会推 Slack 或调用 LLM 的命令强制校验 BRIEFING_MODE.
 	// migrate/seed/status/help 不需要 (纯本地, 不推不调).
 	switch cmd {
-	case "run", "repair", "weekly", "regen", "promote":
+	case "run", "repair", "weekly", "regen", "promote", "promote-weekly", "promote-feishu", "promote-weekly-feishu":
 		if _, merr := briefingMode(); merr != nil {
 			fmt.Fprintf(os.Stderr, "config error: %v\n", merr)
 			os.Exit(ExitConfigFail)
@@ -218,6 +222,12 @@ func main() {
 		err = regenCommand(ctx, cfg, date, gf)
 	case "promote":
 		err = promoteCommand(ctx, cfg, date, gf)
+	case "promote-weekly":
+		err = promoteWeeklyCommand(ctx, cfg, date, gf)
+	case "promote-feishu":
+		err = promoteFeishuCommand(ctx, cfg, date, gf)
+	case "promote-weekly-feishu":
+		err = promoteWeeklyFeishuCommand(ctx, cfg, date, gf)
 	case "status":
 		err = statusCommand(ctx, cfg, date, gf)
 	default:
@@ -355,11 +365,43 @@ func payloadSnapshotPath(date time.Time) string {
 	return fmt.Sprintf("data/slack-payload-%s.json", date.Format("2006-01-02"))
 }
 
+func weeklySnapshotLabel(date time.Time) string {
+	year, week := date.ISOWeek()
+	return fmt.Sprintf("%d-W%02d", year, week)
+}
+
+func weeklyPayloadSnapshotPath(date time.Time) string {
+	return fmt.Sprintf("data/slack-weekly-payload-%s.json", weeklySnapshotLabel(date))
+}
+
+func dailyFeishuSnapshotPath(date time.Time) string {
+	return fmt.Sprintf("data/feishu-daily-card-%s.json", date.Format("2006-01-02"))
+}
+
+func weeklyFeishuSnapshotPath(date time.Time) string {
+	return fmt.Sprintf("data/feishu-weekly-card-%s.json", weeklySnapshotLabel(date))
+}
+
 // savePayloadSnapshot writes payload verbatim to payloadSnapshotPath(date).
 // Used by run and regen right before they POST to test, so the prod
 // promote path can re-send bytes that are guaranteed to match exactly.
 func savePayloadSnapshot(date time.Time, payload []byte) error {
-	path := payloadSnapshotPath(date)
+	return saveJSONSnapshot(payloadSnapshotPath(date), payload)
+}
+
+func saveWeeklyPayloadSnapshot(date time.Time, payload []byte) error {
+	return saveJSONSnapshot(weeklyPayloadSnapshotPath(date), payload)
+}
+
+func saveDailyFeishuSnapshot(date time.Time, payload []byte) error {
+	return saveJSONSnapshot(dailyFeishuSnapshotPath(date), payload)
+}
+
+func saveWeeklyFeishuSnapshot(date time.Time, payload []byte) error {
+	return saveJSONSnapshot(weeklyFeishuSnapshotPath(date), payload)
+}
+
+func saveJSONSnapshot(path string, payload []byte) error {
 	if err := os.MkdirAll("data", 0o755); err != nil {
 		return fmt.Errorf("mkdir data: %w", err)
 	}
@@ -433,6 +475,80 @@ func promoteCommand(ctx context.Context, cfg *config.Config, date time.Time, gf 
 		return fmt.Errorf("slack prod publish failed: %s", delivery.ResponseJSON)
 	}
 	fmt.Printf("[%s] promote: slack prod OK\n", time.Now().Format("15:04:05"))
+	return nil
+}
+
+func promoteWeeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *globalFlags) error {
+	path := weeklyPayloadSnapshotPath(date)
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read weekly snapshot %s: %w (did you run `briefing weekly` first?)", path, err)
+	}
+	if len(payload) == 0 {
+		return fmt.Errorf("weekly snapshot %s is empty", path)
+	}
+	prodURL := cfg.Slack.ProdWebhook
+	if prodURL == "" {
+		return errors.New("cfg.Slack.ProdWebhook is empty — set SLACK_PROD_WEBHOOK in secrets.env")
+	}
+	fmt.Printf("[%s] promote-weekly: re-posting snapshot %s (%d bytes) to Slack prod webhook\n",
+		time.Now().Format("15:04:05"), path, len(payload))
+	if gf.dryRun {
+		fmt.Println("dry-run: not posting weekly snapshot to prod")
+		fmt.Println(string(payload))
+		return nil
+	}
+	delivery := postSlackPayload(ctx, store.ChannelSlackProd, prodURL, payload, 0)
+	if delivery.Status != store.DeliveryStatusSent {
+		return fmt.Errorf("weekly slack prod publish failed: %s", delivery.ResponseJSON)
+	}
+	fmt.Printf("[%s] promote-weekly: slack prod OK\n", time.Now().Format("15:04:05"))
+	return nil
+}
+
+func promoteFeishuCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *globalFlags) error {
+	path := dailyFeishuSnapshotPath(date)
+	return replayFeishuSnapshot(ctx, path, "promote-feishu", gf.dryRun)
+}
+
+func promoteWeeklyFeishuCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *globalFlags) error {
+	path := weeklyFeishuSnapshotPath(date)
+	return replayFeishuSnapshot(ctx, path, "promote-weekly-feishu", gf.dryRun)
+}
+
+func replayFeishuSnapshot(ctx context.Context, path, label string, dryRun bool) error {
+	cardBytes, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read feishu snapshot %s: %w", path, err)
+	}
+	if len(cardBytes) == 0 {
+		return fmt.Errorf("feishu snapshot %s is empty", path)
+	}
+	appID := os.Getenv("FEISHU_APP_ID")
+	appSecret := os.Getenv("FEISHU_APP_SECRET")
+	chatID := os.Getenv("FEISHU_CHAT_ID")
+	if appID == "" || appSecret == "" || chatID == "" {
+		return errors.New("feishu credentials are empty — set FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_CHAT_ID in secrets.env")
+	}
+	var card map[string]any
+	if err := json.Unmarshal(cardBytes, &card); err != nil {
+		return fmt.Errorf("parse feishu snapshot %s: %w", path, err)
+	}
+	fmt.Printf("[%s] %s: re-posting snapshot %s to Feishu chat\n",
+		time.Now().Format("15:04:05"), label, path)
+	if dryRun {
+		fmt.Println("dry-run: not posting feishu snapshot")
+		fmt.Println(string(cardBytes))
+		return nil
+	}
+	token, err := feishuGetToken(appID, appSecret)
+	if err != nil {
+		return err
+	}
+	if err := feishuPostCard(ctx, token, chatID, card); err != nil {
+		return err
+	}
+	fmt.Printf("[%s] %s: Feishu post OK\n", time.Now().Format("15:04:05"), label)
 	return nil
 }
 
