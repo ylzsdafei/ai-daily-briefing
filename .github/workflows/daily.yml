@@ -110,12 +110,26 @@ jobs:
           echo "RUN_DATE=$run_date" >> "$GITHUB_ENV"
           echo "PUBLISH_TARGET=auto" >> "$GITHUB_ENV"
           echo "BRIEFING_MODE=prod" >> "$GITHUB_ENV"
+          echo "BRIEFING_SKIP_IF_REPORT_EXISTS=1" >> "$GITHUB_ENV"
           echo "BRIEFING_REPORT_URL_BASE=$report_url" >> "$GITHUB_ENV"
           echo "NO_IMAGES_FLAG=$no_images_flag" >> "$GITHUB_ENV"
           echo "HEXTRA_SITE_DIR=$GITHUB_WORKSPACE/site" >> "$GITHUB_ENV"
           echo "HUGO_BIN=$(command -v hugo)" >> "$GITHUB_ENV"
 
+      - name: Skip if daily report already exists on site
+        run: |
+          year="${RUN_DATE:0:4}"
+          yearmonth="${RUN_DATE:0:7}"
+          report_path="site/content/cn/${year}/${yearmonth}/${RUN_DATE}.md"
+          if [ -f "$report_path" ]; then
+            echo "SKIP_DAILY=true" >> "$GITHUB_ENV"
+            echo "daily already exists at ${report_path}, skipping generation/publish"
+          else
+            echo "SKIP_DAILY=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Validate required secrets
+        if: env.SKIP_DAILY != 'true'
         run: |
           test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is required"; exit 1; }
           test -n "$SLACK_TEST_WEBHOOK" || { echo "SLACK_TEST_WEBHOOK is required"; exit 1; }
@@ -126,25 +140,29 @@ jobs:
           test -n "$FEISHU_CHAT_ID" || { echo "FEISHU_CHAT_ID is required"; exit 1; }
 
       - name: Restore automation state
+        if: env.SKIP_DAILY != 'true'
         run: bash ./scripts/gha_restore_state.sh
 
       - name: Build briefing
+        if: env.SKIP_DAILY != 'true'
         run: go build -o ./bin/briefing ./cmd/briefing
 
       - name: Prepare database
+        if: env.SKIP_DAILY != 'true'
         run: |
           ./bin/briefing migrate
           ./bin/briefing seed
 
       - name: Run daily pipeline
+        if: env.SKIP_DAILY != 'true'
         run: ./bin/briefing run --date "$RUN_DATE" --domain ai --target "$PUBLISH_TARGET" $NO_IMAGES_FLAG
 
       - name: Save automation state
-        if: success()
+        if: success() && env.SKIP_DAILY != 'true'
         run: bash ./scripts/gha_save_state.sh
 
       - name: Push ai-daily-site update
-        if: success()
+        if: success() && env.SKIP_DAILY != 'true'
         working-directory: site
         run: |
           git add -A
@@ -156,7 +174,7 @@ jobs:
           git push origin HEAD:main
 
       - name: Notify test channel on failure
-        if: failure()
+        if: failure() && env.SKIP_DAILY != 'true'
         run: |
           run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           payload=$(cat <<EOF
