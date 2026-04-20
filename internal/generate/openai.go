@@ -249,14 +249,13 @@ func (g *openaiGenerator) GenerateInsight(ctx context.Context, in *Input) (*stor
 			attempts, strings.Join(lastReasons, "; "))
 	}
 
-	// v1.0.1 Phase 4.5 (N1): 保证 mermaid 关系图必出. LLM 偷懒不输出 mermaid 时用
-	// 规则化 graph LR 兜底, 让"行业洞察上方的关系图"永远有图. validator 只把
-	// missing mermaid 降为 warn 不 fail, 所以 LLM 能通过 validation 却不输出图;
-	// 这里在写入 DB 前补一个规则化 block 到 industryMD 开头, render.markdown 的
-	// mermaid extractor 会把它搬到"行业洞察"上方渲染.
-	if !mermaidBlockRegex.MatchString(industryMD + "\n" + ourMD) {
-		fallbackMermaid := ruleBasedMermaidDiagram(in)
-		industryMD = fallbackMermaid + "\n\n" + industryMD
+	// 保证日报关系图不缺席, 也不能只是 3 个截断节点的敷衍图。
+	// 缺图或图太简单时, 用规则化 graph LR 替换, 并移除旧 mermaid/孤儿标题。
+	combined := industryMD + "\n" + ourMD
+	if block := mermaidBlockRegex.FindString(combined); block == "" || mermaidLooksTooSimple(block) {
+		industryMD = stripMermaidArtifacts(industryMD)
+		ourMD = stripMermaidArtifacts(ourMD)
+		industryMD = ruleBasedMermaidDiagram(in) + "\n\n" + strings.TrimSpace(industryMD)
 	}
 
 	return &store.IssueInsight{
@@ -270,40 +269,65 @@ func (g *openaiGenerator) GenerateInsight(ctx context.Context, in *Input) (*stor
 	}, nil
 }
 
-// ruleBasedMermaidDiagram 用 summary 3 行 (或 items top titles 兜底) 拼一个简单的
-// graph LR mermaid 图. 节点文字取前 6-8 字保证不溢出画布, 主线 3 节点 + classDef
-// 蓝色着色, 符合 prompts.go:60-66 里对 mermaid 的格式要求.
-//
-// 不依赖 LLM, 100% 能产出, 是 N1 的兜底实现.
+var mermaidHeadingOnlyRe = regexp.MustCompile(`(?m)^\s{0,3}(?:#{1,6}\s*)?🗺️\s*今日关系图.*\n?`)
+var mermaidNodeLabelRe = regexp.MustCompile(`[A-Z0-9]+\[([^\]]+)\]`)
+
+// ruleBasedMermaidDiagram 用摘要 + section item 标题抽取主题, 生成一张
+// 5 节点、1 条主线 + 1 条分支的关系图。目标不是“图能渲染”，而是 5 秒能看懂。
 func ruleBasedMermaidDiagram(in *Input) string {
-	labels := extractMermaidLabels(in)
+	labels := extractMermaidThemes(in)
 	return "```mermaid\n" +
 		"graph LR\n" +
-		fmt.Sprintf("A[%s] -->|带动| B[%s]\n", labels[0], labels[1]) +
-		fmt.Sprintf("B -->|延伸| C[%s]\n", labels[2]) +
+		fmt.Sprintf("A[%s] -->|把结果做出来| D[%s]\n", labels[0], labels[3]) +
+		fmt.Sprintf("B[%s] -->|降低创作门槛| D\n", labels[1]) +
+		fmt.Sprintf("C[%s] -->|串起多助手| E[%s]\n", labels[2], labels[4]) +
+		" D -->|进入业务流程| E\n" +
 		"classDef blue fill:#dbeafe,stroke:#3b82f6,color:#111827\n" +
+		"classDef green fill:#d1fae5,stroke:#10b981,color:#111827\n" +
 		"class A,B,C blue\n" +
+		"class D,E green\n" +
 		"```"
 }
 
-// extractMermaidLabels 提取 3 个节点 label (6-8 字) 给 mermaid 图用.
-// 策略: 优先用 Issue.Summary 的前 3 非空行每行截 6-8 字;
-// summary 不足时用 items 的前几个 title 兜底;
-// 都缺就 fallback 到静态默认 (保证永远返回 3 个非空 label).
-func extractMermaidLabels(in *Input) [3]string {
-	var labels [3]string
+// extractMermaidThemes 提取 3 个“事件/主题”节点 + 2 个固定结果节点.
+// 优先从产品/开源/行业条目中抽语义标签, 摘要只做补位。
+func extractMermaidThemes(in *Input) [5]string {
+	var labels [5]string
 	cur := 0
 
+	appendTheme := func(line string) {
+		if cur >= 3 {
+			return
+		}
+		clean := mermaidThemeLabel(line)
+		if clean == "" {
+			return
+		}
+		for i := 0; i < cur; i++ {
+			if labels[i] == clean {
+				return
+			}
+		}
+		labels[cur] = clean
+		cur++
+	}
+
+	if in != nil {
+		for _, it := range in.Items {
+			if cur >= 3 || it == nil {
+				break
+			}
+			if it.Section == store.SectionProductUpdate || it.Section == store.SectionOpenSource || it.Section == store.SectionIndustry {
+				appendTheme(it.Title)
+			}
+		}
+	}
 	if in != nil && in.Issue != nil {
 		for _, line := range strings.Split(in.Issue.Summary, "\n") {
 			if cur >= 3 {
 				break
 			}
-			clean := mermaidLabelFrom(line)
-			if clean != "" {
-				labels[cur] = clean
-				cur++
-			}
+			appendTheme(line)
 		}
 	}
 	if cur < 3 && in != nil {
@@ -311,18 +335,15 @@ func extractMermaidLabels(in *Input) [3]string {
 			if cur >= 3 || it == nil {
 				break
 			}
-			clean := mermaidLabelFrom(it.Title)
-			if clean != "" {
-				labels[cur] = clean
-				cur++
-			}
+			appendTheme(it.Title)
 		}
 	}
-	// 最后兜底: 静态词.
-	defaults := [3]string{"AI 新动态", "行业关联", "值得关注"}
+	defaults := [3]string{"产品能力升级", "创作门槛下降", "多助手协作"}
 	for i := cur; i < 3; i++ {
 		labels[i] = defaults[i]
 	}
+	labels[3] = "AI直接交付"
+	labels[4] = "企业工作流AI化"
 	return labels
 }
 
@@ -354,6 +375,66 @@ func mermaidLabelFrom(line string) string {
 		rs = rs[:8]
 	}
 	return string(rs)
+}
+
+func mermaidThemeLabel(line string) string {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	switch {
+	case strings.Contains(lower, "claude design"):
+		return "Claude做设计"
+	case strings.Contains(lower, "generative ui"),
+		strings.Contains(lower, "a2ui"),
+		strings.Contains(lower, "界面标准"),
+		strings.Contains(lower, "agent 界面"),
+		strings.Contains(lower, "生成式界面"):
+		return "Google做界面"
+	case strings.Contains(lower, "personalized images"),
+		strings.Contains(lower, "nano banana"),
+		strings.Contains(lower, "google photos"),
+		strings.Contains(lower, "图片生成"),
+		(strings.Contains(lower, "gemini") && strings.Contains(lower, "图片")):
+		return "Gemini做图片"
+	case strings.Contains(lower, "openai-agents"),
+		strings.Contains(lower, "agents-python"),
+		strings.Contains(lower, "多 agent"),
+		strings.Contains(lower, "多智能体"),
+		strings.Contains(lower, "agent 工作流"),
+		strings.Contains(lower, "mcp"):
+		return "多Agent框架"
+	case strings.Contains(lower, "enterprise"),
+		strings.Contains(lower, "企业"),
+		strings.Contains(lower, "cursor"),
+		strings.Contains(lower, "ipo"),
+		strings.Contains(lower, "cerebras"):
+		return "企业化落地"
+	case strings.Contains(lower, "token"),
+		strings.Contains(lower, "成本"),
+		strings.Contains(lower, "opus 4.7"):
+		return "真实成本抬升"
+	}
+	return mermaidLabelFrom(line)
+}
+
+func mermaidLooksTooSimple(block string) bool {
+	if strings.TrimSpace(block) == "" {
+		return true
+	}
+	if len(mermaidNodeLabelRe.FindAllStringSubmatch(block, -1)) < 4 {
+		return true
+	}
+	if strings.Count(block, "-->") < 3 {
+		return true
+	}
+	if !strings.Contains(block, "classDef green") {
+		return true
+	}
+	return false
+}
+
+func stripMermaidArtifacts(s string) string {
+	s = mermaidBlockRegex.ReplaceAllString(s, "")
+	s = mermaidHeadingOnlyRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
 }
 
 // promptForAttempt returns the (system, user, maxTokens) to use at the given

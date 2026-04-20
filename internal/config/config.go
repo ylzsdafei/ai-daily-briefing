@@ -157,8 +157,14 @@ func Load(path string) (*Config, error) {
 
 	// Resolve Slack env. Missing webhooks are warnings, not errors, so
 	// that dev/test flows that skip slack publishing still succeed.
-	cfg.Slack.TestWebhook = os.Getenv(cfg.Slack.TestWebhookEnv)
-	cfg.Slack.ProdWebhook = os.Getenv(cfg.Slack.ProdWebhookEnv)
+	cfg.Slack.TestWebhook = firstNonEmpty(
+		os.Getenv(cfg.Slack.TestWebhookEnv),
+		os.Getenv("SLACK_WEBHOOK_TEST"),
+	)
+	cfg.Slack.ProdWebhook = firstNonEmpty(
+		os.Getenv(cfg.Slack.ProdWebhookEnv),
+		os.Getenv("SLACK_WEBHOOK_PROD"),
+	)
 	if cfg.Slack.TestWebhook == "" {
 		fmt.Fprintf(os.Stderr, "WARNING: %s not set, slack test publish will fail\n", cfg.Slack.TestWebhookEnv)
 	}

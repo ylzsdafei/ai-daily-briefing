@@ -7,6 +7,10 @@ import (
 	"briefing-v3/internal/store"
 )
 
+// merge 20260420: codex 重写 mermaid 为 mermaidLabelFrom + mermaidThemeLabel,
+// 旧的 extractMermaidLabels 及其三级兜底测试已失效 (函数不存在), 删除不补齐.
+// TestRuleBasedMermaidDiagram 覆盖了集成层, 单元层 TestMermaidLabelFrom 够用.
+
 // TestMermaidLabelFrom 验证 N1 mermaid 节点 label 提取.
 func TestMermaidLabelFrom(t *testing.T) {
 	cases := []struct {
@@ -26,47 +30,6 @@ func TestMermaidLabelFrom(t *testing.T) {
 			t.Errorf("in=%q got=%q want=%q", tc.in, got, tc.want)
 		}
 	}
-}
-
-// TestExtractMermaidLabels 验证从 summary / items / 默认值三级兜底.
-func TestExtractMermaidLabels(t *testing.T) {
-	t.Run("from_summary_3_lines", func(t *testing.T) {
-		in := &Input{Issue: &store.Issue{Summary: "第一件事\n第二件事\n第三件事"}}
-		labels := extractMermaidLabels(in)
-		if labels[0] != "第一件事" || labels[1] != "第二件事" || labels[2] != "第三件事" {
-			t.Errorf("got %v", labels)
-		}
-	})
-	t.Run("summary_short_fallback_items", func(t *testing.T) {
-		in := &Input{
-			Issue: &store.Issue{Summary: "唯一摘要"},
-			Items: []*store.IssueItem{
-				{Title: "第二标题"},
-				{Title: "第三标题"},
-			},
-		}
-		labels := extractMermaidLabels(in)
-		if labels[0] != "唯一摘要" || labels[1] != "第二标题" || labels[2] != "第三标题" {
-			t.Errorf("got %v", labels)
-		}
-	})
-	t.Run("empty_all_fallback_default", func(t *testing.T) {
-		in := &Input{Issue: &store.Issue{Summary: ""}}
-		labels := extractMermaidLabels(in)
-		for i, l := range labels {
-			if l == "" {
-				t.Errorf("label[%d] should never be empty, got %v", i, labels)
-			}
-		}
-	})
-	t.Run("nil_input_safe", func(t *testing.T) {
-		labels := extractMermaidLabels(nil)
-		for i, l := range labels {
-			if l == "" {
-				t.Errorf("label[%d] should never be empty on nil input, got %v", i, labels)
-			}
-		}
-	})
 }
 
 // TestRuleBasedMermaidDiagram 验证 mermaid 块格式合法 + 命中 regex.

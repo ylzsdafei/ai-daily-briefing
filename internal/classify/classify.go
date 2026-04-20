@@ -90,37 +90,40 @@ func New(cfg Config) (Classifier, error) {
 	return &llmClassifier{cfg: cfg, hc: &http.Client{}}, nil
 }
 
-// classifySystemPrompt is the rubric the LLM follows. v1.0.0 narrows
-// the LLM's job to a strict binary: every item passed to classifyBatch
-// is known to be a news-category article, and the LLM must decide
-// whether it is a product update or an industry / policy / commentary
-// story. All other section types (research / opensource / social) are
-// handled by deterministic rules before the LLM is ever called.
+// classifySystemPrompt is the rubric the LLM follows. v1.0.0 originally
+// narrowed the LLM's job to a strict binary for news items, but实战中这会把
+// “研究类新闻”错误压到 industry / product_update。当前 prompt 改为三分类:
+// news item 只能被分到 product_update / research / industry。
 const classifySystemPrompt = `你是 AI 日报编辑。你收到的每一条都来自新闻类来源 (news category)。
-你的任务：把每一条分到且仅分到以下 2 个 section 之一。请在批次内尽量均衡：
-product_update 和 industry 的比例理想在 1:1 到 2:1 之间，不要把 batch
-全部判到同一个 section。
+你的任务：把每一条分到且仅分到以下 3 个 section 之一：
+product_update / research / industry
 
 - product_update: AI 公司或产品的具体发布、更新、新功能、新版本、发布会、开发者工具、API、模型
   (典型标志: OpenAI/Anthropic/Google/DeepMind/Meta/xAI/DeepSeek/Mistral/NVIDIA/Microsoft/Apple/
   AWS/字节/阿里/腾讯/华为/智谱/月之暗面/MiniMax 等公司推出的任何具体产品/模型/工具/API/功能)
+- research: 研究结果、基准测试、论文、模型架构、训练方法、数据集、实验结论的报道
+  (典型标志: 研究显示/研究发现/新论文/基准测试/benchmark/study/paper/arxiv/数据集/评测/
+  架构/训练方法/实验结果/性能下降/system prompt/工作流理解/图表理解)
 - industry: 行业趋势、政策、监管、融资并购、人事变动、观点评论、社会影响、市场分析、调查报告
   (典型标志: 融资/监管/诉讼/收购/政策/观点/评论/报告/调研/访谈/专访/行业白皮书/人事变动)
 
 判断要点：
 1. 标题/内容含"发布/推出/上线/开源/新增/新功能/新模型/new model/release/launch/ships/unveil/
    available/announce/rollout/beta/preview/API/SDK" 等字眼且指向具体产品 → product_update
-2. 标题/内容含"融资/投资/估值/监管/政策/诉讼/收购/并购/合作/观点/评论/分析/报告/调研/趋势/访谈"
-   等字眼 → industry
-3. 描述某家 AI 公司有新能力、新产品、新工具的，一律 product_update
-4. 讨论某个商业/监管/行业动态但没有新产品的，才归 industry
-5. 不确定时：若提到任何 AI 公司名 + 任何能力性描述 → product_update；否则 industry
+2. 标题/内容核心在“研究发现了什么 / 基准测出了什么 / 论文提出了什么方法” → research
+3. 标题/内容含"融资/投资/估值/监管/政策/诉讼/收购/并购/合作/观点/评论/分析/报告/调研/趋势/访谈"
+   等字眼，且不是具体研究成果或产品发布 → industry
+4. 描述某家 AI 公司有新能力、新产品、新工具的，一律 product_update
+5. 不确定时：
+   - 有明确发布动作 → product_update
+   - 有明确研究/评测/论文结果 → research
+   - 其余 → industry
 
 只输出严格 JSON 数组 (不要输出其他任何文字):
-[{"id": 原 id, "section": "product_update" 或 "industry"}, ...]`
+[{"id": 原 id, "section": "product_update" 或 "research" 或 "industry"}, ...]`
 
 // classifyUserPromptTemplate is the per-batch user message.
-const classifyUserPromptTemplate = `以下是新闻类候选条目，请只在 product_update / industry 里二选一：
+const classifyUserPromptTemplate = `以下是新闻类候选条目，请只在 product_update / research / industry 里三选一：
 
 %s
 
@@ -251,9 +254,11 @@ func (c *llmClassifier) Classify(
 			if _, ok := byID[v.ID]; !ok {
 				continue
 			}
-			// The binary prompt should only emit these two, but we defend
-			// in depth against the LLM hallucinating a five-section verdict.
-			if v.Section != store.SectionProductUpdate && v.Section != store.SectionIndustry {
+			// The prompt should only emit these three, but we defend
+			// in depth against the LLM hallucinating other sections.
+			if v.Section != store.SectionProductUpdate &&
+				v.Section != store.SectionResearch &&
+				v.Section != store.SectionIndustry {
 				continue
 			}
 			assigned[v.ID] = v.Section
@@ -294,6 +299,7 @@ func (c *llmClassifier) Classify(
 // not social.
 func ruleClassifyByCategory(srcCategory, urlStr, title string) (string, bool) {
 	lowerURL := strings.ToLower(urlStr)
+	lowerTitle := strings.ToLower(title)
 
 	// High-confidence URL overrides beat the source category. These
 	// catch cases where a blog or news source happens to link to
@@ -318,6 +324,9 @@ func ruleClassifyByCategory(srcCategory, urlStr, title string) (string, bool) {
 	case "community":
 		return store.SectionSocial, true
 	case "blog":
+		if looksResearchLikeText(lowerTitle + " " + lowerURL) {
+			return store.SectionResearch, true
+		}
 		return store.SectionSocial, true
 	case "news":
 		// news is intentionally ambiguous — the LLM makes the
@@ -438,6 +447,10 @@ func fallbackSection(it *store.RawItem) string {
 		return store.SectionProductUpdate
 	}
 
+	if looksResearchLikeText(title + " " + url) {
+		return store.SectionResearch
+	}
+
 	// Title keyword heuristic. News-style URLs (techcrunch, the-decoder,
 	// smol.ai, google news, ...) drop through to here; pick product_update
 	// vs industry by simple keyword matching so that one fallback-heavy
@@ -470,6 +483,32 @@ func fallbackSection(it *store.RawItem) string {
 	// Still unknown — prefer industry over social so news-category
 	// items default to the news-shaped section.
 	return store.SectionIndustry
+}
+
+func looksResearchLikeText(text string) bool {
+	s := strings.ToLower(strings.TrimSpace(text))
+	researchKeywords := []string{
+		"benchmark", "study", "research", "paper", "papers", "arxiv",
+		"openreview", "dataset", "evaluation", "experiment", "architecture",
+		"training method", "scientific", "workflow for understanding llms",
+		"system prompt", "performance when", "new benchmark", "new study",
+		"研究", "论文", "基准", "评测", "数据集", "实验", "架构", "训练方法", "研究显示",
+	}
+	industryBlockers := []string{
+		"融资", "ipo", "ceo", "股市", "上市", "估值", "广告", "用户", "资本", "并购",
+		"lawsuit", "funding", "startup", "advertiser", "market", "policy", "regulation",
+	}
+	for _, bad := range industryBlockers {
+		if strings.Contains(s, bad) {
+			return false
+		}
+	}
+	for _, kw := range researchKeywords {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractJSONArray / firstRunes / truncateOneLine are duplicated from

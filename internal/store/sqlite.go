@@ -310,6 +310,18 @@ func (s *sqliteStore) InsertRawItems(ctx context.Context, items []*RawItem) erro
 		return fmt.Errorf("prepare insert raw_items: %w", err)
 	}
 	defer stmt.Close()
+	lookupByExt, err := tx.PrepareContext(ctx,
+		`SELECT id FROM raw_items WHERE source_id = ? AND external_id = ? ORDER BY id DESC LIMIT 1`)
+	if err != nil {
+		return fmt.Errorf("prepare lookup raw_items by external_id: %w", err)
+	}
+	defer lookupByExt.Close()
+	lookupByURL, err := tx.PrepareContext(ctx,
+		`SELECT id FROM raw_items WHERE source_id = ? AND url = ? ORDER BY id DESC LIMIT 1`)
+	if err != nil {
+		return fmt.Errorf("prepare lookup raw_items by url: %w", err)
+	}
+	defer lookupByURL.Close()
 
 	for _, it := range items {
 		var publishedAt any
@@ -330,6 +342,17 @@ func (s *sqliteStore) InsertRawItems(ctx context.Context, items []*RawItem) erro
 		); err != nil {
 			return fmt.Errorf("insert raw_item (source=%d ext=%q): %w", it.SourceID, it.ExternalID, err)
 		}
+		var rowID int64
+		if strings.TrimSpace(it.ExternalID) != "" {
+			if err := lookupByExt.QueryRowContext(ctx, it.SourceID, it.ExternalID).Scan(&rowID); err != nil {
+				return fmt.Errorf("lookup raw_item id by external_id (source=%d ext=%q): %w", it.SourceID, it.ExternalID, err)
+			}
+		} else {
+			if err := lookupByURL.QueryRowContext(ctx, it.SourceID, it.URL).Scan(&rowID); err != nil {
+				return fmt.Errorf("lookup raw_item id by url (source=%d url=%q): %w", it.SourceID, it.URL, err)
+			}
+		}
+		it.ID = rowID
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit insert raw_items: %w", err)
@@ -821,11 +844,14 @@ func (s *sqliteStore) ListDailyIssuesByDateRange(ctx context.Context, domainID s
 		       COALESCE(source_count, 0), COALESCE(item_count, 0),
 		       generated_at, published_at
 		FROM issues
-		WHERE domain_id = ? AND issue_date >= ? AND issue_date <= ?
+		WHERE domain_id = ?
+		  AND issue_date >= ?
+		  AND issue_date <= ?
+		  AND (status = ? OR published_at IS NOT NULL)
 		ORDER BY issue_date ASC
 	`
 	rows, err := s.db.QueryContext(ctx, q, domainID,
-		start.Format("2006-01-02"), end.Format("2006-01-02"))
+		start.Format("2006-01-02"), end.Format("2006-01-02"), IssueStatusPublished)
 	if err != nil {
 		return nil, fmt.Errorf("list issues %s [%s..%s]: %w",
 			domainID, start.Format("2006-01-02"), end.Format("2006-01-02"), err)
@@ -1206,17 +1232,30 @@ func (s *sqliteStore) MarkInsightValidated(ctx context.Context, issueID int64, i
 // -------- ClassifiedItem --------
 
 // InsertClassifiedItems persists the output of classify.
-// ON CONFLICT (issue, section, raw_item) replace seq and score —
-// a rerun of classify may shuffle ordering.
+//
+// Semantics are "replace the full classify snapshot for one issue":
+// before inserting the new rows we DELETE all existing classified_items
+// for that issue_id inside the same transaction. This prevents stale
+// rows from previous reruns from surviving under a different section and
+// polluting repair/status/debugging views.
 func (s *sqliteStore) InsertClassifiedItems(ctx context.Context, items []*ClassifiedItem) error {
 	if len(items) == 0 {
 		return nil
+	}
+	issueID := items[0].IssueID
+	for _, ci := range items[1:] {
+		if ci != nil && ci.IssueID != issueID {
+			return fmt.Errorf("insert classified_items: mixed issue ids %d and %d", issueID, ci.IssueID)
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM classified_items WHERE issue_id = ?`, issueID); err != nil {
+		return fmt.Errorf("delete classified_items for issue=%d: %w", issueID, err)
+	}
 	const q = `
 		INSERT INTO classified_items
 			(issue_id, section, raw_item_id, rank_score, seq, created_at)

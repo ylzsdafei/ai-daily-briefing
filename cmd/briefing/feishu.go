@@ -152,28 +152,72 @@ func buildFeishuDailyCard(insight *store.IssueInsight, summary, dateZH, reportUR
 	}
 }
 
-// buildFeishuWeeklyCard 构建周报飞书卡片.
+func buildDailyFeishuCardSnapshot(insight *store.IssueInsight, summary, dateZH, reportURL string) map[string]any {
+	return buildFeishuDailyCard(insight, summary, dateZH, reportURL)
+}
+
+// buildFeishuWeeklyCard 构建周报飞书卡片. 内容与 Slack 周报完全一致:
+// 聚焦 (topics 列表) + 启发 + 思考, 统一走 Slack 清洗路径剥掉 mermaid/
+// <details>/HTML, 然后 slackMrkdwnToLarkMd 转成飞书格式.
 func buildFeishuWeeklyCard(weekly *store.WeeklyIssue, weeklyPageURL string) map[string]any {
 	focusMD := strings.TrimSpace(weekly.FocusMD)
 	takeawayMD := strings.TrimSpace(weekly.TakeawaysMD)
+	ponderMD := strings.TrimSpace(weekly.PonderMD)
 
 	dateRange := fmt.Sprintf("%s ~ %s",
 		weekly.StartDate.Format("01-02"),
 		weekly.EndDate.Format("01-02"))
 	weekLabel := fmt.Sprintf("%d-W%02d", weekly.Year, weekly.Week)
 
-	elements := []map[string]any{
-		{"tag": "div", "text": map[string]any{
-			"tag":     "lark_md",
-			"content": slackMrkdwnToLarkMd(fmt.Sprintf("**🎯 本周聚焦**\n\n%s", focusMD)),
-		}},
-		{"tag": "hr"},
-		{"tag": "div", "text": map[string]any{
-			"tag":     "lark_md",
-			"content": slackMrkdwnToLarkMd(fmt.Sprintf("**💭 对我们的启发**\n\n%s", takeawayMD)),
-		}},
-		{"tag": "hr"},
+	var elements []map[string]any
+
+	// 🎯 本周聚焦 (topics list, 不含 mermaid — 与 Slack 一致)
+	if focusMD != "" {
+		topics := extractFocusTopics(focusMD)
+		if len(topics) > 0 {
+			var focusText strings.Builder
+			fmt.Fprintf(&focusText, "*🎯 本周聚焦（%d 条）*\n\n", len(topics))
+			for i, t := range topics {
+				fmt.Fprintf(&focusText, "%d. %s\n  【洞察】%s\n", i+1, t.title, t.insight)
+			}
+			focusStr := render.TruncateAtSentence(focusText.String(), 2900)
+			elements = append(elements, map[string]any{
+				"tag": "div", "text": map[string]any{
+					"tag":     "lark_md",
+					"content": slackMrkdwnToLarkMd(focusStr),
+				},
+			})
+			elements = append(elements, map[string]any{"tag": "hr"})
+		}
 	}
+
+	// 💡 对我们的启发
+	if takeawayMD != "" {
+		cleaned := cleanForSlack(takeawayMD, 800)
+		cleaned = ensureOrderedList(cleaned)
+		elements = append(elements, map[string]any{
+			"tag": "div", "text": map[string]any{
+				"tag":     "lark_md",
+				"content": slackMrkdwnToLarkMd("*💡 对我们的启发*\n\n" + cleaned),
+			},
+		})
+	}
+
+	// 🤔 本周思考
+	if ponderMD != "" {
+		cleaned := mdToSlack(ponderMD)
+		if len(nonEmptyLines(cleaned)) > 1 {
+			cleaned = ensureOrderedList(cleaned)
+		}
+		elements = append(elements, map[string]any{
+			"tag": "div", "text": map[string]any{
+				"tag":     "lark_md",
+				"content": slackMrkdwnToLarkMd("*🤔 本周思考*\n\n" + cleaned),
+			},
+		})
+	}
+
+	elements = append(elements, map[string]any{"tag": "hr"})
 
 	if weeklyPageURL != "" {
 		elements = append(elements, map[string]any{
@@ -199,6 +243,10 @@ func buildFeishuWeeklyCard(weekly *store.WeeklyIssue, weeklyPageURL string) map[
 		},
 		"elements": elements,
 	}
+}
+
+func buildWeeklyFeishuCardSnapshot(weekly *store.WeeklyIssue, weeklyPageURL string) map[string]any {
+	return buildFeishuWeeklyCard(weekly, weeklyPageURL)
 }
 
 // publishDailyToFeishu 是 run.go publish 阶段调用的入口. fail-soft: 失败只

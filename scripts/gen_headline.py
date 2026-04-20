@@ -57,6 +57,28 @@ TEXT_SOFT = (203, 213, 225)  # #CBD5E1 — subtitle hover
 
 WEEKDAY_ZH = ("一", "二", "三", "四", "五", "六", "日")
 
+MAC_BOLD_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+]
+
+MAC_REGULAR_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+]
+
+LINUX_BOLD_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+]
+
+LINUX_REGULAR_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+]
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -83,6 +105,51 @@ def parse_args() -> argparse.Namespace:
         help="Path to a regular CJK-capable TTF/TTC font",
     )
     return p.parse_args()
+
+
+def _find_sc_index(path: str) -> int:
+    if not path.lower().endswith(".ttc"):
+        return 0
+    for i in range(20):
+        try:
+            f = ImageFont.truetype(path, size=20, index=i)
+            name = f.getname()[0]
+            if "SC" in name or "GB" in name:
+                return i
+        except Exception:
+            break
+    return 0
+
+
+_sc_index_cache: dict[str, int] = {}
+
+
+def resolve_font_path(requested_path: str, role: str) -> str:
+    candidates = []
+    if requested_path:
+        candidates.append(requested_path)
+    if role == "bold":
+        candidates.extend(MAC_BOLD_FONT_CANDIDATES)
+        candidates.extend(LINUX_BOLD_FONT_CANDIDATES)
+    else:
+        candidates.extend(MAC_REGULAR_FONT_CANDIDATES)
+        candidates.extend(LINUX_REGULAR_FONT_CANDIDATES)
+
+    seen = set()
+    for raw in candidates:
+        path = str(raw).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.exists(path):
+            return path
+    return requested_path
+
+
+def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
+    if path not in _sc_index_cache:
+        _sc_index_cache[path] = _find_sc_index(path)
+    return ImageFont.truetype(path, size=size, index=_sc_index_cache[path])
 
 
 def make_gradient(width: int, height: int) -> Image.Image:
@@ -201,11 +268,11 @@ def fit_headline(
     surface the error.
     """
     size = start_size
-    last_font = ImageFont.truetype(font_path, size)
+    last_font = load_font(font_path, size)
     last_lines = wrap_headline(draw, text, last_font, max_width, max_lines)
     while size > min_size and len(last_lines) > max_lines:
         size -= step
-        last_font = ImageFont.truetype(font_path, size)
+        last_font = load_font(font_path, size)
         last_lines = wrap_headline(draw, text, last_font, max_width, max_lines)
     # Even if still > max_lines, return what we have — the drawing
     # loop clamps to max_lines when rendering.
@@ -253,6 +320,8 @@ def draw_corner_marks(draw: ImageDraw.ImageDraw, width: int, height: int) -> Non
 
 def main() -> int:
     args = parse_args()
+    args.font_bold = resolve_font_path(args.font_bold, "bold")
+    args.font_regular = resolve_font_path(args.font_regular, "regular")
 
     width, height = args.width, args.height
     padding = 72  # outer content padding
@@ -264,11 +333,11 @@ def main() -> int:
 
     # 2. Fonts. We load the masthead + footer at fixed sizes; the
     # headline uses fit_headline for auto-shrinking.
-    font_brand = ImageFont.truetype(args.font_bold, 40)
-    font_date = ImageFont.truetype(args.font_regular, 26)
-    font_subtitle = ImageFont.truetype(args.font_regular, 32)
-    font_footer = ImageFont.truetype(args.font_regular, 22)
-    font_badge = ImageFont.truetype(args.font_bold, 22)
+    font_brand = load_font(args.font_bold, 40)
+    font_date = load_font(args.font_regular, 26)
+    font_subtitle = load_font(args.font_regular, 32)
+    font_footer = load_font(args.font_regular, 22)
+    font_badge = load_font(args.font_bold, 22)
 
     # 3. Masthead: brand on the left, date on the right, both on the
     # same horizontal baseline near the top of the canvas.
