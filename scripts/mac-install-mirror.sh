@@ -21,8 +21,11 @@
 #
 # 前置条件:
 #   - Mac 已装 git (xcode-select --install 即可)
-#   - Mac 的 ~/.ssh/id_* 已加到 GitHub ylzsdafei 账号的 SSH Keys
-#     (如果用 HTTPS+token 也行, 把下面两个 URL 的 git@github.com: 改成 https://...)
+#   - 不需要任何认证: 两个 repo 都是 public, 走 HTTPS 只读 fetch
+#
+# 幂等细节:
+#   - 若目标目录已含其它内容 (如 Syncthing 的 .stfolder), 会 mv 到 _trash_*/
+#   - 若已是 git repo, fetch + reset --hard origin/main 强制对齐
 
 set -euo pipefail
 
@@ -33,28 +36,40 @@ PLIST="$HOME/Library/LaunchAgents/com.briefing.mirror.plist"
 LABEL="com.briefing.mirror"
 
 REPOS=(
-    "git@github.com:ylzsdafei/ai-daily-briefing.git|briefing-v3"
-    "git@github.com:ylzsdafei/ai-daily-site.git|ai-daily-site"
+    "https://github.com/ylzsdafei/ai-daily-briefing.git|briefing-v3"
+    "https://github.com/ylzsdafei/ai-daily-site.git|ai-daily-site"
 )
 
 mkdir -p "$MIRROR_ROOT" "$HOME/Library/LaunchAgents"
 touch "$LOG_FILE"
 
 # ---------------------------------------------------------------------
-# 1. clone 或 pull
+# 1. 初始化 / 更新 (用 init + fetch + reset 模式, 不怕非空目录)
 # ---------------------------------------------------------------------
 for entry in "${REPOS[@]}"; do
     url="${entry%|*}"
     name="${entry#*|}"
     path="$MIRROR_ROOT/$name"
+    mkdir -p "$path"
+
     if [ -d "$path/.git" ]; then
         echo "[setup] updating $name..."
-        git -C "$path" fetch --all --prune 2>&1 | tail -5
-        git -C "$path" reset --hard origin/main 2>&1 | tail -3
+        git -C "$path" remote set-url origin "$url"
     else
-        echo "[setup] cloning $name..."
-        git clone "$url" "$path" 2>&1 | tail -5
+        echo "[setup] initializing $name..."
+        if [ -n "$(ls -A "$path" 2>/dev/null)" ]; then
+            trash="$MIRROR_ROOT/_trash_$(date +%Y%m%d_%H%M%S)_$name"
+            mkdir -p "$trash"
+            mv "$path"/* "$trash"/ 2>/dev/null || true
+            mv "$path"/.[!.]* "$trash"/ 2>/dev/null || true
+            echo "[setup]   (non-git leftovers moved to $trash)"
+        fi
+        git -C "$path" init -b main -q
+        git -C "$path" remote add origin "$url"
     fi
+
+    git -C "$path" fetch origin main 2>&1 | tail -3
+    git -C "$path" reset --hard origin/main 2>&1 | tail -3
 done
 
 # ---------------------------------------------------------------------
