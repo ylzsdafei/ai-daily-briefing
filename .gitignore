@@ -11,9 +11,16 @@
 /data/*.db-wal
 /data/*.db-shm
 /data/*.bak*
+/data/backups/
+/data/export/
 /data/images/
+/data/github_stars_cache.json
 /logs/
 /config/secrets.env
+
+# Stray files at repo root
+/briefing
+/ai-daily-site*/
 
 # IDE / OS
 .vscode/
