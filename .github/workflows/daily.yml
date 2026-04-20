@@ -1,8 +1,9 @@
 name: Daily Briefing
 
 on:
-  schedule:
-    - cron: "0 22 * * *"
+  # schedule 已关: 宿主为 claude-4 systemd timer (briefing-daily.timer 22:00 UTC),
+  # GHA 仅保留 workflow_dispatch 作为手工兜底, 避免双宿主重复推送 + 降低账号被封风险.
+  # (20260420 决策; 旧前号 xinfeizhu 曾因频繁 actions 被 suspend, 这次不敢再踩.)
   workflow_dispatch:
     inputs:
       run_date:
