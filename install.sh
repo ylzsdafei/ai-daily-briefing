@@ -4,6 +4,10 @@
 # 在 Mac 上一键安装 briefing-v3 + ai-daily-site 的只读镜像 + launchd 定时拉取.
 # 幂等: 重复执行不会破坏已有状态.
 #
+# NOTE: /install.sh 是本脚本的 verbatim 拷贝 (提供短 URL 给 Mac curl-exec).
+# 改本脚本后必须同步: cp scripts/mac-install-mirror.sh install.sh
+# GitHub raw 不跟 symlink, 所以不能用 symlink 替代.
+#
 # 用法: 把本脚本粘贴/scp 到 Mac 后执行
 #
 #   bash mac-install-mirror.sh
@@ -60,16 +64,16 @@ for entry in "${REPOS[@]}"; do
         if [ -n "$(ls -A "$path" 2>/dev/null)" ]; then
             trash="$MIRROR_ROOT/_trash_$(date +%Y%m%d_%H%M%S)_$name"
             mkdir -p "$trash"
-            mv "$path"/* "$trash"/ 2>/dev/null || true
-            mv "$path"/.[!.]* "$trash"/ 2>/dev/null || true
+            # dotglob 捕获 .stfolder 等隐藏文件, 包括 ..config 这类 (原 .[!.]* 漏)
+            ( shopt -s dotglob nullglob; mv "$path"/* "$trash"/ 2>/dev/null || true )
             echo "[setup]   (non-git leftovers moved to $trash)"
         fi
         git -C "$path" init -b main -q
         git -C "$path" remote add origin "$url"
     fi
 
-    git -C "$path" fetch origin main 2>&1 | tail -3
-    git -C "$path" reset --hard origin/main 2>&1 | tail -3
+    git -C "$path" fetch origin main
+    git -C "$path" reset --hard origin/main
 done
 
 # ---------------------------------------------------------------------
