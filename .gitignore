@@ -27,5 +27,8 @@
 .idea/
 .DS_Store
 
+# Chat / session records (not for public repo)
+/docs/chat/
+
 # Go
 vendor/
