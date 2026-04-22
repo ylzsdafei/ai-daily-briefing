@@ -496,6 +496,33 @@ func promoteCommand(ctx context.Context, cfg *config.Config, date time.Time, gf 
 		fmt.Println("[WARN] promote: no issue row, skipping feishu push")
 	}
 
+	// 2026-04-22: dry-run + promote 新工作流下, run.go 的 appendSentURLs/Titles
+	// 在 dry-run gate 之后被跳过, 必须在 promote 成功后补上, 否则下一天
+	// pipeline 会重推今天已推的 URL/title. fail-soft: 写入失败只 warn.
+	if issue != nil {
+		items, ierr := s.ListIssueItemsByStatus(ctx, issue.ID, "validated")
+		if ierr != nil {
+			fmt.Printf("[WARN] promote: list items for dedup persist: %v\n", ierr)
+		} else {
+			if urls := collectIssueItemSourceURLs(items); len(urls) > 0 {
+				appendSentURLs(urls)
+				fmt.Printf("[%s] promote: persisted %d URLs to sent set\n",
+					time.Now().Format("15:04:05"), len(urls))
+			}
+			var titles []string
+			for _, it := range items {
+				if it != nil && strings.TrimSpace(it.Title) != "" {
+					titles = append(titles, it.Title)
+				}
+			}
+			if len(titles) > 0 {
+				appendSentTitles(titles)
+				fmt.Printf("[%s] promote: persisted %d titles to sent set\n",
+					time.Now().Format("15:04:05"), len(titles))
+			}
+		}
+	}
+
 	return nil
 }
 

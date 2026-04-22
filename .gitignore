@@ -15,8 +15,14 @@
 /data/export/
 /data/images/
 /data/github_stars_cache.json
+/data/feishu-daily-card-*.json
+/data/feishu-weekly-card-*.json
 /logs/
 /config/secrets.env
+
+# Python bytecode (scripts/)
+__pycache__/
+*.pyc
 
 # Stray files at repo root
 /briefing
