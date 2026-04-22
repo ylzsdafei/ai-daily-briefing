@@ -380,17 +380,26 @@ run_pipeline() {
         # fallback 到完整 pipeline.
         if ! "$BRIEFING_BIN" --help 2>&1 | grep -q '^    repair'; then
             echo "$TAG repair subcommand not implemented, fallback to full pipeline"
-            "$BRIEFING_BIN" run --target auto
+            # --dry-run: 生成所有内容 + payload snapshot, 不发 Slack/飞书.
+            # 真正的 Slack/飞书 prod 推送由 post-run.sh 在 GitHub Pages 部署
+            # 完成后用 briefing promote 重放 snapshot 完成. 避免 "推送发出时
+            # Pages 还没好导致链接 404" (2026-04-22 用户反馈).
+            "$BRIEFING_BIN" run --target auto --dry-run
             exit_code=$?
         else
-            "$BRIEFING_BIN" repair --section "$missing"
+            # repair 本质是 run 的别名, 同样用 --dry-run 避免过早推 Slack.
+            "$BRIEFING_BIN" repair --section "$missing" --dry-run
             exit_code=$?
         fi
     else
         # 先跑 daily-reset-dedup (之前是 ExecStartPre; orchestrator 接管后内嵌)
         /usr/local/bin/briefing-daily-reset-dedup.sh || true
-        echo "$TAG attempt $attempt: full pipeline (briefing run --target auto)"
-        "$BRIEFING_BIN" run --target auto
+        echo "$TAG attempt $attempt: full pipeline (briefing run --target auto --dry-run)"
+        # --dry-run: 生成所有内容 + payload snapshot, 不发 Slack/飞书.
+        # 真正的 Slack/飞书 prod 推送由 post-run.sh 在 GitHub Pages 部署
+        # 完成后用 briefing promote 重放 snapshot 完成. 避免 "推送发出时
+        # Pages 还没好导致链接 404" (2026-04-22 用户反馈).
+        "$BRIEFING_BIN" run --target auto --dry-run
         exit_code=$?
     fi
 

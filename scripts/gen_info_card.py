@@ -573,8 +573,6 @@ def render_header_card(data, output_path, width, height,
     left_y = draw_wrapped(
         draw, (pad_x, left_y), headline, f_l1, INK_MAIN,
         left_w, line_spacing=1.08, max_lines=3,
-        stroke_width=max(1, int(2 * scale)),
-        stroke_fill=INK_MAIN,
     )
     left_y += int(18 * scale)
     lead = data.get("lead_paragraph", "").strip()
