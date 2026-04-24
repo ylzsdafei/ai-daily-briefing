@@ -157,10 +157,36 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 		},
 	}
 
-	// 2026-04-24: canvas / audio 按钮从 Slack 模板移除 (用户决定保持原样).
-	// 读者通过 "📖 查看完整日报" 进入页面后自行查看内嵌的 insight-canvas
-	// shortcode 和 audio-player. publish.RenderedIssue 的 CanvasJSON /
-	// CanvasPageURL / AudioURL 字段保留 (未来若改回入口按钮无需再改结构).
+	// v1.1: 洞察图谱按钮 — 只在 canvas JSON 实际生成出来时显示.
+	// canvas shortcode 已嵌在日报页里, 所以按钮链回日报页 + 锚点.
+	if len(rendered.CanvasJSON) > 0 || strings.TrimSpace(rendered.CanvasPageURL) != "" {
+		canvasURL := strings.TrimSpace(rendered.CanvasPageURL)
+		if canvasURL == "" {
+			canvasURL = reportURL + "#insight-canvas"
+		}
+		actionElements = append(actionElements, map[string]any{
+			"type": "button",
+			"text": map[string]any{
+				"type":  "plain_text",
+				"text":  "🗺 洞察图谱",
+				"emoji": true,
+			},
+			"url": canvasURL,
+		})
+	}
+
+	// v1.1: 收听音频按钮 — Slack 会把 mp3/wav URL 当作可内联播放资源.
+	if audioURL := strings.TrimSpace(rendered.AudioURL); audioURL != "" {
+		actionElements = append(actionElements, map[string]any{
+			"type": "button",
+			"text": map[string]any{
+				"type":  "plain_text",
+				"text":  "🎧 收听",
+				"emoji": true,
+			},
+			"url": audioURL,
+		})
+	}
 
 	blocks = append(blocks, map[string]any{
 		"type":     "actions",
