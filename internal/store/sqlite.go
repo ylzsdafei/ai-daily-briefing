@@ -35,6 +35,9 @@ var schemaVersioningSchema string
 //go:embed migrations/006_source_health.sql
 var sourceHealthSchema string
 
+//go:embed migrations/007_canvas_audio_fields.sql
+var canvasAudioFieldsSchema string
+
 // migration is one logical step in the schema evolution. `version` is
 // monotonically increasing and forms the primary key of the
 // schema_migrations audit table. `sql` is the SQL blob to execute.
@@ -60,6 +63,7 @@ func allMigrations() []migration {
 		{4, "004_weekly_diagram_detail", weeklyDiagramDetailSchema, true},
 		{5, "005_schema_versioning", schemaVersioningSchema, true},
 		{6, "006_source_health", sourceHealthSchema, true},
+		{7, "007_canvas_audio_fields", canvasAudioFieldsSchema, true},
 	}
 }
 
@@ -676,11 +680,16 @@ func (s *sqliteStore) UpsertIssueInsight(ctx context.Context, insight *IssueInsi
 	// Defaults: status defaults to 'validated' on new rows (the insight
 	// LLM call succeeded if we got here) and infocard_status defaults to
 	// 'pending' until the card render stage flips it.
+	// v1.1: canvas_json / audio_script_md / audio_url 三列默认空, 只有
+	// v1.1 canvas / audio feature flag 打开时才填. ON CONFLICT 分支在
+	// excluded 为空时保留原值, 避免"重跑不带 canvas 把前一次 canvas 清掉"
+	// 之类的二次丢失.
 	const q = `
 		INSERT INTO issue_insights
 			(issue_id, industry_md, our_md, model, temperature, retry_count,
-			 generated_at, status, validated_at, infocard_status)
-		VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?)
+			 generated_at, status, validated_at, infocard_status,
+			 canvas_json, audio_script_md, audio_url)
+		VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(issue_id) DO UPDATE SET
 			industry_md = excluded.industry_md,
 			our_md = excluded.our_md,
@@ -694,6 +703,21 @@ func (s *sqliteStore) UpsertIssueInsight(ctx context.Context, insight *IssueInsi
 				WHEN excluded.infocard_status = 'pending' AND issue_insights.infocard_status <> 'pending'
 					THEN issue_insights.infocard_status
 				ELSE excluded.infocard_status
+			END,
+			canvas_json = CASE
+				WHEN excluded.canvas_json IS NULL OR excluded.canvas_json = ''
+					THEN issue_insights.canvas_json
+				ELSE excluded.canvas_json
+			END,
+			audio_script_md = CASE
+				WHEN excluded.audio_script_md IS NULL OR excluded.audio_script_md = ''
+					THEN issue_insights.audio_script_md
+				ELSE excluded.audio_script_md
+			END,
+			audio_url = CASE
+				WHEN excluded.audio_url IS NULL OR excluded.audio_url = ''
+					THEN issue_insights.audio_url
+				ELSE excluded.audio_url
 			END
 	`
 	var generatedAt any
@@ -716,6 +740,7 @@ func (s *sqliteStore) UpsertIssueInsight(ctx context.Context, insight *IssueInsi
 		insight.IssueID, insight.IndustryMD, insight.OurMD,
 		insight.Model, insight.Temperature, insight.RetryCount, generatedAt,
 		status, validatedAt, infocardStatus,
+		insight.CanvasJSON, insight.AudioScriptMD, insight.AudioURL,
 	); err != nil {
 		return fmt.Errorf("upsert insight for issue %d: %w", insight.IssueID, err)
 	}
@@ -728,7 +753,8 @@ func (s *sqliteStore) GetIssueInsight(ctx context.Context, issueID int64) (*Issu
 		       COALESCE(industry_md, ''), COALESCE(our_md, ''),
 		       COALESCE(model, ''), COALESCE(temperature, 0),
 		       retry_count, generated_at,
-		       status, validated_at, infocard_status
+		       status, validated_at, infocard_status,
+		       COALESCE(canvas_json, ''), COALESCE(audio_script_md, ''), COALESCE(audio_url, '')
 		FROM issue_insights
 		WHERE issue_id = ?
 	`
@@ -738,6 +764,7 @@ func (s *sqliteStore) GetIssueInsight(ctx context.Context, issueID int64) (*Issu
 		&in.ID, &in.IssueID, &in.IndustryMD, &in.OurMD,
 		&in.Model, &in.Temperature, &in.RetryCount, &in.GeneratedAt,
 		&in.Status, &validatedAt, &in.InfocardStatus,
+		&in.CanvasJSON, &in.AudioScriptMD, &in.AudioURL,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -898,7 +925,8 @@ func (s *sqliteStore) ListIssueInsightsByIssueIDs(ctx context.Context, ids []int
 	}
 	q := `SELECT id, issue_id, COALESCE(industry_md, ''), COALESCE(our_md, ''),
 	       COALESCE(model, ''), COALESCE(temperature, 0), retry_count, generated_at,
-	       status, validated_at, infocard_status
+	       status, validated_at, infocard_status,
+	       COALESCE(canvas_json, ''), COALESCE(audio_script_md, ''), COALESCE(audio_url, '')
 	      FROM issue_insights WHERE issue_id IN (` + strings.Join(placeholders, ",") + `)`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -911,7 +939,8 @@ func (s *sqliteStore) ListIssueInsightsByIssueIDs(ctx context.Context, ids []int
 		var validatedAt sql.NullTime
 		if err := rows.Scan(&in.ID, &in.IssueID, &in.IndustryMD, &in.OurMD,
 			&in.Model, &in.Temperature, &in.RetryCount, &in.GeneratedAt,
-			&in.Status, &validatedAt, &in.InfocardStatus); err != nil {
+			&in.Status, &validatedAt, &in.InfocardStatus,
+			&in.CanvasJSON, &in.AudioScriptMD, &in.AudioURL); err != nil {
 			return nil, fmt.Errorf("scan insight: %w", err)
 		}
 		if validatedAt.Valid {

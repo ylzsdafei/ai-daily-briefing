@@ -120,6 +120,41 @@ func WriteHugoPost(
 	// --- scrub & relocate every remaining ![alt](url) ------------------
 	body = scrubAndRelocateImages(body, siteDir, dateStr)
 
+	// --- v1.1: canvas / audio shortcodes ------------------------------
+	// Build the v1.1 block separately, then splice it in *after* the
+	// "今日摘要" section and *before* the first section heading (### 🔵).
+	// Rationale: canvas = 30-second overview, audio = 3-5 min commentary —
+	// both should live near the top so readers get the map before the
+	// territory, not after.
+	var canvasJSONPath, audioURLForFM string
+	var v11Block strings.Builder
+	if insight != nil {
+		if strings.TrimSpace(insight.CanvasJSON) != "" {
+			canvasJSONPath = fmt.Sprintf("/data/canvas/%s.json", dateStr)
+			fmt.Fprintf(&v11Block,
+				"\n\n{{< insight-canvas json_path=%q title=%q >}}\n",
+				canvasJSONPath,
+				fmt.Sprintf("%s AI 洞察图谱", dateStr),
+			)
+		}
+		if strings.TrimSpace(insight.AudioURL) != "" {
+			audioURLForFM = strings.TrimSpace(insight.AudioURL)
+			fmt.Fprintf(&v11Block,
+				"\n\n{{< audio-player src=%q title=%q >}}\n",
+				audioURLForFM,
+				"AI 早报·每日点评",
+			)
+		}
+	}
+	if v11Block.Len() > 0 {
+		if idx := strings.Index(body, "\n### "); idx > 0 {
+			body = body[:idx] + v11Block.String() + body[idx:]
+		} else {
+			// 找不到第一个 section heading — fallback 到底部, 至少不丢.
+			body += v11Block.String()
+		}
+	}
+
 	// --- v1.0.1: weekly report back-link --------------------------------
 	isoYear, isoWeek := date.ISOWeek()
 	weeklyLink := fmt.Sprintf("/blog/weekly/%d-w%02d/", isoYear, isoWeek)
@@ -139,6 +174,13 @@ func WriteHugoPost(
 	fm.WriteString("breadcrumbs: false\n")
 	fm.WriteString("comments: false\n")
 	fmt.Fprintf(&fm, "description: %q\n", description)
+	// v1.1: 仅在实际产出时写入两个键, 便于下游 SEO / OG 或 RSS pipeline 按需消费.
+	if canvasJSONPath != "" {
+		fmt.Fprintf(&fm, "canvas_json_path: %q\n", canvasJSONPath)
+	}
+	if audioURLForFM != "" {
+		fmt.Fprintf(&fm, "audio_url: %q\n", audioURLForFM)
+	}
 	fm.WriteString("---\n\n")
 
 	full := fm.String() + body

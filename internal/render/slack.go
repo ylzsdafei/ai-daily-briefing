@@ -139,25 +139,58 @@ func buildSlackPayloadMap(rendered *publish.RenderedIssue) map[string]any {
 	// scannable — user feedback was that section prose was too dense
 	// and hurt readability inside Slack.
 
-	// 9. Actions — view full report button.
+	// 9. Actions — view full report button (+ optional v1.1 canvas / audio).
 	reportURL := strings.TrimSpace(rendered.ReportURL)
 	if reportURL == "" {
 		reportURL = "https://github.com/ylzsdafei/briefing-v3"
 	}
-	blocks = append(blocks, map[string]any{
-		"type": "actions",
-		"elements": []map[string]any{
-			{
-				"type": "button",
-				"text": map[string]any{
-					"type":  "plain_text",
-					"text":  "📖 查看完整日报",
-					"emoji": true,
-				},
-				"url":   reportURL,
-				"style": "primary",
+	actionElements := []map[string]any{
+		{
+			"type": "button",
+			"text": map[string]any{
+				"type":  "plain_text",
+				"text":  "📖 查看完整日报",
+				"emoji": true,
 			},
+			"url":   reportURL,
+			"style": "primary",
 		},
+	}
+
+	// v1.1: 洞察图谱按钮 — 只在 canvas JSON 实际生成出来时显示.
+	// canvas shortcode 已嵌在日报页里, 所以按钮链回日报页 + 锚点.
+	if len(rendered.CanvasJSON) > 0 || strings.TrimSpace(rendered.CanvasPageURL) != "" {
+		canvasURL := strings.TrimSpace(rendered.CanvasPageURL)
+		if canvasURL == "" {
+			canvasURL = reportURL + "#insight-canvas"
+		}
+		actionElements = append(actionElements, map[string]any{
+			"type": "button",
+			"text": map[string]any{
+				"type":  "plain_text",
+				"text":  "🗺 洞察图谱",
+				"emoji": true,
+			},
+			"url": canvasURL,
+		})
+	}
+
+	// v1.1: 收听音频按钮 — Slack 会把 mp3/wav URL 当作可内联播放资源.
+	if audioURL := strings.TrimSpace(rendered.AudioURL); audioURL != "" {
+		actionElements = append(actionElements, map[string]any{
+			"type": "button",
+			"text": map[string]any{
+				"type":  "plain_text",
+				"text":  "🎧 收听",
+				"emoji": true,
+			},
+			"url": audioURL,
+		})
+	}
+
+	blocks = append(blocks, map[string]any{
+		"type":     "actions",
+		"elements": actionElements,
 	})
 
 	// 10. Footer context.
