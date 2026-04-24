@@ -78,6 +78,36 @@ gate:
   max_takeaway_bullets: 8
   min_source_domains: 3        # 5→3, 高质量内容不一定来自 5 个不同源
 
+# v1.1 Canvas 洞察流程图. 默认 off, 只在 dev smoke 时由环境变量打开.
+# 开启后会调 LLM 生成 X6 schema, 写到 DB + {HEXTRA_SITE_DIR}/data/canvas/{date}.json.
+# 生成失败一律 fail-soft (canvas 是可选增强, 不阻塞日报主体).
+canvas:
+  enabled: false # main/prod 永远 off
+  retry_backoff_seconds: [5, 15, 45]
+  min_nodes: 15
+  max_nodes: 30
+
+# v1.1 罗永浩风格语音播报. 同上, 默认 off.
+# 开启后调 LLM 生成 ~3000 字稿件 → TTS backend → 落盘 MP3 到
+# {HEXTRA_SITE_DIR}/static/audio/{date}.mp3.
+#
+# backend 选择:
+#   "edge" (默认) — 调用 microsoft edge-tts CLI (MIT 开源 wrapper, 免费无配额).
+#                   输出原生 MP3, 无需 ffmpeg 转码. 中文效果好.
+#   "cf"         — Cloudflare Workers AI MeloTTS. 2026-04-24 验证: 中文输出
+#                  为无效底噪 (方差 5 vs 真人 >10k), 已不再推荐, 保留为回退.
+audio:
+  enabled: false # main/prod 永远 off
+  backend: edge
+  voice: zh-CN-YunjianNeural   # edge-tts 男声, 解说员风格, 接近罗永浩
+  rate: "+5%"                   # edge-tts 语速微调
+  cf_api_token_env: CF_API_TOKEN
+  cf_account_id_env: CF_ACCOUNT_ID
+  voice_lang: zh
+  output_format: mp3
+  self_check: true
+  retry_backoff_seconds: [5, 15, 45]
+
 # Slack distribution. test channel is the default/safe target.
 # prod channel is only written when gate passes AND target=auto.
 slack:

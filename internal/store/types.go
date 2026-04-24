@@ -115,6 +115,22 @@ type IssueInsight struct {
 	Status         string
 	ValidatedAt    *time.Time
 	InfocardStatus string
+	// v1.1 canvas / audio additions. Both are optional add-ons gated by
+	// config (canvas.enabled / audio.enabled); when disabled they stay
+	// empty and the pipeline is byte-identical to v1.0.
+	//
+	//   CanvasJSON     — the X6 flow schema produced by internal/canvas.
+	//                    Persisted as TEXT so we can round-trip exactly
+	//                    what the LLM returned; the frontend fetches a
+	//                    mirror copy from {HEXTRA_SITE_DIR}/data/canvas.
+	//   AudioScriptMD  — Luo Yonghao-style monologue script fed to TTS.
+	//                    Kept around for debugging / regenerating audio
+	//                    without re-running the script LLM call.
+	//   AudioURL       — public-relative URL (e.g. "/audio/2026-04-24.mp3")
+	//                    served by Hugo static tree after TTS success.
+	CanvasJSON    string
+	AudioScriptMD string
+	AudioURL      string
 }
 
 // WeeklyIssue represents a weekly summary report aggregating daily Issues.
