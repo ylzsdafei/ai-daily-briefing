@@ -63,7 +63,14 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		date.Format("2006-01-02"), gf.domain, gf.target, gf.dryRun))
 
 	// --- 0. Open store & ensure schema ----------------------------------
-	s, err := store.New("data/briefing.db")
+	// BRIEFING_DB env override mirrors the `migrate` subcommand (main.go
+	// L274) so operators can point run at a throwaway DB copy for smoke
+	// tests without touching /root/briefing-v3/data/briefing.db.
+	dbPath := os.Getenv("BRIEFING_DB")
+	if dbPath == "" {
+		dbPath = "data/briefing.db"
+	}
+	s, err := store.New(dbPath)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
