@@ -64,24 +64,6 @@ type RenderedIssue struct {
 	// renderers display this in the footer context block when
 	// non-empty so readers know which sections are missing content.
 	FailedSections []string
-
-	// v1.1 canvas / audio add-ons. All three are optional — the Slack
-	// renderer emits the extra action buttons only when the matching
-	// field is non-empty, and feishu publishers ignore them entirely.
-	//
-	//   CanvasJSON     — raw X6 flow schema (mirror copy of the
-	//                    {HEXTRA_SITE_DIR}/data/canvas/{date}.json
-	//                    file). Kept here so alternative publishers can
-	//                    embed it without re-reading the file.
-	//   CanvasPageURL  — deep-link used by the "🗺 洞察图谱" button.
-	//                    Typically ReportURL#insight-canvas; may fall
-	//                    back to ReportURL when the anchor is missing.
-	//   AudioURL       — absolute public URL of the MP3/WAV served by
-	//                    GitHub Pages. Empty means TTS failed and the
-	//                    "🎧 收听" button must be skipped.
-	CanvasJSON    []byte
-	CanvasPageURL string
-	AudioURL      string
 }
 
 // Publisher sends a RenderedIssue to one distribution channel.

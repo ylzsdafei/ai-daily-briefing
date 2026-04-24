@@ -29,8 +29,6 @@ import (
 	"sync"
 	"time"
 
-	"briefing-v3/internal/audio"
-	"briefing-v3/internal/canvas"
 	"briefing-v3/internal/classify"
 	"briefing-v3/internal/compose"
 	"briefing-v3/internal/config"
@@ -44,7 +42,6 @@ import (
 	"briefing-v3/internal/publish"
 	"briefing-v3/internal/rank"
 	"briefing-v3/internal/render"
-	"briefing-v3/internal/search"
 	"briefing-v3/internal/store"
 )
 
@@ -545,150 +542,6 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 	recordStage(store.StageInsight, store.StageStatusSucceeded, "")
 	stage("insight: generated and persisted")
 
-	// v1.1.1 shared search client: read TAVILY_API_KEY once and reuse
-	// for canvas + audio script generation. Empty => search disabled.
-	tavilyKey := strings.TrimSpace(os.Getenv("TAVILY_API_KEY"))
-
-	// --- 9b. v1.1 Canvas 洞察流程图 (feature-flagged, fail-soft) --------
-	// 只有 cfg.Canvas.Enabled=true 时才跑 (默认 off). 任何失败都只 log, 不
-	// 阻塞主 pipeline — canvas 是"增强产物", 失败降级到 v1.0 纯文字日报.
-	// 成功时:
-	//   1. insight.CanvasJSON 存到 DB (方便 regen 不重算)
-	//   2. {HEXTRA_SITE_DIR}/data/canvas/{date}.json 写一份 (前端 fetch)
-	hextraSiteDirForV11 := strings.TrimSpace(os.Getenv("HEXTRA_SITE_DIR"))
-	if cfg.Canvas.Enabled {
-		stage("canvas: generating X6 insight-flow JSON via LLM (v1.1)")
-		cvGen, cvErr := canvas.NewGenerator(canvas.Config{
-			BaseURL:       cfg.LLM.BaseURL,
-			APIKey:        cfg.LLM.APIKey,
-			Model:         cfg.LLM.Model,
-			Temperature:   cfg.LLM.Temperature,
-			MaxTokens:     8192, // canvas 输出比 insight 长, 预留 token
-			Timeout:       cfg.LLM.LLMTimeout(),
-			RetryBackoffs: toDurationSeconds(cfg.Canvas.RetryBackoffSeconds),
-		})
-		if cvErr != nil {
-			fmt.Printf("[WARN] canvas: generator init failed: %v — skipping (fail-soft)\n", cvErr)
-		} else {
-			if tavilyKey != "" {
-				cvGen.WithSearch(search.NewTavilyClient(tavilyKey))
-				stage("canvas: web_search ENABLED via Tavily")
-			}
-			flow, cvgErr := cvGen.Generate(ctx, issue, issueItems, insight)
-			if cvgErr != nil {
-				fmt.Printf("[WARN] canvas: generate failed: %v — skipping (fail-soft)\n", cvgErr)
-			} else {
-				jsonBytes, mErr := flow.ToJSON()
-				if mErr != nil {
-					fmt.Printf("[WARN] canvas: marshal flow: %v\n", mErr)
-				} else {
-					insight.CanvasJSON = string(jsonBytes)
-					stage(fmt.Sprintf("canvas: got %d nodes / %d edges (%d bytes JSON)",
-						len(flow.Nodes), len(flow.Edges), len(jsonBytes)))
-					// 前端 shortcode 直接 fetch 这个路径. 注意: Hugo 的 data/ 是
-					// server-side only (仅 .Site.Data 可用, 不做 static serve),
-					// 所以必须写到 static/data/canvas/ 下, Hugo 构建后才会出现在
-					// public/data/canvas/ 公开 URL 上.
-					if hextraSiteDirForV11 != "" {
-						canvasDir := filepath.Join(hextraSiteDirForV11, "static", "data", "canvas")
-						if err := os.MkdirAll(canvasDir, 0o755); err != nil {
-							fmt.Printf("[WARN] canvas: mkdir %s: %v\n", canvasDir, err)
-						} else {
-							canvasPath := filepath.Join(canvasDir, date.Format("2006-01-02")+".json")
-							if err := os.WriteFile(canvasPath, jsonBytes, 0o644); err != nil {
-								fmt.Printf("[WARN] canvas: write %s: %v\n", canvasPath, err)
-							} else {
-								stage("canvas: wrote " + canvasPath)
-							}
-						}
-					}
-					// 持久化到 DB (让 regen 可以复用).
-					if err := s.UpsertIssueInsight(ctx, insight); err != nil {
-						fmt.Printf("[WARN] canvas: upsert insight after canvas: %v\n", err)
-					}
-				}
-			}
-		}
-	}
-
-	// --- 9c. v1.1 语音播报 — 罗永浩风格稿件 (feature-flagged, fail-soft) ---
-	if cfg.Audio.Enabled {
-		stage("audio-script: generating Luo Yonghao-style monologue via LLM (v1.1)")
-		scriptGen := audio.NewScriptGenerator(audio.Config{
-			BaseURL:             cfg.LLM.BaseURL,
-			APIKey:              cfg.LLM.APIKey,
-			Model:               cfg.LLM.Model,
-			Temperature:         0.8, // audio script 要更有人味, 比 infocard 高
-			Timeout:             cfg.LLM.LLMTimeout(),
-			MaxRetries:          len(cfg.Audio.RetryBackoffSeconds),
-			RetryBackoffSeconds: cfg.Audio.RetryBackoffSeconds,
-			EnableSelfCheck:     cfg.Audio.SelfCheck,
-		}, cfg.LLM.Model)
-		if tavilyKey != "" {
-			scriptGen.WithSearch(search.NewTavilyClient(tavilyKey))
-			stage("audio-script: web_search ENABLED via Tavily")
-		}
-		script, sErr := scriptGen.Generate(ctx, issue, issueItems, insight)
-		if sErr != nil {
-			fmt.Printf("[WARN] audio-script: generate failed: %v — skipping (fail-soft)\n", sErr)
-		} else {
-			insight.AudioScriptMD = script
-			stage(fmt.Sprintf("audio-script: got %d runes", len([]rune(script))))
-		}
-	}
-
-	// --- 9d. v1.1 TTS 合成 + 落盘 (feature-flagged, fail-soft) ---------
-	// 只在音频脚本实际生成出来时才跑 TTS. 否则省下 CF 额度 + 不写空文件.
-	// Backend 选择: "edge" (默认, microsoft edge-tts CLI, 免费开源) 或
-	// "cf" (Cloudflare MeloTTS, 中文输出已知损坏, 保留仅为回退).
-	if cfg.Audio.Enabled && strings.TrimSpace(insight.AudioScriptMD) != "" {
-		if hextraSiteDirForV11 == "" {
-			fmt.Printf("[WARN] audio: HEXTRA_SITE_DIR not set — skipping TTS save (fail-soft)\n")
-		} else {
-			var ttsClient audio.TTSClient
-			var opts audio.SynthesizeOpts
-			backend := strings.ToLower(strings.TrimSpace(cfg.Audio.Backend))
-			ttsReady := true
-			switch backend {
-			case audio.BackendCF:
-				if cfg.Audio.CFAPIToken == "" || cfg.Audio.CFAccountID == "" {
-					fmt.Printf("[WARN] audio: CF_API_TOKEN or CF_ACCOUNT_ID missing — skipping TTS (fail-soft)\n")
-					ttsReady = false
-				} else {
-					stage("audio-tts: calling CF MeloTTS")
-					ttsClient = audio.NewCFTTSClient(cfg.Audio.CFAPIToken, cfg.Audio.CFAccountID)
-					opts = audio.SynthesizeOpts{Lang: cfg.Audio.VoiceLang}
-				}
-			default: // "edge" 或空 (edge 是默认)
-				stage("audio-tts: calling edge-tts (" + cfg.Audio.Voice + " " + cfg.Audio.Rate + ")")
-				ttsClient = audio.NewEdgeTTSClient(cfg.Audio.Voice, cfg.Audio.Rate)
-				opts = audio.SynthesizeOpts{
-					Voice: cfg.Audio.Voice,
-					Rate:  cfg.Audio.Rate,
-				}
-			}
-
-			if !ttsReady {
-				// fall through — outer else already logged
-			} else if wavBytes, mimeType, tErr := audio.SynthesizeWithRetry(ctx, ttsClient, insight.AudioScriptMD, opts, nil); tErr != nil {
-				fmt.Printf("[WARN] audio-tts: synthesize failed after retries: %v — skipping (fail-soft)\n", tErr)
-			} else {
-				stage(fmt.Sprintf("audio-tts: got %d bytes %s", len(wavBytes), mimeType))
-				audioURL, saveErr := audio.SaveAudio(ctx, wavBytes, mimeType, date, hextraSiteDirForV11)
-				if saveErr != nil {
-					fmt.Printf("[WARN] audio: SaveAudio failed: %v — skipping (fail-soft)\n", saveErr)
-				} else {
-					insight.AudioURL = audioURL
-					stage("audio: " + audioURL)
-					// 持久化 canvas+audio 字段到 DB (insight 里合并的字段).
-					if err := s.UpsertIssueInsight(ctx, insight); err != nil {
-						fmt.Printf("[WARN] audio: upsert insight after audio: %v\n", err)
-					}
-				}
-			}
-		}
-	}
-
 	// --- 10. Daily summary (Step 2 — 3-line summary) --------------------
 	// v1.0.1 "零降级" (2026-04-14 用户原话 "局部缺信息, 应该是想办法补上,
 	// 不是一再降级") + 双层防御: 本地 retry 扛 transient 502, 全挂才 escalate
@@ -1077,21 +930,6 @@ func runPipeline(ctx context.Context, cfg *config.Config, date time.Time, gf *gl
 		QualityWarn:      report.Warn,
 		QualityWarnings:  report.Warnings,
 		FailedSections:   report.FailedSections,
-	}
-	// v1.1: 把 insight 上的 canvas / audio 字段镜像到 RenderedIssue,
-	// 让 Slack 渲染器能据此决定是否加 "🗺 洞察图谱" / "🎧 收听" 按钮.
-	if insight != nil {
-		if strings.TrimSpace(insight.CanvasJSON) != "" {
-			rendered.CanvasJSON = []byte(insight.CanvasJSON)
-			// CanvasPageURL 默认等于 ReportURL + 锚点 (shortcode 在日报页里).
-			rendered.CanvasPageURL = reportURL + "#insight-canvas"
-		}
-		if strings.TrimSpace(insight.AudioURL) != "" {
-			// AudioURL 是相对路径 ("/audio/YYYY-MM-DD.mp3"); 拼成 Slack
-			// 按钮可直接打开的绝对 URL. BRIEFING_REPORT_URL_BASE 的 host 部分
-			// 就是 Pages 根, 所以从 reportURL 取 scheme+host.
-			rendered.AudioURL = absolutizeAudioURL(reportURL, insight.AudioURL)
-		}
 	}
 	stage(fmt.Sprintf("gate: pass=%v warn=%v items=%d sections=%d insightChars=%d industry=%d takeaways=%d domains=%d failedSections=%d",
 		report.Pass, report.Warn, report.ItemCount, report.SectionCount, report.InsightChars,
@@ -3428,49 +3266,4 @@ func writeDailyMarkdown(date time.Time, md string) error {
 	}
 	path := filepath.Join(dir, date.Format("2006-01-02")+".md")
 	return os.WriteFile(path, []byte(md), 0o644)
-}
-
-// absolutizeAudioURL converts a root-relative audio path ("/audio/X.mp3")
-// into an absolute URL Slack can open. It uses the scheme+host of
-// reportURL as the base. When reportURL is not parseable as a URL (e.g.
-// when BRIEFING_REPORT_URL_BASE is a placeholder or a local file:// URI)
-// the relative path is returned unchanged — Slack will fall back to
-// "looks like a relative URL", which is better than a broken button.
-func absolutizeAudioURL(reportURL, audioRel string) string {
-	audioRel = strings.TrimSpace(audioRel)
-	if audioRel == "" {
-		return ""
-	}
-	// Already absolute — nothing to do.
-	if strings.HasPrefix(audioRel, "http://") || strings.HasPrefix(audioRel, "https://") {
-		return audioRel
-	}
-	base, err := url.Parse(strings.TrimSpace(reportURL))
-	if err != nil || base == nil || base.Host == "" {
-		return audioRel
-	}
-	abs := *base
-	abs.Path = audioRel
-	abs.RawQuery = ""
-	abs.Fragment = ""
-	return abs.String()
-}
-
-// toDurationSeconds converts a []int seconds list (as expressed in
-// config/ai.yaml retry_backoff_seconds) to a []time.Duration slice
-// suitable for feeding into canvas.Config / audio.Config retry loops.
-// Nil / empty input returns nil so downstream code can apply its own
-// defaults.
-func toDurationSeconds(seconds []int) []time.Duration {
-	if len(seconds) == 0 {
-		return nil
-	}
-	out := make([]time.Duration, len(seconds))
-	for i, s := range seconds {
-		if s < 0 {
-			s = 0
-		}
-		out[i] = time.Duration(s) * time.Second
-	}
-	return out
 }

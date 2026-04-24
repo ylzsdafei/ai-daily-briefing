@@ -5,7 +5,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -20,49 +19,8 @@ type Config struct {
 	Gate     GateConfig      `yaml:"gate"`
 	Slack    SlackConfig     `yaml:"slack"`
 	Image    ImageConfig     `yaml:"image"`
-	Canvas   CanvasConfig    `yaml:"canvas"`
-	Audio    AudioConfig     `yaml:"audio"`
 	Sections []SectionConfig `yaml:"sections"`
 	Sources  []SourceConfig  `yaml:"sources"`
-}
-
-// CanvasConfig gates the v1.1 insight-flow canvas feature. When Enabled
-// is false the pipeline must behave exactly as v1.0 — no LLM call, no
-// canvas JSON written anywhere. Enabled is further overridable from the
-// environment via CANVAS_ENABLED so smoke tests can turn it on without
-// editing config/ai.yaml.
-type CanvasConfig struct {
-	Enabled             bool  `yaml:"enabled"`
-	RetryBackoffSeconds []int `yaml:"retry_backoff_seconds"`
-	MinNodes            int   `yaml:"min_nodes"`
-	MaxNodes            int   `yaml:"max_nodes"`
-}
-
-// AudioConfig gates the v1.1 Luo Yonghao-style voice broadcast feature.
-// Env-overrides: AUDIO_ENABLED / CF_API_TOKEN / CF_ACCOUNT_ID
-// (the *_env keys are resolved at Load time).
-type AudioConfig struct {
-	Enabled bool `yaml:"enabled"`
-	// Backend selects the TTS provider. "edge" (default) = Microsoft
-	// edge-tts CLI (free, open-source wrapper, Chinese quality
-	// verified good). "cf" = Cloudflare Workers AI MeloTTS (retained
-	// for rollback but known broken on Chinese as of 2026-04-24).
-	Backend             string `yaml:"backend"`
-	CFAPITokenEnv       string `yaml:"cf_api_token_env"`
-	CFAccountIDEnv      string `yaml:"cf_account_id_env"`
-	VoiceLang           string `yaml:"voice_lang"`
-	OutputFormat        string `yaml:"output_format"`
-	// Voice is the edge-tts short-name, e.g. "zh-CN-YunjianNeural".
-	// Only consumed when Backend == "edge".
-	Voice string `yaml:"voice"`
-	// Rate is the edge-tts prosody adjustment, e.g. "+5%", "-10%".
-	// Only consumed when Backend == "edge".
-	Rate                string `yaml:"rate"`
-	SelfCheck           bool   `yaml:"self_check"`
-	RetryBackoffSeconds []int  `yaml:"retry_backoff_seconds"`
-	// Resolved values (populated by Load).
-	CFAPIToken  string `yaml:"-"`
-	CFAccountID string `yaml:"-"`
 }
 
 // RankConfig mirrors the `rank:` block in config/ai.yaml. Currently only
@@ -215,62 +173,6 @@ func Load(path string) (*Config, error) {
 	if cfg.Slack.DefaultTarget == "" {
 		cfg.Slack.DefaultTarget = "test"
 	}
-
-	// v1.1 canvas/audio env overrides. CANVAS_ENABLED / AUDIO_ENABLED
-	// flip the YAML default; this is how smoke tests opt-in without
-	// touching config/ai.yaml. Any of the usual truthy values are
-	// accepted; everything else (including unset) keeps the YAML value.
-	if v, ok := parseBoolEnv("CANVAS_ENABLED"); ok {
-		cfg.Canvas.Enabled = v
-	}
-	if v, ok := parseBoolEnv("AUDIO_ENABLED"); ok {
-		cfg.Audio.Enabled = v
-	}
-
-	// Audio CF credentials — env var names come from YAML (*_env fields),
-	// so operators can rename the env vars without changing code. When
-	// audio is disabled we still resolve them so `--dry-run --audio`
-	// failures surface as a clear "credential missing" error instead of
-	// a confusing HTTP 401 mid-pipeline.
-	if cfg.Audio.CFAPITokenEnv != "" {
-		cfg.Audio.CFAPIToken = os.Getenv(cfg.Audio.CFAPITokenEnv)
-	}
-	if cfg.Audio.CFAccountIDEnv != "" {
-		cfg.Audio.CFAccountID = os.Getenv(cfg.Audio.CFAccountIDEnv)
-	}
-	// Backfill audio defaults so a partially-filled YAML doesn't crash.
-	if cfg.Audio.Backend == "" {
-		// edge-tts is the new default backend (2026-04-24). MeloTTS
-		// was retained under "cf" for rollback but produces silence
-		// on Chinese input.
-		cfg.Audio.Backend = "edge"
-	}
-	if cfg.Audio.Voice == "" {
-		// YunjianNeural is a sports-commentator male voice — the
-		// closest edge-tts match to the Luo Yonghao register.
-		cfg.Audio.Voice = "zh-CN-YunjianNeural"
-	}
-	if cfg.Audio.Rate == "" {
-		cfg.Audio.Rate = "+5%"
-	}
-	if cfg.Audio.VoiceLang == "" {
-		cfg.Audio.VoiceLang = "zh"
-	}
-	if cfg.Audio.OutputFormat == "" {
-		cfg.Audio.OutputFormat = "mp3"
-	}
-	if len(cfg.Audio.RetryBackoffSeconds) == 0 {
-		cfg.Audio.RetryBackoffSeconds = []int{5, 15, 45}
-	}
-	if len(cfg.Canvas.RetryBackoffSeconds) == 0 {
-		cfg.Canvas.RetryBackoffSeconds = []int{5, 15, 45}
-	}
-	if cfg.Canvas.MinNodes == 0 {
-		cfg.Canvas.MinNodes = 15
-	}
-	if cfg.Canvas.MaxNodes == 0 {
-		cfg.Canvas.MaxNodes = 30
-	}
 	return &cfg, nil
 }
 
@@ -302,15 +204,4 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
-}
-
-// parseBoolEnv reads an env var and interprets truthy strings as bool.
-// Returns (value, ok). ok == false means the env was unset/empty, so
-// callers keep their existing default instead of forcing false.
-func parseBoolEnv(name string) (bool, bool) {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
-	if raw == "" {
-		return false, false
-	}
-	return raw == "1" || raw == "true" || raw == "yes" || raw == "on", true
 }
