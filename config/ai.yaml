@@ -99,8 +99,8 @@ canvas:
 audio:
   enabled: false # main/prod 永远 off
   backend: edge
-  voice: zh-CN-YunjianNeural   # edge-tts 男声, 解说员风格, 接近罗永浩
-  rate: "+5%"                   # edge-tts 语速微调
+  voice: zh-CN-YunyangNeural   # 用户 2026-04-24 试听后选定 (比 Yunjian AI 味轻, 新闻播音风)
+  rate: "+10%"                  # 语速略快 (Yunyang 默认偏慢)
   cf_api_token_env: CF_API_TOKEN
   cf_account_id_env: CF_ACCOUNT_ID
   voice_lang: zh
