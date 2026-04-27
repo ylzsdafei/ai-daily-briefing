@@ -266,12 +266,17 @@ selfheal_publish_status() {
     # 注意用 DATE('now','localtime') (依赖 sqlite 所在机器的时区);
     # 服务器时区是 UTC, 但 issue_date 是 Asia/Shanghai 当天, 所以要用
     # date 命令拿北京 today 再传进去.
-    local today
+    # 2026-04-27 加固: 原版只查 today, 早 6 点启动时今天 issue 还没生成,
+    # 当天 promote 推完后再无 selfheal 机会; 第二天又只看新一天的 today,
+    # 永远漏修昨天. 改成扫近 7 天兜底, 包含今天和过去一周.
+    local today cutoff
     today=$(TZ=Asia/Shanghai date '+%Y-%m-%d')
+    cutoff=$(TZ=Asia/Shanghai date -d '7 days ago' '+%Y-%m-%d')
     result=$(sqlite3 "$BRIEFING_DB" <<EOF 2>&1
 UPDATE issues SET status='published',
        published_at = COALESCE(published_at, CURRENT_TIMESTAMP)
-WHERE issue_date='$today'
+WHERE issue_date >= '$cutoff'
+  AND issue_date <= '$today'
   AND status='generated'
   AND EXISTS(SELECT 1 FROM deliveries
              WHERE issue_id=issues.id
@@ -281,10 +286,10 @@ EOF
 )
     local changes="${result##*$'\n'}"
     if [[ "$changes" =~ ^[0-9]+$ ]] && [[ "$changes" -gt 0 ]]; then
-        echo "$TAG selfheal: corrected $changes issue(s) generated -> published for $today"
+        echo "$TAG selfheal: corrected $changes issue(s) generated -> published in [$cutoff..$today]"
         log_jsonl 0 "selfheal" 0 0 "corrected $changes rows"
     else
-        echo "$TAG selfheal: no inconsistency found for $today"
+        echo "$TAG selfheal: no inconsistency found in [$cutoff..$today]"
     fi
 }
 

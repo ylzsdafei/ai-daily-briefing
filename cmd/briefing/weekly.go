@@ -230,6 +230,29 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 	slackBlocks := buildWeeklySlackBlocks(weekly, dailyIssues, weeklyPageURL)
 	slackBody, _ := json.Marshal(slackBlocks)
 
+	// 持久化 snapshot 给 promote-weekly / promote-weekly-feishu 用; 跟日报
+	// run.go 的 savePayloadSnapshot/saveDailyFeishuSnapshot 对齐. 即使本次
+	// 跳过 publish, snapshot 也存好, 后续 promote 命令可重放.
+	if err := saveWeeklyPayloadSnapshot(date, slackBody); err != nil {
+		fmt.Printf("[WARN] save weekly slack snapshot: %v\n", err)
+	}
+	weeklyFeishuCard := buildWeeklyFeishuCardSnapshot(weekly, weeklyPageURL)
+	if cardBytes, err := json.Marshal(weeklyFeishuCard); err != nil {
+		fmt.Printf("[WARN] marshal weekly feishu snapshot: %v\n", err)
+	} else if err := saveWeeklyFeishuSnapshot(date, cardBytes); err != nil {
+		fmt.Printf("[WARN] save weekly feishu snapshot: %v\n", err)
+	}
+
+	// BRIEFING_WEEKLY_NO_PUBLISH=1: 跳过 Slack(test+prod) 与飞书推送, 仅
+	// 保留 LLM 生成 + DB 持久化 + Hugo 写入 + snapshot 保存. 用于"先更新
+	// 线上链接, 等审核确认, 再用 promote-weekly 补推"的工作流.
+	noPublish := strings.EqualFold(strings.TrimSpace(os.Getenv("BRIEFING_WEEKLY_NO_PUBLISH")), "1")
+	if noPublish {
+		stage("weekly publish: BRIEFING_WEEKLY_NO_PUBLISH=1, snapshot saved, skipping all Slack/Feishu push")
+		stage("weekly: done")
+		return nil
+	}
+
 	stage("weekly: posting to Slack test channel")
 	testDelivery := postSlackPayload(ctx, store.ChannelSlackTest, cfg.Slack.TestWebhook, slackBody, 0)
 	if testDelivery.Status != store.DeliveryStatusSent {

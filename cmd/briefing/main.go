@@ -483,6 +483,18 @@ func promoteCommand(ctx context.Context, cfg *config.Config, date time.Time, gf 
 	}
 	fmt.Printf("[%s] promote: slack prod OK\n", time.Now().Format("15:04:05"))
 
+	// 与 run.go:1074 对齐: dry-run + promote 工作流下, run.go 的 dry-run 分支
+	// 提前 return, MarkIssuePublished 永远到不了; 必须在 promote 推送成功后
+	// 补标. 否则 issues.status 卡在 'generated', 周报 ListDailyIssuesByDateRange
+	// (status=published OR published_at IS NOT NULL) 会漏掉这天.
+	// fail-soft: Slack/飞书 已推, 标 published 失败只 warn, 不让 post-run.sh
+	// 误判成 prod 推送失败. orchestrator selfheal 兜底.
+	if issue != nil {
+		if err := s.MarkIssuePublished(ctx, issue.ID); err != nil {
+			fmt.Printf("[WARN] promote: mark issue published: %v\n", err)
+		}
+	}
+
 	// #4: promote 加飞书推送 — 跟 run.go 的 prod publish 对齐.
 	// fail-soft: 飞书失败只 warn 不阻断 promote.
 	if issue != nil {
