@@ -12,7 +12,10 @@
 | `briefing-post-run.sh` | `/usr/local/bin/` | 日报成功后 push site + wait Pages + promote + push state |
 | `briefing-weekly-post-run.sh` | `/usr/local/bin/` | 周报成功后 push site + wait Pages + promote-weekly(+feishu) + push state |
 | `briefing-daily-reset-dedup.sh` | `/usr/local/bin/` | 日常 dedup 重置 |
+| `briefing-daily.service` | `/etc/systemd/system/` | daily oneshot unit (调 orchestrator) |
+| `briefing-daily.timer` | `/etc/systemd/system/` | daily 触发器 (北京 06:00 = UTC 22:00) |
 | `briefing-weekly.service` | `/etc/systemd/system/` | weekly oneshot unit (走 dry-run + promote 工作流) |
+| `briefing-weekly.timer` | `/etc/systemd/system/` | weekly 触发器 (周日北京 22:00 = Sun UTC 14:00) |
 | `journald-briefing-retention.conf` | `/etc/systemd/journald.conf.d/briefing-retention.conf` | 加大 journal 保留期 (500M / 21d) |
 
 ## 同步规则
@@ -29,8 +32,11 @@ for f in briefing-orchestrator.sh briefing-post-run.sh \
     diff "/usr/local/bin/$f" "./$f" && echo "$f: OK" \
         || echo "$f: DRIFT"
 done
-diff /etc/systemd/system/briefing-weekly.service ./briefing-weekly.service \
-    && echo "weekly.service: OK" || echo "weekly.service: DRIFT"
+for u in briefing-daily.service briefing-daily.timer \
+         briefing-weekly.service briefing-weekly.timer; do
+    diff "/etc/systemd/system/$u" "./$u" && echo "$u: OK" \
+        || echo "$u: DRIFT"
+done
 diff /etc/systemd/journald.conf.d/briefing-retention.conf \
     ./journald-briefing-retention.conf \
     && echo "journald drop-in: OK" || echo "journald drop-in: DRIFT"
@@ -42,13 +48,28 @@ diff /etc/systemd/journald.conf.d/briefing-retention.conf \
 
 ```bash
 git clone https://github.com/ylzsdafei/ai-daily-briefing.git /root/briefing-v3
+
+# 1. 部署 .sh 脚本
 cp /root/briefing-v3/scripts/systemd/*.sh /usr/local/bin/
 chmod +x /usr/local/bin/briefing-*.sh
-cp /root/briefing-v3/scripts/systemd/briefing-weekly.service /etc/systemd/system/
+
+# 2. 部署 systemd unit + timer (4 个: daily/weekly 各 .service+.timer)
+cp /root/briefing-v3/scripts/systemd/briefing-daily.service \
+   /root/briefing-v3/scripts/systemd/briefing-daily.timer \
+   /root/briefing-v3/scripts/systemd/briefing-weekly.service \
+   /root/briefing-v3/scripts/systemd/briefing-weekly.timer \
+   /etc/systemd/system/
+
+# 3. 部署 journald drop-in (加大日志保留期)
 mkdir -p /etc/systemd/journald.conf.d/
 cp /root/briefing-v3/scripts/systemd/journald-briefing-retention.conf \
    /etc/systemd/journald.conf.d/briefing-retention.conf
+
+# 4. 加载 + 启用
 systemctl daemon-reload
 systemctl restart systemd-journald
-# 再恢复 daily.service / daily.timer / weekly.timer (尚未入库, 需备份)
+systemctl enable --now briefing-daily.timer briefing-weekly.timer
+
+# 5. 单独恢复 secrets.env (敏感, 不在 git 里)
+#   — 从 1Password / 私有备份拷贝到 /root/briefing-v3/config/secrets.env
 ```
