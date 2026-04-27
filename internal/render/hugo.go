@@ -121,24 +121,11 @@ func WriteHugoPost(
 	body = scrubAndRelocateImages(body, siteDir, dateStr)
 
 	// --- weekly report back-link ----------------------------------------
-	// 永远挂"本周周报"链接, 不做时间或 file 存在性判断. 周报未生成时
-	// (周一~周日 22:00 前) 点击会落到 layouts/404.html, 那里识别
-	// /blog/weekly/{Y}-w{NN}/ 形式 URL 并显示友好提示.
-	// 周报生成后 (周日 22:00 后) 同链接自动 hit 真实周报页, 无需 backfill.
-	//
-	// 必须用完整 URL (站点部署在 baseURL=.../ai-daily-site/ 子路径下),
-	// 否则 hugo render 出 host-relative `/blog/weekly/...`, 浏览器解析
-	// 成 ylzsdafei.github.io/blog/... 会撞 GitHub 顶级 "Site not found"
-	// 通用 404, 跳过我们仓库的自定义 404.html. (2026-04-27 实测)
-	// 用 BRIEFING_REPORT_URL_BASE 提取 site root, 跟 weekly.go:225 一致.
-	isoYear, isoWeek := date.ISOWeek()
-	weeklyLink := fmt.Sprintf("/blog/weekly/%d-w%02d/", isoYear, isoWeek)
-	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
-		if idx := strings.Index(base, "{{"); idx > 0 {
-			siteRoot := strings.TrimRight(base[:idx], "/")
-			weeklyLink = fmt.Sprintf("%s/blog/weekly/%d-w%02d/", siteRoot, isoYear, isoWeek)
-		}
-	}
+	// 永远挂"本周周报"链接 (无论本周周报是否已生成). 周报未生成时点击
+	// 会被 ai-daily-site/layouts/partials/custom/footer.html 的全局 JS
+	// 拦截, 弹模态框提示, 不跳走. 周报生成后同链接自动 hit 真实周报页.
+	_, isoWeek := date.ISOWeek()
+	weeklyLink := weeklyBackLink(date)
 	body += fmt.Sprintf("\n\n---\n\n> 本周周报：[第%d周综合分析](%s)\n", isoWeek, weeklyLink)
 
 	// --- frontmatter ----------------------------------------------------
@@ -602,4 +589,33 @@ func truncateDescription(s string, maxRunes int) string {
 		s = string(runes)
 	}
 	return s
+}
+
+// weeklyBackLinkFallbackPathPrefix 是 BRIEFING_REPORT_URL_BASE 环境变量缺失
+// 或格式错时的 fallback site path. 不能 fallback 成裸 host-relative
+// `/blog/weekly/...`, 否则浏览器在 ylzsdafei.github.io 上会解析成顶级
+// 路径, 撞 GitHub "Site not found" 通用 404 (2026-04-27 实测).
+//
+// 历史教训: 上次 fallback 写成 `/blog/weekly/...`, env 配错就直接 break
+// 用户体验. 这里硬编码 site path 作为 last-resort 安全垫.
+const weeklyBackLinkFallbackPathPrefix = "/ai-daily-site"
+
+// weeklyBackLink 算给定日期所属 ISO 周的周报回链 URL.
+//
+// 优先用 BRIEFING_REPORT_URL_BASE 提取 site root 拼完整 URL, 跟
+// weekly.go:227 同款写法保证两边对齐.
+//
+// 如果 env 缺失或没有 `{{` 占位符 (格式不对), fallback 到带 site path
+// 前缀的 host-relative URL, 仍然能落到本仓库 Pages 域内, 触发 footer.html
+// 的 JS 拦截; 绝不返回裸 `/blog/weekly/...`.
+func weeklyBackLink(date time.Time) string {
+	isoYear, isoWeek := date.ISOWeek()
+	if base := os.Getenv("BRIEFING_REPORT_URL_BASE"); base != "" {
+		if idx := strings.Index(base, "{{"); idx > 0 {
+			siteRoot := strings.TrimRight(base[:idx], "/")
+			return fmt.Sprintf("%s/blog/weekly/%d-w%02d/", siteRoot, isoYear, isoWeek)
+		}
+	}
+	return fmt.Sprintf("%s/blog/weekly/%d-w%02d/",
+		weeklyBackLinkFallbackPathPrefix, isoYear, isoWeek)
 }
