@@ -120,10 +120,19 @@ func WriteHugoPost(
 	// --- scrub & relocate every remaining ![alt](url) ------------------
 	body = scrubAndRelocateImages(body, siteDir, dateStr)
 
-	// --- v1.0.1: weekly report back-link --------------------------------
+	// --- weekly report back-link ----------------------------------------
+	// 本周周报要到周日 22:00 北京时间才生成. 周一~周六 (含周日早上) 推日报
+	// 时若硬挂本周链接会 404 (2026-04-27 实测 W18 链接 404). 用 file 存在
+	// 性 check: weekly md 已写入 → 挂链接; 没写入 → 显示提示, 不挂链接.
 	isoYear, isoWeek := date.ISOWeek()
-	weeklyLink := fmt.Sprintf("/blog/weekly/%d-w%02d/", isoYear, isoWeek)
-	body += fmt.Sprintf("\n\n---\n\n> 本周周报：[第%d周综合分析](%s)\n", isoWeek, weeklyLink)
+	weeklyMDPath := filepath.Join(siteDir, "content", "cn", "blog", "weekly",
+		fmt.Sprintf("%d-W%02d.md", isoYear, isoWeek))
+	if _, err := os.Stat(weeklyMDPath); err == nil {
+		weeklyLink := fmt.Sprintf("/blog/weekly/%d-w%02d/", isoYear, isoWeek)
+		body += fmt.Sprintf("\n\n---\n\n> 本周周报：[第%d周综合分析](%s)\n", isoWeek, weeklyLink)
+	} else {
+		body += fmt.Sprintf("\n\n---\n\n> 📅 第 %d 周周报将于本周日晚汇总发布\n", isoWeek)
+	}
 
 	// --- frontmatter ----------------------------------------------------
 	linkTitle := fmt.Sprintf("%02d-%02d AI资讯", int(date.Month()), date.Day())
