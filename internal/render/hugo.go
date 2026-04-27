@@ -121,18 +121,14 @@ func WriteHugoPost(
 	body = scrubAndRelocateImages(body, siteDir, dateStr)
 
 	// --- weekly report back-link ----------------------------------------
-	// 本周周报要到周日 22:00 北京时间才生成. 周一~周六 (含周日早上) 推日报
-	// 时若硬挂本周链接会 404 (2026-04-27 实测 W18 链接 404). 用 file 存在
-	// 性 check: weekly md 已写入 → 挂链接; 没写入 → 显示提示, 不挂链接.
+	// 永远挂"本周周报"链接, 不做时间或 file 存在性判断. 周报未生成时
+	// (周一~周日 22:00 前) 点击会落到 layouts/404.html, 那里识别
+	// /blog/weekly/{Y}-w{NN}/ 形式 URL 并显示"本周周报将于周日晚汇总发布"
+	// 提示, 用户体验比 generic 404 更好.
+	// 周报生成后 (周日 22:00 后) 同链接自动 hit 真实周报页, 无需 backfill.
 	isoYear, isoWeek := date.ISOWeek()
-	weeklyMDPath := filepath.Join(siteDir, "content", "cn", "blog", "weekly",
-		fmt.Sprintf("%d-W%02d.md", isoYear, isoWeek))
-	if _, err := os.Stat(weeklyMDPath); err == nil {
-		weeklyLink := fmt.Sprintf("/blog/weekly/%d-w%02d/", isoYear, isoWeek)
-		body += fmt.Sprintf("\n\n---\n\n> 本周周报：[第%d周综合分析](%s)\n", isoWeek, weeklyLink)
-	} else {
-		body += fmt.Sprintf("\n\n---\n\n> 📅 第 %d 周周报将于本周日晚汇总发布\n", isoWeek)
-	}
+	weeklyLink := fmt.Sprintf("/blog/weekly/%d-w%02d/", isoYear, isoWeek)
+	body += fmt.Sprintf("\n\n---\n\n> 本周周报：[第%d周综合分析](%s)\n", isoWeek, weeklyLink)
 
 	// --- frontmatter ----------------------------------------------------
 	linkTitle := fmt.Sprintf("%02d-%02d AI资讯", int(date.Month()), date.Day())
