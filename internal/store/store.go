@@ -107,6 +107,9 @@ type Store interface {
 	// WeeklyIssue
 	UpsertWeeklyIssue(ctx context.Context, w *WeeklyIssue) (int64, error)
 	GetWeeklyIssue(ctx context.Context, domainID string, year, week int) (*WeeklyIssue, error)
+	// MarkWeeklyPublished sets weekly_issues.status='published' and
+	// published_at=now (idempotent COALESCE). 与 MarkIssuePublished 对称.
+	MarkWeeklyPublished(ctx context.Context, weeklyID int64) error
 	ListDailyIssuesByDateRange(ctx context.Context, domainID string, start, end time.Time) ([]*Issue, error)
 
 	// Delivery

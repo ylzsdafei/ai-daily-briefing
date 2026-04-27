@@ -563,6 +563,24 @@ func promoteWeeklyCommand(ctx context.Context, cfg *config.Config, date time.Tim
 		return fmt.Errorf("weekly slack prod publish failed: %s", delivery.ResponseJSON)
 	}
 	fmt.Printf("[%s] promote-weekly: slack prod OK\n", time.Now().Format("15:04:05"))
+
+	// 与 promoteCommand (daily) 对齐: 推送成功后 mark weekly_issues.status='published'.
+	// fail-soft: Slack 已推, mark 失败只 warn.
+	s, err := store.New("data/briefing.db")
+	if err != nil {
+		fmt.Printf("[WARN] promote-weekly: open store for mark published: %v\n", err)
+		return nil
+	}
+	defer s.Close()
+	isoYear, isoWeek := date.ISOWeek()
+	weekly, err := s.GetWeeklyIssue(ctx, gf.domain, isoYear, isoWeek)
+	if err != nil || weekly == nil {
+		fmt.Printf("[WARN] promote-weekly: get weekly row for %d-W%02d: %v\n", isoYear, isoWeek, err)
+		return nil
+	}
+	if err := s.MarkWeeklyPublished(ctx, weekly.ID); err != nil {
+		fmt.Printf("[WARN] promote-weekly: mark weekly published: %v\n", err)
+	}
 	return nil
 }
 

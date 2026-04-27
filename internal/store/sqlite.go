@@ -522,6 +522,26 @@ func (s *sqliteStore) MarkIssuePublished(ctx context.Context, issueID int64) err
 	return nil
 }
 
+func (s *sqliteStore) MarkWeeklyPublished(ctx context.Context, weeklyID int64) error {
+	const q = `
+		UPDATE weekly_issues
+		SET status = ?, published_at = COALESCE(published_at, CURRENT_TIMESTAMP)
+		WHERE id = ?
+	`
+	res, err := s.db.ExecContext(ctx, q, IssueStatusPublished, weeklyID)
+	if err != nil {
+		return fmt.Errorf("mark weekly %d published: %w", weeklyID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("mark weekly %d published: not found", weeklyID)
+	}
+	return nil
+}
+
 func (s *sqliteStore) NextIssueNumber(ctx context.Context, domainID string) (int, error) {
 	const q = `SELECT COALESCE(MAX(issue_number), 0) + 1 FROM issues WHERE domain_id = ?`
 	var n int

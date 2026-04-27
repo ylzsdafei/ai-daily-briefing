@@ -270,6 +270,12 @@ func weeklyCommand(ctx context.Context, cfg *config.Config, date time.Time, gf *
 
 		// v1.0.1 Phase 4.5: 飞书推送 (跟 Slack prod 同条件, fail-soft).
 		publishWeeklyToFeishu(ctx, weekly, weeklyPageURL)
+
+		// 与 daily 对齐: prod publish 后 mark weekly_issues.status='published'.
+		// fail-soft: Slack/Feishu 已推, mark 失败只 warn.
+		if err := s.MarkWeeklyPublished(ctx, weeklyID); err != nil {
+			fmt.Printf("[WARN] weekly: mark published: %v\n", err)
+		}
 	}
 
 	stage("weekly: done")
